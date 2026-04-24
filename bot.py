@@ -142,12 +142,10 @@ async def on_member_join(member: discord.Member):
     if not is_bot_active:
         return
         
-    channel = member.guild.system_channel
+    channel = discord.utils.get(member.guild.text_channels, name="general")
     if not channel:
-        for ch in member.guild.text_channels:
-            if ch.permissions_for(member.guild.me).send_messages:
-                channel = ch
-                break
+        # Fallback to system channel if 'general' doesn't exist
+        channel = member.guild.system_channel
                 
     if channel:
         template = random.choice(WELCOME_MESSAGES)
