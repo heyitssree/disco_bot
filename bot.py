@@ -395,12 +395,6 @@ async def astro_slash(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
 ) -> None:
-    if not is_bot_active:
-        await interaction.response.send_message(
-            "AstRobot is currently sleeping. Shokam.", ephemeral=True
-        )
-        return
-
     target = user or interaction.user
     display_name = target.display_name
     mention_str = target.mention
@@ -419,10 +413,6 @@ async def astro_slash(
 
 @tree.command(name="rank", description="See the Top Appis — Boli Points leaderboard")
 async def rank_slash(interaction: discord.Interaction) -> None:
-    if not is_bot_active:
-        await interaction.response.send_message("Bot is sleeping. Shokam.", ephemeral=True)
-        return
-
     await interaction.response.defer(thinking=False)
     leaders = get_leaderboard(db_conn, limit=10)
 
