@@ -1,89 +1,234 @@
-# Deploying AstRobot to Google Cloud (Always Free Tier)
+# AstRobot V2 — Deployment Guide (GCP Free Tier VM)
 
-This guide walks you through setting up your Discord bot to run 24/7 on a Google Cloud Platform (GCP) **e2-micro** instance without incurring charges.
+This guide covers deploying AstRobot V2 to a GCP **e2-micro** Linux VM.
 
-## Step 1: Create the Virtual Machine
-1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2. Create a new project or select an existing one. You may need to attach a credit card to enable billing, but you will not be charged as long as you stay within the Always Free limits.
-3. Open the left menu, go to **Compute Engine > VM instances** and click **Create Instance**.
-4. **Name:** `astrobot-server` (or whatever you prefer)
-5. **Region (CRITICAL):** You MUST choose one of these three regions to get it for free:
-   - `us-central1` (Iowa)
-   - `us-east1` (South Carolina)
-   - `us-west1` (Oregon)
-6. **Machine Configuration:** 
-   - Series: **E2**
-   - Machine type: **e2-micro (2 vCPU, 1 GB memory)**
-7. **Boot Disk:** Leave the defaults (Debian/Ubuntu 10GB is fine, free tier covers up to 30GB standard persistent disk).
-8. Click **Create** at the bottom.
+---
 
-## Step 2: Access Your Server
-1. Once the VM has booted up (showing a green checkmark), click the **SSH** button next to it in the Compute Engine dashboard.
-2. A terminal window will pop up. You are now inside your remote Linux server!
+## Quick Reference — What Changed in V2
 
-## Step 3: Download Your Code & Setup Python
-Inside the SSH terminal, run these commands carefully:
+| Change | Action needed on VM |
+|---|---|
+| New deps: `duckdb`, `requests` | `pip install -r requirements.txt` |
+| New env vars | Update `.env` (see Step 3) |
+| `data/` and `logs/` dirs | Auto-created on first bot startup |
+| Old `response_cache.json` | Can be deleted — replaced by DuckDB |
+| Old `GEMINI_API_KEY` | Rename to `GEMINI_API_KEY_PAID` in `.env` |
 
-1. Update the server and install Python:
-   ```bash
-   sudo apt-get update
-   sudo apt-get install python3 python3-pip python3-venv git tmux -y
-   ```
+---
 
-2. Download your bot code:
-   ```bash
-   git clone https://github.com/heyitssree/disco_bot.git
-   cd disco_bot
-   ```
-   *(If your repo is private, you may need to use a GitHub personal access token when cloning).*
+## Step 1: Push Your Code from Windows
 
-3. Set up the Python virtual environment:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
+On your **local machine**, commit and push everything:
 
-4. Install the bot's requirements:
-   ```bash
-   pip install -r requirements.txt
-   ```
+```bash
+git add .
+git commit -m "feat: AstRobot V2 - DuckDB, dual-key, rate limiter, gamification"
+git push origin main
+```
 
-## Step 4: Add Your Tokens (.env file)
-Your `.env` file (which holds your Discord and Gemini keys) is intentionally blocked by Git, so it didn't copy over during the clone. You must recreate it on the server:
+> [!NOTE]
+> `.env` and `data/*.db` are git-ignored and will NOT be pushed — that's correct.
+> Only the sanitized `.env.example` is tracked.
 
-1. Create and open the `.env` file:
-   ```bash
-   nano .env
-   ```
-2. Paste your keys inside using this format:
-   ```env
-   DISCORD_TOKEN=your-discord-token-here
-   GEMINI_API_KEY=your-gemini-key-here
-   ```
-3. Press `Ctrl + O` then `Enter` to save it. Press `Ctrl + X` to exit Nano.
+---
 
-## Step 5: Keep the Bot Running Forever
-If you just type `python bot.py` and close your SSH window, the bot will die. To keep it alive in the background, we use `tmux`.
+## Step 2: Pull the Code on Your VM
 
-1. Start a new background session:
-   ```bash
-   tmux new -s astrobot
-   ```
-2. Make sure you are in the folder and the virtual environment is active:
-   ```bash
-   cd ~/disco_bot
-   source .venv/bin/activate
-   ```
-3. Start the bot!
-   ```bash
-   python bot.py
-   ```
-4. **Detaching:** Once the bot says "Logged in as AstRobot", press `Ctrl + B`, let go of both keys, and then press `D`. 
-   
-This "detaches" you from the tmux session while leaving the bot running. You can now close the browser tab. 
+SSH into your GCP VM (click **SSH** in the GCP Console), then:
 
-### How to check on it later
-If you ever want to see your running bot logs or stop it:
-1. Click the **SSH** button in Google Cloud again.
-2. Type `tmux attach -t astrobot`.
-3. To stop the bot, hit `Ctrl + C`.
+```bash
+# Navigate to your bot folder
+cd ~/disco_bot
+
+# Pull the latest changes
+git pull origin main
+
+# Activate your virtual environment
+source .venv/bin/activate
+
+# Install new dependencies (duckdb + requests were added)
+pip install -r requirements.txt
+```
+
+---
+
+## Step 3: Update Your `.env` File
+
+Your `.env` needs two new variables. Open it:
+
+```bash
+nano .env
+```
+
+Update it to look like this (replace values with your real keys):
+
+```env
+DISCORD_TOKEN=your-discord-token-here
+CLIENT_ID=your-client-id-here
+GUILD_ID=your-guild-id-here
+
+# Gemini API keys — free key tried first, paid is fallback
+GEMINI_API_KEY_FREE=your-free-gemini-key-here
+GEMINI_API_KEY_PAID=your-paid-gemini-key-here
+
+# Bot behaviour
+HORRIBLESCOPE_CHANNEL=off-topic
+FREE_TIER_MODE=true
+```
+
+> [!IMPORTANT]
+> If your old `.env` had `GEMINI_API_KEY=...`, that still works as a fallback alias.
+> But rename it to `GEMINI_API_KEY_PAID` for clarity.
+
+Press `Ctrl+O` → `Enter` to save, `Ctrl+X` to exit.
+
+---
+
+## Step 4: Run the Bot
+
+Use `tmux` so the bot keeps running after you close the SSH window:
+
+```bash
+# If you have an existing tmux session, kill it first
+tmux kill-session -t astrobot 2>/dev/null || true
+
+# Start a fresh session
+tmux new -s astrobot
+
+# Inside tmux — make sure venv is active and you're in the right folder
+cd ~/disco_bot
+source .venv/bin/activate
+
+# Start the bot
+python bot.py
+```
+
+You should see startup logs like:
+
+```
+2026-04-24 [INFO] astrobot: Starting AstRobot V2... Free key: ✓ | Paid key: ✓
+2026-04-24 [INFO] astrobot.schema: DuckDB initialised at data/astro_bot.db
+2026-04-24 [INFO] astrobot.gemini: GeminiService initialised. Available keys: ['free', 'paid']
+2026-04-24 [INFO] astrobot: Logged in as AstRobot#XXXX
+2026-04-24 [INFO] astrobot: Slash commands synced. AstRobot V2 is live.
+```
+
+**Detach from tmux** (bot keeps running): Press `Ctrl+B`, release, then press `D`.
+
+---
+
+## Step 5: Verify It's Working
+
+Back in Discord, test these:
+
+| Command / Action | Expected |
+|---|---|
+| `/astro` | Prediction + Rashi assigned on first use |
+| `/mypoints` | Shows your Boli Points and Rashi |
+| `/rank` | Leaderboard embed |
+| `/health` (owner only) | Status embed showing active key, RPM, circuit state |
+| Say "machane" in chat | Condescending Thirontharam reply |
+| Say "kidilam" in chat | +5 Boli Points silently awarded |
+| 7:00 AM IST | `#off-topic` receives daily omen + weather |
+
+---
+
+## Checking Logs / Reattaching
+
+```bash
+# Reattach to the running bot
+tmux attach -t astrobot
+
+# Or tail the log file directly (without attaching)
+tail -f ~/disco_bot/logs/bot.log
+
+# To stop the bot
+tmux attach -t astrobot
+# Then press Ctrl+C
+```
+
+---
+
+## Running the Cache Cleaner (Optional, Weekly)
+
+To keep cached responses generic (good for reuse), run the cleaner manually:
+
+```bash
+cd ~/disco_bot
+source .venv/bin/activate
+
+# Stop the bot first (Ctrl+C in its tmux window), then:
+python tools/cache_cleaner.py
+
+# Restart the bot
+python bot.py
+```
+
+Or set up a weekly cron job (runs Sunday 2:30 AM IST = Sunday 21:00 UTC Saturday):
+
+```bash
+crontab -e
+```
+
+Add this line:
+
+```
+0 21 * * 6 cd ~/disco_bot && source .venv/bin/activate && python tools/cache_cleaner.py >> logs/cleaner.log 2>&1
+```
+
+---
+
+## Backing Up Boli Points Data
+
+The DuckDB file at `data/astro_bot.db` is not committed to git. To back up user stats:
+
+```bash
+cd ~/disco_bot
+source .venv/bin/activate
+python -c "import schema, duckdb; conn = duckdb.connect('data/astro_bot.db'); schema.export_stats_csv(conn, 'data/backup_stats.csv'); print('Done')"
+```
+
+Then copy it to your local machine:
+
+```bash
+# Run this on your LOCAL machine (Windows PowerShell)
+gcloud compute scp astrobot-server:~/disco_bot/data/backup_stats.csv ./backup_stats.csv
+```
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `DISCORD_TOKEN not found` | Check `.env` is saved correctly with `cat .env` |
+| `No Gemini API key found` | Ensure `GEMINI_API_KEY_FREE` or `GEMINI_API_KEY_PAID` is in `.env` |
+| Bot shows `active_key: none` in `/health` | Both API keys are failing — check quotas in Google AI Studio |
+| `#off-topic channel not found` | Set `HORRIBLESCOPE_CHANNEL=general` in `.env` to match your server |
+| Bot crashes on startup | Check `logs/bot.log` for the traceback: `cat logs/bot.log` |
+| Daily omen not posting | Confirm the bot was running at 7:00 AM IST (01:30 UTC) |
+
+---
+
+## GCP VM Setup (First Time Only)
+
+If you're setting up a brand new VM:
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) → Compute Engine → Create Instance
+2. **Region**: `us-central1`, `us-east1`, or `us-west1` (free tier only)
+3. **Machine type**: `e2-micro`
+4. Click **SSH** once it's running, then:
+
+```bash
+sudo apt-get update
+sudo apt-get install python3 python3-pip python3-venv git tmux -y
+
+git clone https://github.com/heyitssree/disco_bot.git
+cd disco_bot
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Then follow Steps 3–5 above.
