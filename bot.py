@@ -17,7 +17,7 @@ from curses import CURSE_WORDS, get_random_doomed_prediction, get_random_curse_b
 load_dotenv()
 
 # Constants
-CURSE_REPLY_CHANCE = 0.30  # 30% chance to reply to curse words
+CURSE_REPLY_CHANCE = 0.50  # 50% chance to reply to curse words
 BOT_PREFIX = "."
 CACHE_FILE = "response_cache.json"
 
