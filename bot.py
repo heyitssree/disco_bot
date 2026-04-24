@@ -46,7 +46,6 @@ def call_gemini(prompt: str) -> str:
             config={
                 "system_instruction": ASTRO_SYSTEM_PROMPT,
                 "temperature": 0.8,
-                "max_output_tokens": 40,
             }
         )
         result = response.text
