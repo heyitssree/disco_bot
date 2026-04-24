@@ -79,7 +79,7 @@ FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 HORRIBLESCOPE_CHANNEL = os.getenv("HORRIBLESCOPE_CHANNEL", "off-topic")
 
 CURSE_REPLY_CHANCE = 0.25
-KOCHI_REPLY_CHANCE = 0.85
+KOCHI_REPLY_CHANCE = 0.28
 
 # ---------------------------------------------------------------------------
 # Bot startup time

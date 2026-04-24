@@ -55,13 +55,13 @@ KOCHI_SLANG_RESPONSES: list[str] = [
 # ---------------------------------------------------------------------------
 
 DOOMED_PREDICTIONS: list[str] = [
-    "Nee oru {curse} aanu. Ponmudi mist-pole ninte future also unclear. Kili poyi!",
-    "Eda {user}, ninte stars say you will get stuck in KD Puram traffic for 45 minutes on a Tuesday with no charge in your phone. Chumma vayadi ayikko.",
-    "Aiyo {user}, nee oru {curse} aanu. This week avoid Chalai Market or you will lose your wallet AND your sense of direction.",
-    "{user} ya, AstRobot is watching. Your stars say you will wait at Thampanoor bus stand for 2 hours for a bus that never comes. Shokam aanu.",
-    "Eda {user}, ninte rashi meedhi KSRTC bus thana. You will get stuck in Museum Campus traffic during Attukal Pongala. Karma has noted your recent behaviour.",
-    "{user}, nee oru {curse} aanu. Your palm lines say you will spend all evening at Indian Coffee House waiting for a cutlet that was sold out. Chumma.",
-    "Aiyo {user}, ninte future is darker than Chalai Market at night. You will go to Zam Zam and find out they ran out of shawarma. Kidilam aayirunnu!",
+    "Aiyo {user}, the stars heard what you said and now Ponmudi mist will follow you all week. Oola situation.",
+    "Eda {user}, the universe clocked your language and has booked you 45 minutes of KD Puram traffic with zero phone charge. Chumma.",
+    "Aiyo {user}, saying that near Chalai Market? Cosmos says you will lose your wallet AND your dignity this week.",
+    "{user}, AstRobot did not make this happen — your own words did. Thampanoor bus stand, 2 hours, bus never comes. Shokam.",
+    "Eda {user}, the stars noted your vocabulary. Museum Campus traffic during peak hour is your cosmic punishment. Karma is a KSRTC bus.",
+    "{user}, the universe heard that word and decided: Indian Coffee House, all evening, cutlet sold out. Your doing, not mine. Chumma.",
+    "Aiyo {user}, Chalai Market at night is shokam enough — your words made it worse. Zam Zam ran out of shawarma. Self-inflicted.",
 ]
 
 # ---------------------------------------------------------------------------
@@ -69,11 +69,11 @@ DOOMED_PREDICTIONS: list[str] = [
 # ---------------------------------------------------------------------------
 
 CURSE_BACK_REPLIES: list[str] = [
-    "Aiyo {user}, nee oru {curse} aanu. Ponmudi mist-pole ninte future also unclear. Kili poyi!",
-    "Eda {user}, nee oru {curse}! Ninte aadu (star) is sitting in the 7th house like a KSRTC bus at Thampanoor — not moving.",
-    "{user}, nee oru {curse} aanu. Chumma vayadi ayikko. AstRobot is judging you from Vellayambalam.",
-    "Aiyo {user}, nee oru {curse}! Go drink chaya at thattukada and think about what you said. Oola.",
-    "{user}, nee oru {curse} aanu. Ninte future darker than KD Puram at 7pm. Shokam.",
+    "Aiyo {user}, the cosmos saw what you typed. Ponmudi mist will be your future — unclear and damp.",
+    "Eda {user}, that word? The stars billed it to your account. KSRTC bus at Thampanoor — not moving, like your luck.",
+    "{user}, the universe has a ledger. That word just added one shokam entry. AstRobot is merely the messenger.",
+    "Aiyo {user}, the stars decided — go drink chaya at thattukada and reflect on your word choices. Oola.",
+    "{user}, the cosmos heard that. Ninte future darker than KD Puram at 7pm. Your words, your karma. Shokam.",
 ]
 
 # ---------------------------------------------------------------------------
