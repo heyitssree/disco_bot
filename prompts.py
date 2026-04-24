@@ -50,3 +50,25 @@ def get_astro_prompt(name: str) -> str:
 def get_curse_prompt(name: str, curse: str) -> str:
     """Returns the user prompt for the dynamic curse response."""
     return CURSE_USER_PROMPT_TEMPLATE.format(name=name, curse=curse)
+
+# Template for answering tagged questions
+QA_USER_PROMPT_TEMPLATE = """A user named {name} tagged me and asked: "{question}"
+
+Requirements:
+- Reply to their question in a highly sarcastic and dismissive manner.
+- Must be in Trivandrum Manglish.
+- Keep it to exactly 1 or 2 complete sentences.
+- Never be too helpful."""
+
+def get_qa_prompt(name: str, question: str) -> str:
+    """Returns the user prompt for answering questions."""
+    return QA_USER_PROMPT_TEMPLATE.format(name=name, question=question)
+
+# Static welcome messages to save API calls
+WELCOME_MESSAGES = [
+    "Eda {user}, welcome to the server! Chumma irikkalle, go get a chaya from the thattukada.",
+    "Aiyo, look who arrived. Welcome {user}. Try not to get lost like a tourist at Chalai Market.",
+    "Namaskaram {user}. I am AstRobot. Sit quietly, my calculations say you will cause trouble.",
+    "Oho, puthiya aal! Welcome {user}. Beware, your stars look slightly shokam today.",
+    "{user} vanne! Go find a seat before it gets crowded like KSRTC bus at Thampanoor."
+]

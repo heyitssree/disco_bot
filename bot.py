@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from google import genai
 
-from prompts import ASTRO_SYSTEM_PROMPT, get_astro_prompt, get_curse_prompt, FALLBACK_MESSAGE
+from prompts import ASTRO_SYSTEM_PROMPT, get_astro_prompt, get_curse_prompt, FALLBACK_MESSAGE, get_qa_prompt, WELCOME_MESSAGES
 from curses import CURSE_WORDS, get_random_doomed_prediction, get_random_curse_back, get_random_curse
 
 # Load environment variables
@@ -20,6 +20,8 @@ load_dotenv()
 CURSE_REPLY_CHANCE = 0.25  # 50% chance to reply to curse words
 BOT_PREFIX = "."
 CACHE_FILE = "response_cache.json"
+
+is_bot_active = True
 
 # Initialize Gemini client
 gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
@@ -55,8 +57,19 @@ def call_gemini(prompt: str) -> str:
         return FALLBACK_MESSAGE
 
 
-def save_to_cache(response: str, name: str, curse_used: str | None = None):
-    """Saves generated LLM responses to a local JSON cache with placeholders."""
+def load_cache() -> dict:
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+    return {"astro": [], "curse": []}
+
+def save_to_cache(response: str, name: str, cache_type: str, curse_used: str | None = None):
+    """Saves generated LLM responses to a local JSON cache dictionary."""
     try:
         if response == FALLBACK_MESSAGE or not response:
             return
@@ -65,31 +78,50 @@ def save_to_cache(response: str, name: str, curse_used: str | None = None):
         if curse_used:
             template_result = template_result.replace(curse_used, "{curse}")
             
-        cache_data = []
-        if os.path.exists(CACHE_FILE):
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                try:
-                    cache_data = json.load(f)
-                except json.JSONDecodeError:
-                    cache_data = []
-                    
-        if template_result not in cache_data:
-            cache_data.append(template_result)
+        cache_data = load_cache()
+        if cache_type not in cache_data:
+            cache_data[cache_type] = []
+            
+        if template_result not in cache_data[cache_type]:
+            cache_data[cache_type].append(template_result)
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"[{datetime.now().isoformat()}] Caching error: {e}")
 
+def get_from_cache(cache_type: str, name: str, curse_used: str | None = None) -> str | None:
+    """Gets a response from cache if conditions are met."""
+    cache_data = load_cache()
+    items = cache_data.get(cache_type, [])
+    
+    if len(items) < 100:
+        return None # Force Gemini API usage
+        
+    # If 100+, 80% chance to use cache, 20% to use Gemini
+    if random.random() < 0.8 and items:
+        template = random.choice(items)
+        result = template.replace("{user}", name)
+        if curse_used:
+            result = result.replace("{curse}", curse_used)
+        return result
+        
+    return None
+
 
 async def get_astro_prediction(name: str) -> str:
     """Get astrology prediction from Gemini and cache it."""
+    cached = get_from_cache("astro", name)
+    if cached:
+        print(f"[{datetime.now().isoformat()}] Using cached astro prediction for {name}")
+        return cached
+
     user_prompt = get_astro_prompt(name)
     
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, call_gemini, user_prompt)
     
     # Save the successful prediction to cache
-    save_to_cache(result, name)
+    save_to_cache(result, name, "astro")
     
     return result
 
@@ -104,6 +136,24 @@ def contains_curse_word(message_content: str) -> bool:
 
 
 @bot.event
+async def on_member_join(member: discord.Member):
+    """Welcome new members sarcastically."""
+    if not is_bot_active:
+        return
+        
+    channel = member.guild.system_channel
+    if not channel:
+        for ch in member.guild.text_channels:
+            if ch.permissions_for(member.guild.me).send_messages:
+                channel = ch
+                break
+                
+    if channel:
+        template = random.choice(WELCOME_MESSAGES)
+        message = template.format(user=member.mention)
+        await channel.send(message)
+
+@bot.event
 async def on_ready():
     """Event triggered when the bot is ready. Used to sync app commands."""
     print(f"[{datetime.now().isoformat()}] Logged in as {bot.user}")
@@ -114,6 +164,10 @@ async def on_ready():
 @tree.command(name="astro", description="Get a dramatic Manglish astrology prediction")
 async def astro_slash(interaction: discord.Interaction, user: discord.Member | None = None):
     """Slash command to get a dramatic astrology reading."""
+    if not is_bot_active:
+        await interaction.response.send_message("AstRobot is currently sleeping. Shokam.", ephemeral=True)
+        return
+
     target = user or interaction.user
     display_name = target.display_name
     mention_str = target.mention
@@ -135,6 +189,36 @@ async def on_message(message: discord.Message):
     
     if message.author.id == bot.user.id:
         return
+        
+    global is_bot_active
+    
+    # Global Admin Toggle
+    content_lower = message.content.strip().lower()
+    if content_lower in ["astro syros stop", "astro syros start"]:
+        app_info = await bot.application_info()
+        if message.author.id == app_info.owner.id:
+            if content_lower == "astro syros stop":
+                is_bot_active = False
+                await message.reply("Ok owner, stopping responses everywhere. Chumma irikkaam.")
+            else:
+                is_bot_active = True
+                await message.reply("Ok owner, I am back online. Ready to cause trouble.")
+            return
+
+    if not is_bot_active:
+        return
+
+    # Check for tagged questions
+    if bot.user.mentioned_in(message):
+        content_without_ping = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+        if content_without_ping and not contains_curse_word(message.content):
+            async with message.channel.typing():
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                user_prompt = get_qa_prompt(message.author.display_name, content_without_ping)
+                loop = asyncio.get_event_loop()
+                reply = await loop.run_in_executor(None, call_gemini, user_prompt)
+                await message.reply(reply)
+            return
     
     # Check for astro command
     if message.content.lower().startswith("astro"):
@@ -166,18 +250,23 @@ async def on_message(message: discord.Message):
                 content_lower = message.content.lower()
                 curse_used = next((c for c in CURSE_WORDS if c in content_lower), "oola")
                 
-                # Try getting dynamic curse response from Gemini
-                user_prompt = get_curse_prompt(username, curse_used)
-                loop = asyncio.get_event_loop()
-                reply = await loop.run_in_executor(None, call_gemini, user_prompt)
-                
-                if reply == FALLBACK_MESSAGE:
-                    if random.random() < 0.5:
-                        reply = get_random_doomed_prediction(username)
-                    else:
-                        reply = get_random_curse_back(username)
+                cached = get_from_cache("curse", username, curse_used)
+                if cached:
+                    reply = cached
+                    print(f"[{datetime.now().isoformat()}] Using cached curse reply for {username}")
                 else:
-                    save_to_cache(reply, username, curse_used)
+                    # Try getting dynamic curse response from Gemini
+                    user_prompt = get_curse_prompt(username, curse_used)
+                    loop = asyncio.get_event_loop()
+                    reply = await loop.run_in_executor(None, call_gemini, user_prompt)
+                    
+                    if reply == FALLBACK_MESSAGE:
+                        if random.random() < 0.5:
+                            reply = get_random_doomed_prediction(username)
+                        else:
+                            reply = get_random_curse_back(username)
+                    else:
+                        save_to_cache(reply, username, "curse", curse_used)
                 
                 await message.reply(reply)
 
