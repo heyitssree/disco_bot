@@ -3,6 +3,7 @@
 
 # DuckDB database (environment-specific, auto-created on startup)
 data/*.db
+data/*.wal
 
 # Log files
 logs/*.log
