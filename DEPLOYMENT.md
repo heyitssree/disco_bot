@@ -32,7 +32,7 @@ Inside the SSH terminal, run these commands carefully:
 
 2. Download your bot code:
    ```bash
-   git clone https://github.com/YOUR-USERNAME/disco_bot.git
+   git clone https://github.com/heyitssree/disco_bot.git
    cd disco_bot
    ```
    *(If your repo is private, you may need to use a GitHub personal access token when cloning).*

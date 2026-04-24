@@ -40,7 +40,7 @@ DOOMED_PREDICTIONS = [
     "Eda {user}, ninte stars say you will get stuck in KD Puram traffic for 45 minutes on a Tuesday with no charge in your phone. Chumma vayadi ayikko.",
     "Aiyo {user}, nee oru {curse} aanu. This week avoid Chalai Market or you will lose your wallet AND your sense of direction.",
     "{user} ya, AstRobot is watching. Your stars say you will wait at Thampanoor bus stand for 2 hours for a bus that never comes. Shokam aanu.",
-    "Eda {user}, ninte rashi meedhi KSRTC bus thana. You will get stuck in Museum Campus traffic during Attukal Pongala. Padmanabha swami has noted your recent behaviour.",
+    "Eda {user}, ninte rashi meedhi KSRTC bus thana. You will get stuck in Museum Campus traffic during Attukal Pongala. Karma has noted your recent behaviour.",
     "{user}, nee oru {curse} aanu. Your palm lines say you will spend all evening at Indian Coffee House waiting for a cutlet that was sold out. Chumma.",
     "Aiyo {user}, ninte future is darker than Chalai Market at night. You will go to Zam Zam and find out they ran out of shawarma. Kidilam aayirunnu!",
 ]
@@ -49,7 +49,7 @@ DOOMED_PREDICTIONS = [
 CURSE_BACK_REPLIES = [
     "Aiyo {user}, nee oru {curse} aanu. Ponmudi mist-pole ninte future also unclear. Kili poyi!",
     "Eda {user}, nee oru {curse}! Ninte aadu (star) is sitting in the 7th house like a KSRTC bus at Thampanoor — not moving.",
-    "{user}, nee oru {curse} aanu. Chumma vayadi ayikko. Padmanabha swami is judging you.",
+    "{user}, nee oru {curse} aanu. Chumma vayadi ayikko. AstRobot is judging you.",
     "Aiyo {user}, nee oru {curse}! Go drink chaya at thattukada and think about what you said. Oola.",
     "{user}, nee oru {curse} aanu. Ninte future darker than KD Puram at 7pm. Shokam.",
 ]

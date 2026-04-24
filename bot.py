@@ -136,8 +136,8 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
     
-    # Check for .astro command
-    if message.content.startswith(BOT_PREFIX + "astro"):
+    # Check for astro command
+    if message.content.lower().startswith("astro"):
         if message.mentions:
             target = message.mentions[0]
             display_name = target.display_name
