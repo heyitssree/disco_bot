@@ -41,6 +41,7 @@ from prompts import (
 )
 from curses import (
     CURSE_WORDS,
+    get_random_curse,
     get_random_doomed_prediction,
     get_random_curse_back,
     get_random_kochi_response,
@@ -319,7 +320,8 @@ async def on_message(message: discord.Message) -> None:
             if target.id == bot.user.id:
                 await message.reply("Eda, you think I can curse myself? Oola idea.")
                 return
-            curse_reply = get_random_curse_back(target.mention)
+            curse_word = get_random_curse()
+            curse_reply = f"{curse_word} {target.mention}"
             await message.reply(curse_reply)
             log_curse(db_conn, target.id, target.display_name, "proxy_astro")
             logger.info("%s cursed %s via prefix command", message.author.display_name, target.display_name)
