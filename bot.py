@@ -46,6 +46,7 @@ def call_gemini(prompt: str) -> str:
             config={
                 "system_instruction": ASTRO_SYSTEM_PROMPT,
                 "temperature": 0.8,
+                "max_output_tokens": 40,
             }
         )
         result = response.text
@@ -189,6 +190,12 @@ async def on_message(message: discord.Message):
     
     if message.author.id == bot.user.id:
         return
+        
+    # Ignore if replying to the bot's own message
+    if message.reference:
+        replied_msg = message.reference.resolved or message.reference.cached_message
+        if isinstance(replied_msg, discord.Message) and replied_msg.author.id == bot.user.id:
+            return
         
     global is_bot_active
     
