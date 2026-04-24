@@ -303,12 +303,12 @@ def get_time_context() -> dict:
     else:
         return {
             "period": "late night",
-            "landmark_hint": "Museum Campus",
+            "landmark_hint": "Trivandrum at night",
             "personality_addendum": (
-                "It is late night in Thirontharam. Chalai Market has shut. "
-                "Museum Campus is eerily quiet. "
-                "You hint at mysterious late-night energies and the ghosts of bad decisions. "
-                "Predictions are darker and more ominous than usual."
+                "It is late night in Thirontharam. The city has gone to sleep. "
+                "You hint at mysterious late-night energies, bad life decisions made after midnight, "
+                "or the existential dread of waking up early tomorrow. "
+                "Predictions should be slightly darker or philosophical, but DO NOT always mention ghosts or Museum Campus. VARY your late-night topics."
             ),
         }
 
@@ -318,14 +318,20 @@ def get_time_context() -> dict:
 # ---------------------------------------------------------------------------
 
 def get_glossary_text() -> str:
-    """Returns formatted glossary for prompt injection."""
-    exprs = ", ".join([f"{k} ({v})" for k, v in EXPRESSIONS.items()])
-    landmarks = ", ".join(LANDMARKS)
-    foods = ", ".join(FOOD)
-    culture = ", ".join(CULTURE)
+    """Returns formatted glossary for prompt injection (random subset to ensure variety)."""
+    import random
+    
+    # Pick random subset to force LLM to vary its topics on every request
+    expr_items = random.sample(list(EXPRESSIONS.items()), k=min(4, len(EXPRESSIONS)))
+    exprs = ", ".join([f"{k} ({v})" for k, v in expr_items])
+    
+    landmarks = ", ".join(random.sample(LANDMARKS, k=min(4, len(LANDMARKS))))
+    foods = ", ".join(random.sample(FOOD, k=min(3, len(FOOD))))
+    culture = ", ".join(random.sample(CULTURE, k=min(3, len(CULTURE))))
+    
     return f"""
-EXPRESSIONS (Trivandrum Manglish): {exprs}
-LANDMARKS: {landmarks}
-FOOD & EATERIES: {foods}
-CULTURE: {culture}
+AVAILABLE EXPRESSIONS (Trivandrum Manglish): {exprs}
+AVAILABLE LANDMARKS: {landmarks}
+AVAILABLE FOOD & EATERIES: {foods}
+AVAILABLE CULTURE: {culture}
 """

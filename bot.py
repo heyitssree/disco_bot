@@ -98,13 +98,13 @@ bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
 # ---------------------------------------------------------------------------
-# Global state (initialised in on_ready)
+# Globals
 # ---------------------------------------------------------------------------
 
-is_bot_active: bool = True
 db_conn = None          # duckdb.DuckDBPyConnection
 gemini_svc = None       # GeminiService
 api_mgr = None          # ApiManager
+_BOT_START_TIME = datetime.now(timezone.utc)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -210,8 +210,6 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    if not is_bot_active:
-        return
     channel = (
         discord.utils.get(member.guild.text_channels, name="general")
         or member.guild.system_channel
@@ -224,8 +222,6 @@ async def on_member_join(member: discord.Member) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    global is_bot_active
-
     # Ignore bots and self
     if message.author.bot or message.author.id == bot.user.id:
         return
@@ -242,12 +238,9 @@ async def on_message(message: discord.Message) -> None:
     if content_lower in ("astro syros stop", "astro syros start"):
         app_info = await bot.application_info()
         if message.author.id == app_info.owner.id:
-            is_bot_active = content_lower == "astro syros start"
-            status = "back online. Ready to cause trouble." if is_bot_active else "stopping responses everywhere. Chumma irikkaam."
+            gemini_svc.free_only = content_lower == "astro syros stop"
+            status = "now running in Free-Only Mode (will fallback to cache if free key fails)." if gemini_svc.free_only else "Gemini Paid Tier is back online."
             await message.reply(f"Ok owner, {status}")
-        return
-
-    if not is_bot_active:
         return
 
     # Upsert user record on every message (lightweight)
@@ -320,7 +313,20 @@ async def on_message(message: discord.Message) -> None:
             if target.id == bot.user.id:
                 await message.reply("Eda, you think I can curse myself? Oola idea.")
                 return
+
             curse_word = get_random_curse()
+
+            app_info = await bot.application_info()
+            reversal_chance = 0.30 if target.id == app_info.owner.id else 0.10
+
+            # Chance to reverse the curse back onto the person who sent it
+            if random.random() < reversal_chance:
+                curse_reply = f"Eda {message.author.mention}, you tried to curse {target.display_name}, but the stars reversed it. {curse_word}!"
+                await message.reply(curse_reply)
+                log_curse(db_conn, message.author.id, message.author.display_name, "proxy_astro_reverse")
+                logger.info("Proxy curse reversed! %s tried to curse %s but got cursed instead.", message.author.display_name, target.display_name)
+                return
+
             curse_reply = f"{curse_word} {target.mention}"
             await message.reply(curse_reply)
             log_curse(db_conn, target.id, target.display_name, "proxy_astro")
@@ -519,19 +525,52 @@ async def health_slash(interaction: discord.Interaction) -> None:
         value=(
             f"Used: **{rate_status['rpm_used']}/{rate_status['rpm_limit']} RPM**\n"
             f"Window resets in: {rate_status['window_resets_in_seconds']}s\n"
-            f"Free Tier Mode: {'ON' if rate_status['free_tier_mode'] else 'OFF'}"
+            f"Free Tier Mode: {'ON' if rate_status['free_tier_mode'] else 'OFF'}\n"
+            f"Free-Only Mode (Killswitch): **{'ON 🔴' if gemini_svc.free_only else 'OFF 🟢'}**"
         ),
         inline=False,
     )
     counts_str = "\n".join(f"  `{t}`: {n}" for t, n in table_counts.items())
     embed.add_field(name="🗄️ DuckDB Row Counts", value=counts_str, inline=False)
-    embed.add_field(
-        name="🤖 Bot Active",
-        value="✅ Yes" if is_bot_active else "❌ No (stopped by owner)",
-        inline=True,
-    )
 
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="help", description="Learn how to interact with AstRobot")
+async def help_slash(interaction: discord.Interaction) -> None:
+    """Show the help menu for AstRobot."""
+    embed = discord.Embed(
+        title="🤖 AstRobot V2 — Help & Features",
+        description="I am your friendly neighbourhood Trivandrum Astrologer. Here is what I can do:",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="🔮 Predictions (`astro`)",
+        value="Type `astro` in chat to get a personalised, Trivandrum-style daily astrological prediction.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🤬 Proxy Cursing (`astro @user`)",
+        value="Mention someone with the astro command to instantly send them a local curse or roast.",
+        inline=False,
+    )
+    embed.add_field(
+        name="💬 Q&A (`@AstRobot question?`)",
+        value="Tag me with a question and I'll give you a highly sarcastic, culturally accurate answer.",
+        inline=False,
+    )
+    embed.add_field(
+        name="🏆 Boli Points & Profile (`/profile`)",
+        value="Use Trivandrum slang (like *kidilam*, *shokam*) to earn Boli Points! Check your stats using the `/profile` slash command.",
+        inline=False,
+    )
+    embed.add_field(
+        name="👀 Passive Aggression",
+        value="Be careful what you say... If you use Kochi slang (*machane*), I will judge you. If you curse, I might curse you back.",
+        inline=False,
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -541,9 +580,6 @@ async def health_slash(interaction: discord.Interaction) -> None:
 @tasks.loop(time=dt_time(hour=1, minute=30, tzinfo=timezone.utc))
 async def daily_omen_and_weather() -> None:
     """Post the daily Trivandrum omen + weather briefing to #off-topic at 7 AM IST."""
-    if not is_bot_active:
-        logger.info("Daily omen skipped — bot is inactive.")
-        return
 
     # Idempotent check
     if get_todays_omen(db_conn):

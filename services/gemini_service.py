@@ -44,6 +44,7 @@ class GeminiService:
         self.failure_count: int = 0
         self.open_until: datetime | None = None
         self.active_key: str = "none"  # "free" | "paid" | "none"
+        self.free_only: bool = False
 
         # Usage counters (lifetime, since last bot restart)
         self.free_calls: int = 0
@@ -96,8 +97,8 @@ class GeminiService:
                 self.free_calls += 1
                 return result
 
-        # Fall back to paid key
-        if self._paid_client:
+        # Fall back to paid key (only if not in free-only mode)
+        if self._paid_client and not self.free_only:
             result = self._try_key(self._paid_client, prompt, system_prompt, key_name="paid")
             if result is not None:
                 self.failure_count = 0
@@ -105,12 +106,13 @@ class GeminiService:
                 self.paid_calls += 1
                 return result
 
-        # Both failed — increment circuit breaker
+        # All available keys failed — increment circuit breaker
         self.failure_count += 1
         self.failed_calls += 1
         self.active_key = "none"
         logger.error(
-            "Both API keys failed. Circuit failure count: %d/%d",
+            "API keys failed (free_only=%s). Circuit failure count: %d/%d",
+            self.free_only,
             self.failure_count,
             _CIRCUIT_FAILURE_THRESHOLD,
         )
