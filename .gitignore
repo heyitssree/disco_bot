@@ -1,3 +1,19 @@
-.env.example
+# Secrets — never commit
 .env
+
+# DuckDB database (environment-specific, auto-created on startup)
+data/*.db
+
+# Log files
+logs/*.log
+
+# Old JSON cache (migrated to DuckDB)
 response_cache.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# NOTE: .env.example IS tracked (it contains no real keys)

@@ -1,0 +1,14 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.db
+logs/
+data/
+input_feed/
+.gitignore
+*.md
+test_*.py
+tools/
