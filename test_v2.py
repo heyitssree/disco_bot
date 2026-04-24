@@ -244,16 +244,29 @@ from prompts import (
     get_astro_prompt, get_curse_prompt, get_qa_prompt,
     get_daily_omen_prompt, get_time_aware_system_prompt, FALLBACK_MESSAGE, WELCOME_MESSAGES
 )
+import random
+random.seed(42)  # Force predictable random behaviour for prompt generation testing
 
-# Astro prompt — new user (no history)
-p = get_astro_prompt("Sree")
-check("Astro prompt contains name", "Sree" in p)
-check("Astro prompt — new user has no history block", "first reading" in p)
+prompt1 = get_astro_prompt("Sree", "Kumbham")
+check("Astro prompt contains name", "Sree" in prompt1)
+check("Astro prompt — new user has no history block", "hint" not in prompt1.lower())
+check("Astro prompt includes Rashi", "Kumbham" in prompt1)
 
-# Astro prompt — with rashi + history
-p2 = get_astro_prompt("Arun", rashi="Kumbham (Aquarius)", past_predictions=["Stuck at KD Puram", "Lost wallet at Chalai"])
-check("Astro prompt includes Rashi", "Kumbham" in p2)
-check("Astro prompt includes past predictions", "KD Puram" in p2)
+# At seed(42), random.random() is ~0.63, so it WON'T include history.
+# Let's mock random temporarily for the test to ensure it hits the 40% branch AND picks a known item
+import random as test_random
+original_random = test_random.random
+original_choice = test_random.choice
+test_random.random = lambda: 0.1  # Force history branch
+test_random.choice = lambda seq: seq[0]  # Force picking the first item ("traffic")
+
+prompt2 = get_astro_prompt("Arun", past_predictions=["You got stuck in traffic", "Lost chappal at Chalai", "Forgot umbrella"])
+
+test_random.random = original_random  # Restore
+test_random.choice = original_choice  # Restore
+
+check("Astro prompt includes past predictions hint when triggered", "hint" in prompt2.lower())
+check("Astro prompt includes past predictions", "traffic" in prompt2.lower())
 
 # Curse prompt
 cp = get_curse_prompt("Sree", "pottan")

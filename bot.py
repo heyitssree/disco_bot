@@ -311,11 +311,22 @@ async def on_message(message: discord.Message) -> None:
 
     # ---- Legacy prefix "astro" command ----
     if message.content.lower().startswith("astro"):
+
+        # "astro @username" → curse/roast the mentioned user (instant, no API)
         if message.mentions:
             target = message.mentions[0]
-        else:
-            target = message.author
+            # Don't curse the bot itself
+            if target.id == bot.user.id:
+                await message.reply("Eda, you think I can curse myself? Oola idea.")
+                return
+            curse_reply = get_random_curse_back(target.mention)
+            await message.reply(curse_reply)
+            log_curse(db_conn, target.id, target.display_name, "proxy_astro")
+            logger.info("%s cursed %s via prefix command", message.author.display_name, target.display_name)
+            return
 
+        # "astro" with no mention → full prediction for the sender
+        target = message.author
         display_name = target.display_name
         mention_str = target.mention
 
@@ -480,11 +491,15 @@ async def health_slash(interaction: discord.Interaction) -> None:
     )
     embed.add_field(name="⏱️ Uptime", value=uptime_str, inline=False)
     embed.add_field(
-        name="🔑 Gemini Keys",
+        name="🔑 Gemini API Usage",
         value=(
             f"Free key: {'✅' if gemini_status['free_key_available'] else '❌'}\n"
             f"Paid key: {'✅' if gemini_status['paid_key_available'] else '❌'}\n"
-            f"Active key: **{gemini_status['active_key']}**"
+            f"Active key: **{gemini_status['active_key']}**\n\n"
+            f"**Lifetime Calls (Since Boot)**\n"
+            f"Free: **{gemini_status['free_calls']}** ({gemini_status['free_pct']}%)\n"
+            f"Paid: **{gemini_status['paid_calls']}** ({gemini_status['paid_pct']}%)\n"
+            f"Fails: {gemini_status['failed_calls']}"
         ),
         inline=True,
     )

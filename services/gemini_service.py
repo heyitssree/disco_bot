@@ -45,6 +45,11 @@ class GeminiService:
         self.open_until: datetime | None = None
         self.active_key: str = "none"  # "free" | "paid" | "none"
 
+        # Usage counters (lifetime, since last bot restart)
+        self.free_calls: int = 0
+        self.paid_calls: int = 0
+        self.failed_calls: int = 0
+
         keys_available = []
         if free_api_key:
             keys_available.append("free")
@@ -88,6 +93,7 @@ class GeminiService:
             if result is not None:
                 self.failure_count = 0  # reset on any success
                 self.active_key = "free"
+                self.free_calls += 1
                 return result
 
         # Fall back to paid key
@@ -96,10 +102,12 @@ class GeminiService:
             if result is not None:
                 self.failure_count = 0
                 self.active_key = "paid"
+                self.paid_calls += 1
                 return result
 
         # Both failed — increment circuit breaker
         self.failure_count += 1
+        self.failed_calls += 1
         self.active_key = "none"
         logger.error(
             "Both API keys failed. Circuit failure count: %d/%d",
@@ -144,6 +152,9 @@ class GeminiService:
 
     def status_dict(self) -> dict:
         """Return a status snapshot for the /health command."""
+        total = self.free_calls + self.paid_calls + self.failed_calls
+        free_pct = round(self.free_calls / total * 100) if total else 0
+        paid_pct = round(self.paid_calls / total * 100) if total else 0
         return {
             "circuit_open": self.is_circuit_open,
             "failure_count": self.failure_count,
@@ -151,4 +162,11 @@ class GeminiService:
             "active_key": self.active_key,
             "free_key_available": self._free_client is not None,
             "paid_key_available": self._paid_client is not None,
+            # Usage counters
+            "free_calls": self.free_calls,
+            "paid_calls": self.paid_calls,
+            "failed_calls": self.failed_calls,
+            "total_calls": total,
+            "free_pct": free_pct,
+            "paid_pct": paid_pct,
         }

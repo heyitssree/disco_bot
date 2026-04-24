@@ -64,34 +64,35 @@ def get_astro_prompt(
 ) -> str:
     """Build the user-facing astrology prompt.
 
-    Includes Rashi and past prediction recall when available.
+    History is referenced only ~40% of the time and as a brief aside,
+    so consecutive predictions feel fresh rather than repetitive.
     """
-    rashi_line = f"Their Rashi (star sign) is: {rashi}." if rashi else ""
+    import random as _random
 
-    if past_predictions:
-        formatted_past = "\n".join(
-            f"  - {p}" for p in past_predictions[:3]
+    rashi_line = f"Their Rashi is {rashi}." if rashi else ""
+
+    # Only occasionally reference history, and pick just one item at random
+    memory_aside = ""
+    if past_predictions and _random.random() < 0.40:
+        past_item = _random.choice(past_predictions)
+        memory_aside = (
+            f"You may briefly hint (in at most 5 words) that a previous doom came true — "
+            f"e.g. the last one was: \"{past_item[:60]}\". "
+            f"This is optional flavour only, not the main prediction."
         )
-        memory_block = f"""
-Their recent cosmic failures (reference ONE of these — suggest it happened because of a
-specific Trivandrum reason, e.g. 'you got stuck at KD Puram because you skipped Boli and
-Paal Payasam'):
-{formatted_past}
-
-Then add a BRAND NEW doom for today."""
-    else:
-        memory_block = "This is their first reading — generate a fresh doom."
 
     return f"""Give a dramatic astrology reading for {name}. {rashi_line}
-{memory_block}
+{memory_aside}
 
 Requirements:
+- The prediction must be FRESH and about something NEW — not a continuation of any past topic.
 - Start with "Eda {name}" or "Aiyo {name}"
-- Reference a Trivandrum location
+- Reference a specific Trivandrum location
 - Use Manglish naturally
 - 1–2 fully complete sentences. Maximum 25 words.
 - Do NOT use newlines, lists, or colons.
 - Ensure the sentence ends with proper punctuation."""
+
 
 
 # ---------------------------------------------------------------------------
