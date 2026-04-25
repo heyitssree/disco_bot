@@ -256,14 +256,12 @@ async def get_astro_prediction(user_id: int, name: str, usage_count: int = 1) ->
     """
     profile = get_user_profile(db_conn, user_id)
 
-    # Assign Rashi on first use
-    rashi: str | None = None
-    if profile is None:
+    # Assign Rashi if missing (new user, or existing user from before Rashi was introduced)
+    rashi: str | None = None if profile is None else profile.get("rashi")
+    if not rashi:
         rashi = random.choice(RASHIS)
         upsert_user(db_conn, user_id, name, rashi=rashi)
-        logger.info("New user %s assigned Rashi: %s", name, rashi)
-    else:
-        rashi = profile.get("rashi")
+        logger.info("Assigned Rashi to %s: %s", name, rashi)
 
     todays_pred = get_todays_user_prediction(db_conn, user_id)
 
