@@ -338,7 +338,10 @@ async def on_message(message: discord.Message) -> None:
         # Spam Check
         cooldown = check_spam_cooldown(message.author.id)
         if cooldown > 0:
-            return # Ignore silently for prefix to avoid spamming the channel with warnings
+            cached_pred = get_todays_user_prediction(db_conn, message.author.id)
+            if cached_pred:
+                await message.reply(f"Eda mone chill... I already told you: {cached_pred}")
+            return
 
         # "astro @username" → curse/roast the mentioned user (instant, no API)
         if message.mentions:
@@ -434,9 +437,14 @@ async def astro_slash(
 ) -> None:
     cooldown = check_spam_cooldown(interaction.user.id)
     if cooldown > 0:
-        await interaction.response.send_message(
-            f"Eda mone, chill! Wait {cooldown} seconds before asking again.", ephemeral=True
-        )
+        cached_pred = get_todays_user_prediction(db_conn, interaction.user.id)
+        if cached_pred:
+            # We don't make it ephemeral, we just reply normally from cache with the funny prefix!
+            await interaction.response.send_message(f"Eda mone chill... I already told you: {cached_pred}")
+        else:
+            await interaction.response.send_message(
+                f"Eda mone, chill! Wait {cooldown} seconds before asking again.", ephemeral=True
+            )
         return
 
     target = user or interaction.user

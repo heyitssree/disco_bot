@@ -73,16 +73,24 @@ def get_astro_prompt(
 
     # Only occasionally reference history, and pick just one item at random
     memory_aside = ""
-    if past_predictions and _random.random() < 0.40:
-        past_item = _random.choice(past_predictions)
-        memory_aside = (
-            f"You may briefly hint (in at most 5 words) that a previous doom came true — "
-            f"e.g. the last one was: \"{past_item[:60]}\". "
-            f"This is optional flavour only, not the main prediction."
-        )
+    avoid_list = ""
+    
+    if past_predictions:
+        avoid_list = "DO NOT repeat or use topics from these past predictions:\n"
+        for p in past_predictions:
+            avoid_list += f"- {p}\n"
+            
+        if _random.random() < 0.40:
+            past_item = _random.choice(past_predictions)
+            memory_aside = (
+                f"You may briefly hint (in at most 5 words) that a previous doom came true — "
+                f"e.g. the last one was: \"{past_item[:60]}\". "
+                f"This is optional flavour only, not the main prediction."
+            )
 
     return f"""Give a dramatic astrology reading for {name}. {rashi_line}
 {memory_aside}
+{avoid_list}
 
 Requirements:
 - The prediction must be FRESH and about something NEW — not a continuation of any past topic.
