@@ -155,6 +155,35 @@ def contains_curse_word(content: str) -> bool:
     return any(c in content_lower for c in CURSE_WORDS)
 
 
+_SPAM_WRAPPERS = [
+    "Mone, I told you already — {prediction}",
+    "Still asking? Shokam. {prediction}",
+    "Aiyo, same question again? The stars already decided — {prediction}",
+    "Eda, the planets haven't changed since 5 minutes ago. {prediction}",
+    "Chumma asking again is it? Fine. {prediction}",
+    "I only have one doom per customer, mone. {prediction}",
+    "You think fate changes every 5 minutes? {prediction}",
+]
+
+def _format_cached_spam_reply(cached: str, name: str) -> str:
+    """Strip the 'Eda/Aiyo [name],' opener from a cached prediction and
+    wrap it in a varied snarky spam-reply message."""
+    import re
+    # Remove leading opener like "Eda Link," / "Aiyo Link," (case-insensitive)
+    stripped = re.sub(
+        rf"^(Eda|Aiyo|Oola|Shokam)\s+{re.escape(name)}\s*[,.]?\s*",
+        "",
+        cached,
+        flags=re.IGNORECASE,
+    ).strip()
+    # Capitalise first letter of remainder
+    if stripped:
+        stripped = stripped[0].upper() + stripped[1:]
+    prediction_text = stripped or cached  # fall back to full text if strip failed
+    wrapper = random.choice(_SPAM_WRAPPERS)
+    return wrapper.format(prediction=prediction_text)
+
+
 # ---------------------------------------------------------------------------
 # Core prediction logic
 # ---------------------------------------------------------------------------
@@ -363,7 +392,8 @@ async def on_message(message: discord.Message) -> None:
         if cooldown > 0:
             cached_pred = get_todays_user_prediction(db_conn, message.author.id)
             if cached_pred:
-                await message.reply(f"Eda mone chill... I already told you: {cached_pred}")
+                reply = _format_cached_spam_reply(cached_pred, message.author.display_name)
+                await message.reply(reply)
             return
 
         # "astro @username" → curse/roast the mentioned user (instant, no API)
@@ -462,8 +492,8 @@ async def astro_slash(
     if cooldown > 0:
         cached_pred = get_todays_user_prediction(db_conn, interaction.user.id)
         if cached_pred:
-            # We don't make it ephemeral, we just reply normally from cache with the funny prefix!
-            await interaction.response.send_message(f"Eda mone chill... I already told you: {cached_pred}")
+            reply = _format_cached_spam_reply(cached_pred, interaction.user.display_name)
+            await interaction.response.send_message(reply)
         else:
             await interaction.response.send_message(
                 f"Eda mone, chill! Wait {cooldown} seconds before asking again.", ephemeral=True
