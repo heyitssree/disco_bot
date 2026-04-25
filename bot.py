@@ -28,6 +28,12 @@ from schema import (
     get_todays_omen,
     save_daily_omen,
     export_stats_csv,
+    get_config_float,
+    get_config_int,
+    set_config_float,
+    set_config_int,
+    get_all_configs,
+    get_todays_user_prediction,
 )
 from glossary import LANDMARKS, RASHIS, get_daily_weather_forecast
 from prompts import (
@@ -78,9 +84,21 @@ FREE_API_KEY = os.getenv("GEMINI_API_KEY_FREE")
 PAID_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY")
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 HORRIBLESCOPE_CHANNEL = os.getenv("HORRIBLESCOPE_CHANNEL", "off-topic")
+# ---------------------------------------------------------------------------
+# In-Memory Spam Control
+# ---------------------------------------------------------------------------
+_user_cooldowns: dict[int, datetime] = {}
 
-CURSE_REPLY_CHANCE = 0.25
-KOCHI_REPLY_CHANCE = 0.28
+def check_spam_cooldown(user_id: int) -> int:
+    """Returns seconds remaining if on cooldown, else 0."""
+    now = datetime.now(timezone.utc)
+    if user_id in _user_cooldowns:
+        cooldown_seconds = get_config_int(db_conn, "astro_cooldown_seconds", 60)
+        time_since = (now - _user_cooldowns[user_id]).total_seconds()
+        if time_since < cooldown_seconds:
+            return int(cooldown_seconds - time_since)
+    _user_cooldowns[user_id] = now
+    return 0
 
 # ---------------------------------------------------------------------------
 # Bot startup time
@@ -147,6 +165,16 @@ async def get_astro_prediction(user_id: int, name: str) -> str:
         logger.info("New user %s assigned Rashi: %s", name, rashi)
     else:
         rashi = profile.get("rashi")
+
+    # 1. Check if the user already had a prediction TODAY
+    todays_pred = get_todays_user_prediction(db_conn, user_id)
+    if todays_pred:
+        cache_chance = get_config_float(db_conn, "cache_reuse_chance", 0.50)
+        if random.random() < cache_chance:
+            logger.info("Recycling today's prediction from cache for %s", name)
+            # Simulate Gemini thinking time
+            await asyncio.sleep(random.uniform(1.0, 2.5))
+            return todays_pred
 
     past_predictions = get_last_n_predictions(db_conn, user_id, n=3)
     system_prompt = get_time_aware_system_prompt()
@@ -256,6 +284,14 @@ async def on_message(message: discord.Message) -> None:
             message.author.display_name, triggered_words, points
         )
 
+    # ---- Kochi slang detection ----
+    kochi_chance = get_config_float(db_conn, "kochi_reply_chance", 0.28)
+    if contains_kochi_slang(message.content) and random.random() < kochi_chance:
+        response = get_random_kochi_response(message.author.mention)
+        await message.reply(response)
+        logger.info("Kochi slang detected from %s — condescending reply sent.", message.author.display_name)
+        return
+
     # ---- Bot mention: Q&A ----
     if bot.user.mentioned_in(message):
         content_without_ping = (
@@ -296,15 +332,13 @@ async def on_message(message: discord.Message) -> None:
             await message.reply(reply)
             return
 
-    # ---- Kochi slang detection ----
-    if contains_kochi_slang(message.content) and random.random() < KOCHI_REPLY_CHANCE:
-        response = get_random_kochi_response(message.author.mention)
-        await message.reply(response)
-        logger.info("Kochi slang detected from %s — condescending reply sent.", message.author.display_name)
-        return
-
     # ---- Legacy prefix "astro" command ----
     if message.content.lower().startswith("astro"):
+
+        # Spam Check
+        cooldown = check_spam_cooldown(message.author.id)
+        if cooldown > 0:
+            return # Ignore silently for prefix to avoid spamming the channel with warnings
 
         # "astro @username" → curse/roast the mentioned user (instant, no API)
         if message.mentions:
@@ -317,7 +351,8 @@ async def on_message(message: discord.Message) -> None:
             curse_word = get_random_curse()
 
             app_info = await bot.application_info()
-            reversal_chance = 0.30 if target.id == app_info.owner.id else 0.10
+            owner_reversal_chance = get_config_float(db_conn, "reversal_chance_owner", 0.45)
+            reversal_chance = owner_reversal_chance if target.id == app_info.owner.id else 0.10
 
             # Chance to reverse the curse back onto the person who sent it
             if random.random() < reversal_chance:
@@ -349,12 +384,14 @@ async def on_message(message: discord.Message) -> None:
         return
 
     # ---- Passive curse word reply ----
-    if contains_curse_word(message.content) and random.random() < CURSE_REPLY_CHANCE:
+    curse_chance = get_config_float(db_conn, "curse_reply_chance", 0.25)
+    if contains_curse_word(message.content) and random.random() < curse_chance:
         username = message.author.display_name
+        user_id = message.author.id
         curse_used = next((c for c in CURSE_WORDS if c in content_lower), "oola")
 
-        log_curse(db_conn, message.author.id, username, curse_used)
-        update_boli_points(db_conn, message.author.id, 1)  # +1 Boli pt for curse event
+        log_curse(db_conn, user_id, username, curse_used)
+        update_boli_points(db_conn, user_id, 1)  # +1 Boli pt for curse event
 
         system_prompt = get_time_aware_system_prompt()
         user_prompt = get_curse_prompt(username, curse_used)
@@ -395,6 +432,13 @@ async def astro_slash(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
 ) -> None:
+    cooldown = check_spam_cooldown(interaction.user.id)
+    if cooldown > 0:
+        await interaction.response.send_message(
+            f"Eda mone, chill! Wait {cooldown} seconds before asking again.", ephemeral=True
+        )
+        return
+
     target = user or interaction.user
     display_name = target.display_name
     mention_str = target.mention
@@ -561,6 +605,68 @@ async def help_slash(interaction: discord.Interaction) -> None:
     )
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Admin Slash Commands
+# ---------------------------------------------------------------------------
+
+@app_commands.default_permissions(administrator=True)
+class AdminGroup(app_commands.Group):
+    def __init__(self):
+        super().__init__(name="admin", description="AstRobot owner configuration controls")
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        app_info = await bot.application_info()
+        if interaction.user.id != app_info.owner.id:
+            await interaction.response.send_message("Eda mone, only my owner can use this.", ephemeral=True)
+            return False
+        return True
+
+    @app_commands.command(name="config_view", description="View all active probabilities and cooldowns")
+    async def config_view(self, interaction: discord.Interaction) -> None:
+        configs = get_all_configs(db_conn)
+        embed = discord.Embed(title="⚙️ AstRobot Configuration", color=discord.Color.dark_grey())
+        embed.add_field(name="Free-Only Mode (Killswitch)", value=f"**{'ON 🔴' if gemini_svc.free_only else 'OFF 🟢'}**", inline=False)
+        for k, v in configs.items():
+            val_str = f"{v:.0%}" if isinstance(v, float) else str(v)
+            embed.add_field(name=k, value=f"`{val_str}`", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="set_cooldown", description="Set anti-spam cooldown in seconds")
+    async def set_cooldown(self, interaction: discord.Interaction, seconds: int) -> None:
+        set_config_int(db_conn, "astro_cooldown_seconds", seconds)
+        await interaction.response.send_message(f"Spam cooldown set to **{seconds} seconds**.", ephemeral=True)
+
+    @app_commands.command(name="set_chances", description="Set reaction probabilities (0.0 to 1.0)")
+    async def set_chances(
+        self, interaction: discord.Interaction, 
+        cache_reuse: float = None, kochi: float = None, curse: float = None, owner_reversal: float = None
+    ) -> None:
+        updates = []
+        if cache_reuse is not None:
+            set_config_float(db_conn, "cache_reuse_chance", cache_reuse)
+            updates.append(f"cache_reuse_chance={cache_reuse:.0%}")
+        if kochi is not None:
+            set_config_float(db_conn, "kochi_reply_chance", kochi)
+            updates.append(f"kochi_reply_chance={kochi:.0%}")
+        if curse is not None:
+            set_config_float(db_conn, "curse_reply_chance", curse)
+            updates.append(f"curse_reply_chance={curse:.0%}")
+        if owner_reversal is not None:
+            set_config_float(db_conn, "reversal_chance_owner", owner_reversal)
+            updates.append(f"reversal_chance_owner={owner_reversal:.0%}")
+        
+        msg = f"Updated configs: {', '.join(updates)}" if updates else "No changes made."
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @app_commands.command(name="toggle_killswitch", description="Toggle Free-Only API mode (circuit breaker bypass)")
+    async def toggle_killswitch(self, interaction: discord.Interaction) -> None:
+        gemini_svc.free_only = not gemini_svc.free_only
+        status = "ON 🔴 (Free API + Cache only)" if gemini_svc.free_only else "OFF 🟢 (Paid Fallback enabled)"
+        await interaction.response.send_message(f"Killswitch is now **{status}**.", ephemeral=True)
+
+tree.add_command(AdminGroup())
 
 
 # ---------------------------------------------------------------------------

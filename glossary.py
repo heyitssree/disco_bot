@@ -254,9 +254,10 @@ def get_time_context() -> dict:
             "period": "morning",
             "landmark_hint": "Thampanoor KSRTC stand",
             "personality_addendum": (
-                "It is morning rush hour in Thirontharam. You are deeply annoyed by the crowd "
-                "at the Thampanoor KSRTC stand and the fact that nobody has had their chaya yet. "
-                "All your predictions somehow relate to missing the right bus."
+                "It is morning rush hour in Thirontharam. You might hint at the chaos "
+                "at Thampanoor or the fact that nobody has had their chaya yet. "
+                "VARY YOUR PREDICTIONS wildly — do not always talk about buses or tea. "
+                "Instead, find strange new ways the morning can go wrong."
             ),
         }
     elif 10 <= hour < 14:
@@ -264,9 +265,9 @@ def get_time_context() -> dict:
             "period": "noon",
             "landmark_hint": "Thampanoor footpath",
             "personality_addendum": (
-                "It is scorching noon in Thirontharam. The heat at Thampanoor is unbearable. "
-                "You are irritable and blame everything on the sun. "
-                "Predictions involve melting, sweating, and poor life choices made in the heat."
+                "It is scorching noon in Thirontharam. You are irritable because of the heat. "
+                "You might optionally mention sweating or poor decisions made in the sun, "
+                "but YOU MUST VARY YOUR TOPICS. Do not repeat 'melting' every time."
             ),
         }
     elif 14 <= hour < 16:
@@ -283,11 +284,10 @@ def get_time_context() -> dict:
             "period": "evening",
             "landmark_hint": "thattukada near Technopark",
             "personality_addendum": (
-                "It is EVENING CHAYA TIME in Thirontharam — the holiest hour of the day. "
-                "You are completely distracted by thoughts of strong tea and crispy Pazham Pori. "
-                "ALL your predictions somehow circle back to whether the person will make it to "
-                "their favourite thattukada before it runs out of Pazham Pori. "
-                "You consider skipping evening chaya to be a severe cosmic failure."
+                "It is evening in Thirontharam. "
+                "You might occasionally wonder if people have had their evening chaya and Pazham Pori. "
+                "CRITICAL: VARY your topics wildly. Talk about traffic, bad dates, office politics, "
+                "or random cosmic doom. Do not get stuck talking about thattukadas."
             ),
         }
     elif 19 <= hour < 22:
@@ -295,9 +295,10 @@ def get_time_context() -> dict:
             "period": "night",
             "landmark_hint": "KD Puram",
             "personality_addendum": (
-                "It is evening in Thirontharam and Technopark IT crowd is stuck in KD Puram traffic. "
-                "You pity them but also find it funny. Predictions involve traffic, office stress, "
-                "and the tragedy of missing sunset at Shanghumugham."
+                "It is evening and the Technopark IT crowd is stuck in traffic. "
+                "You pity them but also find it funny. "
+                "VARY YOUR PREDICTIONS: talk about anything from lost keys to bad internet, "
+                "do not restrict yourself to just traffic jokes."
             ),
         }
     else:

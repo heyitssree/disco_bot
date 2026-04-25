@@ -9,10 +9,12 @@ from datetime import date, datetime
 from pathlib import Path
 
 import duckdb
+import os
 
 logger = logging.getLogger("astrobot.schema")
 
-DB_PATH = Path("data") / "astro_bot.db"
+_db_path_env = os.getenv("DB_PATH")
+DB_PATH = Path(_db_path_env) if _db_path_env else Path("data") / "astro_bot.db"
 
 # ---------------------------------------------------------------------------
 # Initialisation
@@ -91,6 +93,42 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
     """)
     conn.execute("""
         CREATE SEQUENCE IF NOT EXISTS daily_omens_seq START 1
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_config (
+            key VARCHAR PRIMARY KEY,
+            value_str VARCHAR,
+            value_float DOUBLE,
+            value_int INTEGER
+        )
+    """)
+
+    # Insert default config if empty
+    conn.execute("""
+        INSERT INTO bot_config (key, value_float, value_int)
+        SELECT 'astro_cooldown_seconds', NULL, 60
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'astro_cooldown_seconds');
+    """)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_float)
+        SELECT 'cache_reuse_chance', 0.50
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'cache_reuse_chance');
+    """)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_float)
+        SELECT 'kochi_reply_chance', 0.28
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'kochi_reply_chance');
+    """)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_float)
+        SELECT 'curse_reply_chance', 0.25
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'curse_reply_chance');
+    """)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_float)
+        SELECT 'reversal_chance_owner', 0.45
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'reversal_chance_owner');
     """)
 
     conn.commit()
@@ -289,6 +327,22 @@ def save_user_prediction(
     conn.commit()
 
 
+def get_todays_user_prediction(
+    conn: duckdb.DuckDBPyConnection,
+    user_id: int,
+) -> str | None:
+    """Check if the user already received a prediction today, return it if so."""
+    row = conn.execute(
+        """
+        SELECT prediction_text FROM user_prediction_history
+        WHERE user_id = ? AND CAST(timestamp AS DATE) = current_date
+        ORDER BY timestamp DESC LIMIT 1
+        """,
+        [user_id]
+    ).fetchone()
+    return row[0] if row else None
+
+
 # ---------------------------------------------------------------------------
 # Curse logs
 # ---------------------------------------------------------------------------
@@ -345,6 +399,46 @@ def save_daily_omen(
             [text, landmark, today],
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Bot Config
+# ---------------------------------------------------------------------------
+
+def get_config_float(conn: duckdb.DuckDBPyConnection, key: str, default: float) -> float:
+    row = conn.execute("SELECT value_float FROM bot_config WHERE key = ?", [key]).fetchone()
+    return float(row[0]) if row and row[0] is not None else default
+
+def get_config_int(conn: duckdb.DuckDBPyConnection, key: str, default: int) -> int:
+    row = conn.execute("SELECT value_int FROM bot_config WHERE key = ?", [key]).fetchone()
+    return int(row[0]) if row and row[0] is not None else default
+
+def set_config_float(conn: duckdb.DuckDBPyConnection, key: str, value: float) -> None:
+    conn.execute(
+        "UPDATE bot_config SET value_float = ? WHERE key = ?",
+        [value, key]
+    )
+    conn.commit()
+
+def set_config_int(conn: duckdb.DuckDBPyConnection, key: str, value: int) -> None:
+    conn.execute(
+        "UPDATE bot_config SET value_int = ? WHERE key = ?",
+        [value, key]
+    )
+    conn.commit()
+
+def get_all_configs(conn: duckdb.DuckDBPyConnection) -> dict:
+    rows = conn.execute("SELECT key, value_str, value_float, value_int FROM bot_config").fetchall()
+    config = {}
+    for r in rows:
+        key = r[0]
+        if r[2] is not None:
+            config[key] = r[2]
+        elif r[3] is not None:
+            config[key] = r[3]
+        else:
+            config[key] = r[1]
+    return config
 
 
 # ---------------------------------------------------------------------------
