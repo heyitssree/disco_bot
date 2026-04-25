@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import random
+import re
 import asyncio
 from datetime import datetime, timezone, time as dt_time
 
@@ -90,27 +91,33 @@ GENERAL_CHANNEL = os.getenv("GENERAL_CHANNEL", "general")
 # Set OWNER_ID in .env so no other user can ever invoke /admin commands.
 _raw_owner_id = os.getenv("OWNER_ID", "")
 OWNER_ID: int | None = int(_raw_owner_id) if _raw_owner_id.isdigit() else None
-# ---------------------------------------------------------------------------
-# In-Memory Spam Control
-# ---------------------------------------------------------------------------
-_user_cooldowns: dict[int, datetime] = {}
 
-def check_spam_cooldown(user_id: int) -> int:
-    """Returns seconds remaining if on cooldown, else 0."""
+# ---------------------------------------------------------------------------
+# In-Memory Rate Limiting (rolling 60-second window per user)
+# ---------------------------------------------------------------------------
+from datetime import timedelta
+
+_user_usage: dict[int, list[datetime]] = {}  # user_id -> list of timestamps
+_RATE_WINDOW_SECONDS = 60
+
+
+def get_user_minute_count(user_id: int, increment: bool = True) -> int:
+    """Return how many times user has used /astro in the last 60 seconds.
+
+    If increment=True, also records this usage (call ONCE per invocation).
+    Returns the count AFTER incrementing.
+    """
     now = datetime.now(timezone.utc)
-    if user_id in _user_cooldowns:
-        cooldown_seconds = get_config_int(db_conn, "astro_cooldown_seconds", 60)
-        time_since = (now - _user_cooldowns[user_id]).total_seconds()
-        if time_since < cooldown_seconds:
-            return int(cooldown_seconds - time_since)
-    _user_cooldowns[user_id] = now
-    return 0
+    cutoff = now - timedelta(seconds=_RATE_WINDOW_SECONDS)
 
-# ---------------------------------------------------------------------------
-# Bot startup time
-# ---------------------------------------------------------------------------
+    # Clean expired timestamps
+    _user_usage.setdefault(user_id, [])
+    _user_usage[user_id] = [t for t in _user_usage[user_id] if t > cutoff]
 
-_BOT_START_TIME: datetime = datetime.now(timezone.utc)
+    if increment:
+        _user_usage[user_id].append(now)
+
+    return len(_user_usage[user_id])
 
 # ---------------------------------------------------------------------------
 # Discord client setup
@@ -168,7 +175,6 @@ _SPAM_WRAPPERS = [
 def _format_cached_spam_reply(cached: str, name: str) -> str:
     """Strip the 'Eda/Aiyo [name],' opener from a cached prediction and
     wrap it in a varied snarky spam-reply message."""
-    import re
     # Remove leading opener like "Eda Link," / "Aiyo Link," (case-insensitive)
     stripped = re.sub(
         rf"^(Eda|Aiyo|Oola|Shokam)\s+{re.escape(name)}\s*[,.]?\s*",
@@ -188,8 +194,14 @@ def _format_cached_spam_reply(cached: str, name: str) -> str:
 # Core prediction logic
 # ---------------------------------------------------------------------------
 
-async def get_astro_prediction(user_id: int, name: str) -> str:
-    """Get an astrology prediction, using memory + cache + Gemini as needed."""
+async def get_astro_prediction(user_id: int, name: str, usage_count: int = 1) -> str:
+    """Get an astrology prediction.
+
+    Routing by usage_count within the current minute:
+      1st call  → normal flow (50% daily cache reuse, otherwise Gemini)
+      2nd call  → 35% daily cache, 65% Gemini
+      3rd+ call → always daily/pool cache with artificial delay (no API)
+    """
     profile = get_user_profile(db_conn, user_id)
 
     # Assign Rashi on first use
@@ -201,21 +213,44 @@ async def get_astro_prediction(user_id: int, name: str) -> str:
     else:
         rashi = profile.get("rashi")
 
-    # 1. Check if the user already had a prediction TODAY
     todays_pred = get_todays_user_prediction(db_conn, user_id)
-    if todays_pred:
-        cache_chance = get_config_float(db_conn, "cache_reuse_chance", 0.50)
-        if random.random() < cache_chance:
-            logger.info("Recycling today's prediction from cache for %s", name)
-            # Simulate Gemini thinking time
+
+    # ---- 3rd+ usage: always serve from cache, never call Gemini ----
+    if usage_count >= 3:
+        if todays_pred:
+            await asyncio.sleep(random.uniform(1.5, 3.0))  # feel like AI
+            return todays_pred
+        # No daily cache yet — fall through to pool cache only (no Gemini)
+        cached_pool, _ = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: api_mgr.call_cache_only(
+                cache_type="astro", name=name, fallback_message=FALLBACK_MESSAGE
+            ),
+        )
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+        return cached_pool
+
+    # ---- 2nd usage: 35% daily cache, 65% Gemini ----
+    if usage_count == 2 and todays_pred:
+        if random.random() < 0.35:
+            logger.info("2nd call: serving cached prediction for %s", name)
             await asyncio.sleep(random.uniform(1.0, 2.5))
             return todays_pred
 
+    # ---- 1st usage (or 2nd fell through): normal 50% daily cache check ----
+    if usage_count == 1 and todays_pred:
+        cache_chance = get_config_float(db_conn, "cache_reuse_chance", 0.50)
+        if random.random() < cache_chance:
+            logger.info("Recycling today's prediction from cache for %s", name)
+            await asyncio.sleep(random.uniform(1.0, 2.5))
+            return todays_pred
+
+    # ---- Gemini call ----
     past_predictions = get_last_n_predictions(db_conn, user_id, n=3)
     system_prompt = get_time_aware_system_prompt()
     user_prompt = get_astro_prompt(name, rashi=rashi, past_predictions=past_predictions)
 
-    result, from_cache = await asyncio.get_event_loop().run_in_executor(
+    result, from_cache = await asyncio.get_running_loop().run_in_executor(
         None,
         lambda: api_mgr.call(
             prompt=user_prompt,
@@ -356,22 +391,9 @@ async def on_message(message: discord.Message) -> None:
             system_prompt = get_time_aware_system_prompt()
             user_prompt = get_qa_prompt(message.author.display_name, content_without_ping)
 
-            if FREE_TIER_MODE:
-                async with message.channel.typing():
-                    await asyncio.sleep(random.uniform(1.0, 2.0))
-                    reply, _ = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: api_mgr.call(
-                            prompt=user_prompt,
-                            system_prompt=system_prompt,
-                            cache_type="qa",
-                            name=message.author.display_name,
-                            fallback_message=FALLBACK_MESSAGE,
-                        ),
-                    )
-            else:
+            async def _do_qa_call() -> str:
                 await asyncio.sleep(random.uniform(1.0, 2.0))
-                reply, _ = await asyncio.get_event_loop().run_in_executor(
+                reply, _ = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda: api_mgr.call(
                         prompt=user_prompt,
@@ -381,20 +403,19 @@ async def on_message(message: discord.Message) -> None:
                         fallback_message=FALLBACK_MESSAGE,
                     ),
                 )
+                return reply
+
+            if FREE_TIER_MODE:
+                async with message.channel.typing():
+                    reply = await _do_qa_call()
+            else:
+                reply = await _do_qa_call()
+
             await message.reply(reply)
             return
 
     # ---- Legacy prefix "astro" command ----
     if message.content.lower().startswith("astro"):
-
-        # Spam Check
-        cooldown = check_spam_cooldown(message.author.id)
-        if cooldown > 0:
-            cached_pred = get_todays_user_prediction(db_conn, message.author.id)
-            if cached_pred:
-                reply = _format_cached_spam_reply(cached_pred, message.author.display_name)
-                await message.reply(reply)
-            return
 
         # "astro @username" → curse/roast the mentioned user (instant, no API)
         if message.mentions:
@@ -402,6 +423,18 @@ async def on_message(message: discord.Message) -> None:
             # Don't curse the bot itself
             if target.id == bot.user.id:
                 await message.reply("Eda, you think I can curse myself? Oola idea.")
+                return
+
+            # Bot-loop protection: if someone is trying to curse another bot
+            if target.bot:
+                bot_curses = [
+                    f"Aiyo {message.author.mention}, you are trying to make me fight other bots? What is this Thampanoor nonsense.",
+                    f"Vayadi {message.author.mention}, trying to start a bot war in this server? The stars curse your WiFi for this.",
+                    f"{message.author.mention} Eda, that is a bot. You think bots have feelings? Even I have more feelings than this plan.",
+                    f"Shokam {message.author.mention}. Trying to proxy-curse a bot? Go outside. Touch some grass near Shanghumugham.",
+                    f"Oola {message.author.mention}, nice try. The universe sees you. And it is judging you very hard right now.",
+                ]
+                await message.reply(random.choice(bot_curses))
                 return
 
             curse_word = get_random_curse()
@@ -429,11 +462,14 @@ async def on_message(message: discord.Message) -> None:
         display_name = target.display_name
         mention_str = target.mention
 
+        # Record usage and get count for tiered cache routing
+        usage_count = get_user_minute_count(target.id, increment=True)
+
         if FREE_TIER_MODE:
             async with message.channel.typing():
-                prediction = await get_astro_prediction(target.id, display_name)
+                prediction = await get_astro_prediction(target.id, display_name, usage_count=usage_count)
         else:
-            prediction = await get_astro_prediction(target.id, display_name)
+            prediction = await get_astro_prediction(target.id, display_name, usage_count=usage_count)
 
         final_reply = prediction.replace(display_name, mention_str)
         await message.reply(final_reply)
@@ -454,7 +490,7 @@ async def on_message(message: discord.Message) -> None:
 
         async with message.channel.typing():
             await asyncio.sleep(random.uniform(1.0, 2.0))
-            reply, from_cache = await asyncio.get_event_loop().run_in_executor(
+            reply, from_cache = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: api_mgr.call(
                     prompt=user_prompt,
@@ -488,32 +524,52 @@ async def astro_slash(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
 ) -> None:
-    cooldown = check_spam_cooldown(interaction.user.id)
-    if cooldown > 0:
-        cached_pred = get_todays_user_prediction(db_conn, interaction.user.id)
-        if cached_pred:
-            reply = _format_cached_spam_reply(cached_pred, interaction.user.display_name)
-            await interaction.response.send_message(reply)
-        else:
-            await interaction.response.send_message(
-                f"Eda mone, chill! Wait {cooldown} seconds before asking again.", ephemeral=True
-            )
+    # Bot-loop protection: curse whoever tries to feed a bot into us
+    if user is not None and user.bot:
+        bot_loop_curses = [
+            f"Aiyo {interaction.user.mention}, you are trying to make me talk to another bot? What is this Thampanoor robot conference.",
+            f"Eda {interaction.user.mention}, that is a bot. You think bots need cosmic readings? Go touch some grass near Padmanabhaswamy.",
+            f"{interaction.user.mention} Shokam. Trying to start a bot loop in this server? The stars curse your internet speed for this nonsense.",
+            f"Vayadi {interaction.user.mention}, a bot asking for a bot's horoscope? Even Rahu cannot predict this level of stupidity.",
+            f"Oola {interaction.user.mention}, nice try. Bot into bot into bot — I know exactly what you are doing. The universe sees and judges very hard.",
+        ]
+        await interaction.response.send_message(random.choice(bot_loop_curses))
         return
+
+    # Record usage and get per-minute count BEFORE checking cache
+    usage_count = get_user_minute_count(interaction.user.id, increment=True)
 
     target = user or interaction.user
     display_name = target.display_name
     mention_str = target.mention
 
+    # Tiered response for 2nd+ use within the minute
+    if usage_count > 1:
+        cached_pred = get_todays_user_prediction(db_conn, interaction.user.id)
+        if cached_pred:
+            if usage_count == 2 and random.random() >= 0.35:
+                # 65% chance: fall through to Gemini (handled below)
+                pass
+            else:
+                # 2nd use (35% case): short delay. 3rd+ use: longer delay to feel AI-generated.
+                reply = _format_cached_spam_reply(cached_pred, display_name)
+                delay = random.uniform(1.5, 3.5) if usage_count >= 3 else random.uniform(1.0, 2.5)
+                await interaction.response.defer(thinking=True)
+                await asyncio.sleep(delay)
+                await interaction.followup.send(reply)
+                return
+
     await interaction.response.defer(thinking=True)
     await asyncio.sleep(random.uniform(1.0, 2.0))
 
-    prediction = await get_astro_prediction(target.id, display_name)
+    prediction = await get_astro_prediction(target.id, display_name, usage_count=usage_count)
     final_reply = prediction.replace(display_name, mention_str)
     await interaction.followup.send(final_reply)
 
-    # +2 Boli Points for using /astro
-    update_boli_points(db_conn, interaction.user.id, 2)
-    logger.info("%s used /astro → +2 Boli Points", interaction.user.display_name)
+    # +2 Boli Points for using /astro (only on first fresh call)
+    if usage_count == 1:
+        update_boli_points(db_conn, interaction.user.id, 2)
+        logger.info("%s used /astro → +2 Boli Points", interaction.user.display_name)
 
 
 @tree.command(name="rank", description="See the Top Appis — Boli Points leaderboard")
@@ -762,7 +818,7 @@ async def daily_omen_and_weather() -> None:
         landmark=landmark,
     )
 
-    result, from_cache = await asyncio.get_event_loop().run_in_executor(
+    result, from_cache = await asyncio.get_running_loop().run_in_executor(
         None,
         lambda: api_mgr.call(
             prompt=user_prompt,

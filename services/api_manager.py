@@ -125,6 +125,21 @@ class ApiManager:
             result = result.replace("{curse}", curse_used)
         return result
 
+    def call_cache_only(
+        self,
+        cache_type: str,
+        name: str,
+        fallback_message: str = "AstRobot-nte lamp went off. KSEB current problem. Try again mone.",
+        curse_used: str | None = None,
+    ) -> tuple[str, bool]:
+        """Serve directly from DuckDB cache pool without touching Gemini API at all.
+
+        Used for 3rd+ usage in a single minute — guaranteed no API cost.
+        Returns (response_text, is_from_cache=True).
+        """
+        cached = self._serve_cache(cache_type, name, curse_used)
+        return (cached or fallback_message, True)
+
     def status_dict(self) -> dict:
         """Return a status snapshot for /health."""
         self._refresh_window()
