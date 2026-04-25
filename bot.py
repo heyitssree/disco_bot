@@ -35,6 +35,8 @@ from schema import (
     set_config_int,
     get_all_configs,
     get_todays_user_prediction,
+    get_level_from_points,
+    points_for_level,
 )
 from glossary import LANDMARKS, RASHIS, get_daily_weather_forecast
 from prompts import (
@@ -171,6 +173,56 @@ _SPAM_WRAPPERS = [
     "I only have one doom per customer, mone. {prediction}",
     "You think fate changes every 5 minutes? {prediction}",
 ]
+
+_LEVEL_TITLES: list[tuple[int, str]] = [
+    (0,  "Tourist"),
+    (6,  "Thampanoor Regular"),
+    (11, "Chalai Veteran"),
+    (21, "Kowdiar Insider"),
+    (36, "Thirontharam Native"),
+    (51, "Neyyattinkara Gopan"),
+    (71, "Cosmic Sage of Thirontharam"),
+    (91, "The Chosen One"),
+]
+
+_LEVEL_UP_MESSAGES: list[str] = [
+    "Aiyo {user}! Level **{level}** achieved! The stars have taken note. Reluctantly.",
+    "Eda {user}, Level **{level}** unlocked! Your Thirontharam energy is growing. Still not enough to beat KD Puram traffic, but still.",
+    "{user} has reached Level **{level}**! Even the thattukada pillacha is impressed. Slightly.",
+    "Oola! {user} is now Level **{level}**! The cosmos updated your file. Long overdue, honestly.",
+    "Shokam to everyone else — {user} just hit Level **{level}**! The universe is watching. And judging the rest.",
+    "{user} Level **{level}** achieved! AstRobot acknowledges your slang dedication. Chumma. Keep going.",
+    "Aiyo {user}, Level **{level}**! Even the Ponmudi mist parted briefly to recognise this moment. Kidilam.",
+    "Eda {user}, you are now Level **{level}**! Indian Coffee House Thampanoor will serve you slightly faster now.",
+]
+
+
+def get_level_title(level: int) -> str:
+    title = _LEVEL_TITLES[0][1]
+    for threshold, name in _LEVEL_TITLES:
+        if level >= threshold:
+            title = name
+    return title
+
+
+async def _maybe_announce_levelup(
+    mention: str,
+    old_points: int,
+    new_points: int,
+    channel: discord.abc.Messageable,
+) -> None:
+    """Send a level-up notification if the points delta crossed a threshold."""
+    old_level = get_level_from_points(old_points)
+    new_level = get_level_from_points(new_points)
+    if new_level <= old_level:
+        return
+    msg = random.choice(_LEVEL_UP_MESSAGES).format(user=mention, level=new_level)
+    old_title = get_level_title(old_level)
+    new_title = get_level_title(new_level)
+    if new_title != old_title:
+        msg += f"\n🏅 *New title unlocked: **{new_title}***"
+    await channel.send(msg)
+
 
 def _format_cached_spam_reply(cached: str, name: str) -> str:
     """Strip the 'Eda/Aiyo [name],' opener from a cached prediction and
@@ -365,7 +417,12 @@ async def on_message(message: discord.Message) -> None:
     triggered_words = contains_boli_trigger(message.content)
     if triggered_words:
         points = len(triggered_words) * 5
+        profile = get_user_profile(db_conn, message.author.id)
+        old_pts = profile["boli_points"] if profile else 0
         update_boli_points(db_conn, message.author.id, points)
+        await _maybe_announce_levelup(
+            message.author.mention, old_pts, old_pts + points, message.channel
+        )
         logger.debug(
             "%s triggered Boli words %s → +%d pts",
             message.author.display_name, triggered_words, points
@@ -568,8 +625,14 @@ async def astro_slash(
 
     # +2 Boli Points for using /astro (only on first fresh call)
     if usage_count == 1:
+        profile = get_user_profile(db_conn, interaction.user.id)
+        old_pts = profile["boli_points"] if profile else 0
         update_boli_points(db_conn, interaction.user.id, 2)
         logger.info("%s used /astro → +2 Boli Points", interaction.user.display_name)
+        if interaction.channel:
+            await _maybe_announce_levelup(
+                interaction.user.mention, old_pts, old_pts + 2, interaction.channel
+            )
 
 
 @tree.command(name="rank", description="See the Top Appis — Boli Points leaderboard")
@@ -593,9 +656,11 @@ async def rank_slash(interaction: discord.Interaction) -> None:
     for i, entry in enumerate(leaders):
         medal = medals[i] if i < 3 else f"**{i + 1}.**"
         rashi_str = f" · {entry['rashi']}" if entry.get("rashi") else ""
+        level = get_level_from_points(entry["boli_points"])
+        title = get_level_title(level)
         embed.add_field(
-            name=f"{medal} {entry['username']}{rashi_str}",
-            value=f"🍮 **{entry['boli_points']} Boli Points** · {entry['prediction_count']} readings",
+            name=f"{medal} {entry['username']}{rashi_str} · Lv.{level}",
+            value=f"🍮 **{entry['boli_points']} Boli Points** · {entry['prediction_count']} readings · *{title}*",
             inline=False,
         )
 
@@ -615,13 +680,28 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
     rashi = profile.get("rashi") or "Not yet assigned"
     pts = profile.get("boli_points", 0)
     count = profile.get("prediction_count", 0)
+    level = get_level_from_points(pts)
+    title = get_level_title(level)
+
+    if level < 100:
+        next_lvl_pts = points_for_level(level + 1)
+        curr_lvl_pts = points_for_level(level)
+        progress = pts - curr_lvl_pts
+        needed = next_lvl_pts - curr_lvl_pts
+        filled = int((progress / needed) * 10) if needed > 0 else 10
+        bar = "█" * filled + "░" * (10 - filled)
+        progress_line = f"📈 `[{bar}]` {progress}/{needed} pts → Level {level + 1}"
+    else:
+        progress_line = "🌟 Maximum level reached! Ninte cosmic destiny is sealed, mone."
 
     await interaction.response.send_message(
         f"**Your AstRobot Profile**\n"
         f"🌟 Rashi: **{rashi}**\n"
+        f"⚔️ Level: **{level}** — *{title}*\n"
+        f"{progress_line}\n"
         f"🍮 Boli Points: **{pts}**\n"
         f"🔮 Predictions received: **{count}**\n\n"
-        f"*Keep using Thirontharam slang to earn more points. Kidilam!*",
+        f"*Use Thirontharam slang to earn points and level up. Kidilam!*",
         ephemeral=True,
     )
 

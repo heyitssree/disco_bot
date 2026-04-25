@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 from datetime import date, datetime
 from pathlib import Path
 
@@ -468,3 +469,35 @@ def get_table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
         row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
         counts[table] = row[0] if row else 0
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Leveling system
+# ---------------------------------------------------------------------------
+
+def points_for_level(level: int) -> int:
+    """Total Boli Points required to reach *level* from zero.
+
+    Formula: 5 * n * (n + 3)
+    Per-level cost grows by 10 each step:
+      Level 1  →  20 pts total
+      Level 10 →  650 pts total
+      Level 50 →  13,250 pts total
+      Level 100 → 51,500 pts total
+    """
+    if level <= 0:
+        return 0
+    n = min(level, 100)
+    return 5 * n * (n + 3)
+
+
+def get_level_from_points(points: int) -> int:
+    """Compute level (0–100) from total Boli Points.
+
+    Solves 5n(n+3) ≤ points for the largest integer n.
+    """
+    if points <= 0:
+        return 0
+    # 5n² + 15n - points = 0  →  n = (-15 + sqrt(225 + 20·points)) / 10
+    n = int((-15 + math.sqrt(225 + 20 * points)) / 10)
+    return min(max(n, 0), 100)
