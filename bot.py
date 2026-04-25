@@ -85,6 +85,11 @@ PAID_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY")
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 HORRIBLESCOPE_CHANNEL = os.getenv("HORRIBLESCOPE_CHANNEL", "off-topic")
 GENERAL_CHANNEL = os.getenv("GENERAL_CHANNEL", "general")
+
+# Bot owner's Discord user ID — MUST match the owner of the bot application.
+# Set OWNER_ID in .env so no other user can ever invoke /admin commands.
+_raw_owner_id = os.getenv("OWNER_ID", "")
+OWNER_ID: int | None = int(_raw_owner_id) if _raw_owner_id.isdigit() else None
 # ---------------------------------------------------------------------------
 # In-Memory Spam Control
 # ---------------------------------------------------------------------------
@@ -637,17 +642,24 @@ async def help_slash(interaction: discord.Interaction) -> None:
 # Admin Slash Commands
 # ---------------------------------------------------------------------------
 
-@app_commands.default_permissions(administrator=True)
 class AdminGroup(app_commands.Group):
+    """Admin controls — visible and usable only by the bot owner."""
     def __init__(self):
         super().__init__(name="admin", description="AstRobot owner configuration controls")
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Primary guard: hardcoded owner ID from .env (fast, no API call)
+        if OWNER_ID and interaction.user.id == OWNER_ID:
+            return True
+        # Fallback: check against Discord's application owner (slower but safe)
         app_info = await bot.application_info()
-        if interaction.user.id != app_info.owner.id:
-            await interaction.response.send_message("Eda mone, only my owner can use this.", ephemeral=True)
-            return False
-        return True
+        if interaction.user.id == app_info.owner.id:
+            return True
+        # Deny everyone else — ephemeral so it's not publicly embarrassing
+        await interaction.response.send_message(
+            "Eda mone, only my owner can use this. Chumma po.", ephemeral=True
+        )
+        return False
 
     @app_commands.command(name="config_view", description="View all active probabilities and cooldowns")
     async def config_view(self, interaction: discord.Interaction) -> None:
