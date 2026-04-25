@@ -84,6 +84,7 @@ FREE_API_KEY = os.getenv("GEMINI_API_KEY_FREE")
 PAID_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY")
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 HORRIBLESCOPE_CHANNEL = os.getenv("HORRIBLESCOPE_CHANNEL", "off-topic")
+GENERAL_CHANNEL = os.getenv("GENERAL_CHANNEL", "general")
 # ---------------------------------------------------------------------------
 # In-Memory Spam Control
 # ---------------------------------------------------------------------------
@@ -238,14 +239,31 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
+    """Welcome new member and generate a fresh astrology prediction for them."""
     channel = (
-        discord.utils.get(member.guild.text_channels, name="general")
+        discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
+        or discord.utils.get(member.guild.text_channels, name="general")
         or member.guild.system_channel
     )
-    if channel:
-        msg = random.choice(WELCOME_MESSAGES).format(user=member.mention)
-        await channel.send(msg)
-        logger.info("Welcomed new member %s in %s", member.display_name, channel.name)
+    if not channel:
+        logger.warning("Could not find a welcome channel for new member %s", member.display_name)
+        return
+
+    # Register the user
+    upsert_user(db_conn, member.id, member.display_name)
+
+    # Send welcome message first
+    welcome_msg = random.choice(WELCOME_MESSAGES).format(user=member.mention)
+    await channel.send(welcome_msg)
+
+    # Generate a fresh prediction for them
+    async with channel.typing():
+        prediction = await get_astro_prediction(member.id, member.display_name)
+        # Replace plain name with mention in the prediction
+        personalised = prediction.replace(member.display_name, member.mention)
+        await channel.send(f"And your first cosmic doom reading, {member.mention}:\n{personalised}")
+
+    logger.info("Welcomed new member %s with prediction in #%s", member.display_name, channel.name)
 
 
 @bot.event
