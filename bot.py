@@ -46,6 +46,7 @@ from prompts import (
     get_curse_prompt,
     get_qa_prompt,
     get_summ_prompt,
+    SUMM_SYSTEM_PROMPT,
     FALLBACK_MESSAGE,
     WELCOME_MESSAGES,
 )
@@ -727,19 +728,21 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
     )
 
 
-@tree.command(name="summ", description="Get a witty Manglish summary of recent chat")
+@tree.command(name="summ", description="Get a factual summary of recent chat")
 @app_commands.describe(
     limit="Number of messages to summarise (1–100)",
     user1="Only include messages from this user (optional)",
     user2="Also include messages from this user (optional)",
+    public="Show summary to everyone? (default: only me)",
 )
 async def summ_slash(
     interaction: discord.Interaction,
     limit: app_commands.Range[int, 1, 100] = 30,
     user1: discord.Member | None = None,
     user2: discord.Member | None = None,
+    public: bool = False,
 ) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await interaction.response.defer(ephemeral=not public, thinking=True)
 
     # Collect history
     raw_messages: list[discord.Message] = []
@@ -758,8 +761,8 @@ async def summ_slash(
 
     if not raw_messages:
         await interaction.followup.send(
-            "Eda, no messages found to summarise. Chumma use the command when people are actually talking.",
-            ephemeral=True,
+            "No messages found to summarise. Try a larger limit or different user filters.",
+            ephemeral=not public,
         )
         return
 
@@ -776,20 +779,19 @@ async def summ_slash(
 
     if not lines:
         await interaction.followup.send(
-            "Aiyo, nothing worth summarising in those messages. All commands and bot talk. Shokam.",
-            ephemeral=True,
+            "Nothing to summarise — all messages were commands or from bots.",
+            ephemeral=not public,
         )
         return
 
     conversation_text = "\n".join(lines)
     user_prompt = get_summ_prompt(conversation_text)
-    system_prompt = get_time_aware_system_prompt(db_conn)
 
     summary, _ = await asyncio.get_running_loop().run_in_executor(
         None,
         lambda: api_mgr.call(
             prompt=user_prompt,
-            system_prompt=system_prompt,
+            system_prompt=SUMM_SYSTEM_PROMPT,
             cache_type="qa",
             name="SummaryRequest",
             fallback_message=FALLBACK_MESSAGE,
@@ -802,8 +804,8 @@ async def summ_slash(
         filter_note = f" (filtered to {', '.join(names)})"
 
     await interaction.followup.send(
-        f"**📜 Chat Summary — last {len(lines)} messages{filter_note}:**\n{summary}",
-        ephemeral=True,
+        f"📜 **Chat Summary — last {len(lines)} messages{filter_note}:**\n{summary}",
+        ephemeral=not public,
     )
 
 
@@ -885,7 +887,7 @@ async def help_slash(interaction: discord.Interaction) -> None:
             "`/astro user:@someone` — Get a prediction for someone else\n"
             "`/rank` — Top 10 Boli Points leaderboard\n"
             "`/mypoints` — Your Rashi, Boli Points, level, and title\n"
-            "`/summ` — Witty Manglish summary of recent chat\n"
+            "`/summ` — Factual English summary of recent chat (optional: `public:True` to show to everyone)\n"
             "`/shop view` — Browse the Boli Marketplace\n"
             "`/shop buy` — Spend Boli Points on perks (Curse Protection, Custom Rashi)\n"
             "`/help` — This menu"

@@ -206,19 +206,23 @@ def get_daily_omen_prompt(
 # Conversation summary prompt
 # ---------------------------------------------------------------------------
 
+SUMM_SYSTEM_PROMPT = """You are a neutral summarisation assistant. Your only job is to produce concise, factual English summaries of conversations. You have no persona, no opinions, and no style. Output plain, clear English only."""
+
+
 def get_summ_prompt(conversation: str) -> str:
-    """Prompt for a witty Thiruvananthapuram/Kochi slang summary of a conversation."""
-    return f"""Below is a Discord conversation. Summarise it briefly and wittily, entirely in Thiruvananthapuram/Kochi Manglish slang.
+    """Prompt for a factual, no-persona summary of a conversation."""
+    return f"""Below is a Discord conversation. The messages may be in English, Malayalam, Manglish (Malayalam-English mix), or a combination. Translate and summarise everything into plain English.
 
 CONVERSATION:
 {conversation}
 
 Requirements:
 - 2–4 sentences maximum.
-- Use Trivandrum Manglish naturally (Eda, Aiyo, Shokam, Chumma, Kidilam, etc.).
-- Be slightly sarcastic but not mean.
-- Do NOT include usernames or IDs in the summary — describe people as 'one fella', 'another mone', etc.
-- Never mention religion or politics."""
+- Output in English only — clear, direct, factual summary regardless of the input language.
+- No personality, no slang, no sarcasm, no persona of any kind.
+- Do NOT include usernames or IDs in the summary — describe people as 'one user', 'another user', etc.
+- Never mention religion or politics.
+- Focus on: what happened, what was discussed, what decisions were made, if any."""
 
 
 # ---------------------------------------------------------------------------
