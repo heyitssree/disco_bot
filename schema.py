@@ -676,6 +676,67 @@ def get_table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return counts
 
 
+def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
+    """Return a rich set of runtime statistics for the /health command."""
+    stats: dict = {}
+
+    # --- User activity ---
+    stats["total_users"] = (
+        conn.execute("SELECT COUNT(*) FROM user_stats").fetchone() or (0,)
+    )[0]
+    stats["active_today"] = (
+        conn.execute(
+            "SELECT COUNT(*) FROM user_stats WHERE CAST(last_seen AS DATE) = current_date"
+        ).fetchone() or (0,)
+    )[0]
+    stats["active_week"] = (
+        conn.execute(
+            "SELECT COUNT(*) FROM user_stats WHERE last_seen >= current_timestamp - INTERVAL 7 DAY"
+        ).fetchone() or (0,)
+    )[0]
+    stats["total_boli_points"] = (
+        conn.execute("SELECT COALESCE(SUM(boli_points), 0) FROM user_stats").fetchone() or (0,)
+    )[0]
+    top_row = conn.execute(
+        "SELECT username, boli_points FROM user_stats ORDER BY boli_points DESC LIMIT 1"
+    ).fetchone()
+    stats["top_user"] = f"{top_row[0]} ({top_row[1]} pts)" if top_row else "N/A"
+
+    # --- Prediction activity ---
+    stats["predictions_today"] = (
+        conn.execute(
+            "SELECT COUNT(*) FROM user_prediction_history WHERE CAST(timestamp AS DATE) = current_date"
+        ).fetchone() or (0,)
+    )[0]
+    cache_rows = conn.execute(
+        "SELECT cache_type, COUNT(*) FROM predictions_cache GROUP BY cache_type ORDER BY cache_type"
+    ).fetchall()
+    stats["cache_by_type"] = {r[0]: r[1] for r in cache_rows}
+
+    # --- Curse log ---
+    stats["curses_today"] = (
+        conn.execute(
+            "SELECT COUNT(*) FROM curse_logs WHERE CAST(timestamp AS DATE) = current_date"
+        ).fetchone() or (0,)
+    )[0]
+    stats["curses_total"] = (
+        conn.execute("SELECT COUNT(*) FROM curse_logs").fetchone() or (0,)
+    )[0]
+    top_curse = conn.execute(
+        "SELECT curse_used, COUNT(*) AS n FROM curse_logs GROUP BY curse_used ORDER BY n DESC LIMIT 1"
+    ).fetchone()
+    stats["top_curse"] = f'"{top_curse[0]}" × {top_curse[1]}' if top_curse else "N/A"
+
+    # --- Active perks ---
+    stats["active_perks"] = (
+        conn.execute(
+            "SELECT COUNT(*) FROM user_perks WHERE expires_at > current_timestamp"
+        ).fetchone() or (0,)
+    )[0]
+
+    return stats
+
+
 # ---------------------------------------------------------------------------
 # Leveling system
 # ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from schema import (
     init_db,
     seed_local_knowledge,
     get_table_counts,
+    get_health_stats,
     get_user_profile,
     upsert_user,
     get_last_n_predictions,
@@ -38,6 +39,7 @@ from schema import (
     has_active_perk,
     grant_perk,
     get_perk_expiry,
+    DB_PATH,
 )
 from glossary import RASHIS
 from prompts import (
@@ -826,12 +828,33 @@ async def health_slash(interaction: discord.Interaction) -> None:
     gemini_status = gemini_svc.status_dict()
     rate_status = api_mgr.status_dict()
     table_counts = get_table_counts(db_conn)
+    health = get_health_stats(db_conn)
+
+    # DB file size
+    try:
+        db_size_mb = DB_PATH.stat().st_size / (1024 * 1024)
+        db_size_str = f"{db_size_mb:.2f} MB"
+    except Exception:
+        db_size_str = "N/A"
+
+    # Unique users active in the in-memory rate-limit window
+    now_utc = datetime.now(timezone.utc)
+    from datetime import timedelta as _td
+    cutoff = now_utc - _td(seconds=60)
+    active_in_window = sum(
+        1 for timestamps in _user_usage.values()
+        if any(t > cutoff for t in timestamps)
+    )
 
     embed = discord.Embed(
         title="🔧 AstRobot V2 — Health Status",
         color=discord.Color.red() if gemini_status["circuit_open"] else discord.Color.green(),
     )
+
+    # ── Uptime ──────────────────────────────────────────────────────────────
     embed.add_field(name="⏱️ Uptime", value=uptime_str, inline=False)
+
+    # ── Gemini API ──────────────────────────────────────────────────────────
     embed.add_field(
         name="🔑 Gemini API Usage",
         value=(
@@ -845,6 +868,8 @@ async def health_slash(interaction: discord.Interaction) -> None:
         ),
         inline=True,
     )
+
+    # ── Circuit Breaker ─────────────────────────────────────────────────────
     embed.add_field(
         name="⚡ Circuit Breaker",
         value=(
@@ -854,18 +879,64 @@ async def health_slash(interaction: discord.Interaction) -> None:
         ),
         inline=True,
     )
+
+    # ── Rate Limiter ────────────────────────────────────────────────────────
     embed.add_field(
         name="🚦 Rate Limiter",
         value=(
             f"Used: **{rate_status['rpm_used']}/{rate_status['rpm_limit']} RPM**\n"
             f"Window resets in: {rate_status['window_resets_in_seconds']}s\n"
+            f"Users active in last 60s: **{active_in_window}**\n"
             f"Free Tier Mode: {'ON' if rate_status['free_tier_mode'] else 'OFF'}\n"
-            f"Free-Only Mode (Killswitch): **{'ON 🔴' if gemini_svc.free_only else 'OFF 🟢'}**"
+            f"Free-Only Killswitch: **{'ON 🔴' if gemini_svc.free_only else 'OFF 🟢'}**"
         ),
         inline=False,
     )
+
+    # ── User Activity ───────────────────────────────────────────────────────
+    embed.add_field(
+        name="👥 User Activity",
+        value=(
+            f"Total registered: **{health['total_users']}**\n"
+            f"Active today: **{health['active_today']}**\n"
+            f"Active this week: **{health['active_week']}**\n"
+            f"Total Boli Points in circulation: **{health['total_boli_points']:,}**\n"
+            f"Top user: {health['top_user']}"
+        ),
+        inline=True,
+    )
+
+    # ── Prediction Activity ─────────────────────────────────────────────────
+    cache_breakdown = " · ".join(
+        f"{k}: {v}" for k, v in health["cache_by_type"].items()
+    ) or "empty"
+    embed.add_field(
+        name="🔮 Predictions",
+        value=(
+            f"Generated today: **{health['predictions_today']}**\n"
+            f"Cache pool: {cache_breakdown}"
+        ),
+        inline=True,
+    )
+
+    # ── Curse Log ───────────────────────────────────────────────────────────
+    embed.add_field(
+        name="🤬 Curses",
+        value=(
+            f"Today: **{health['curses_today']}**  |  All-time: **{health['curses_total']}**\n"
+            f"Top word: {health['top_curse']}\n"
+            f"Active Curse Protections: **{health['active_perks']}**"
+        ),
+        inline=False,
+    )
+
+    # ── DuckDB ──────────────────────────────────────────────────────────────
     counts_str = "\n".join(f"  `{t}`: {n}" for t, n in table_counts.items())
-    embed.add_field(name="🗄️ DuckDB Row Counts", value=counts_str, inline=False)
+    embed.add_field(
+        name=f"🗄️ DuckDB  ({db_size_str})",
+        value=counts_str,
+        inline=False,
+    )
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
