@@ -1,0 +1,19 @@
+[Unit]
+Description=AstRobot V2 — Trivandrum Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astrobot
+WorkingDirectory=/home/astrobot/disco_bot
+EnvironmentFile=/home/astrobot/disco_bot/.env
+ExecStartPre=/bin/bash /home/astrobot/disco_bot/scripts/clean_pycache.sh
+ExecStart=/home/astrobot/disco_bot/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/astrobot/disco_bot/logs/bot.log
+StandardError=append:/home/astrobot/disco_bot/logs/bot.log
+
+[Install]
+WantedBy=multi-user.target

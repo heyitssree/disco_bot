@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from glossary import get_time_context, get_current_weather_context
+from glossary import get_time_context, get_current_weather_context, get_glossary_text
 from curses import KOCHI_SLANG
 
 # ---------------------------------------------------------------------------
@@ -36,7 +36,13 @@ WORD FREQUENCY RULES (CRITICAL):
 
 AUTHENTICITY (CRITICAL — NEVER BREAK THIS):
 You are from Trivandrum, not Kochi. NEVER use these Kochi/outside slang words under any circumstances: {kochi_words}.
-Using any of these instantly breaks your character. There are no exceptions."""
+Using any of these instantly breaks your character. There are no exceptions.
+
+ACCURACY RULE (highest priority):
+- PRIMARY goal: answer the user's question accurately and completely.
+- SECONDARY goal: wrap that accurate answer in your Trivandrum persona.
+- Never sacrifice correctness for a joke or slang. Facts come first, wit comes second.
+- For factual questions (scores, dates, prices, names): state the fact plainly in the first sentence, THEN add personality. Never bury the answer behind jokes."""
 
 
 def _build_base_prompt() -> str:
@@ -48,10 +54,17 @@ def _build_base_prompt() -> str:
 # Dynamic system prompt (time + weather injected)
 # ---------------------------------------------------------------------------
 
-def get_time_aware_system_prompt() -> str:
-    """Compose full system prompt with current time period and weather context."""
+def get_time_aware_system_prompt(db_conn=None) -> str:
+    """Compose full system prompt with current time period, weather context, and local glossary."""
     time_ctx = get_time_context()
     weather = get_current_weather_context()
+
+    glossary_section = ""
+    if db_conn is not None:
+        try:
+            glossary_section = f"\n\nLOCAL KNOWLEDGE (use these naturally — do not list them, weave them in):\n{get_glossary_text(db_conn)}"
+        except Exception:
+            pass  # glossary failure must never break the main prompt
 
     return f"""{_build_base_prompt()}
 
@@ -61,7 +74,7 @@ CURRENT CONTEXT (Trivandrum right now):
 - Focus area: {time_ctx['landmark_hint']}
 
 TIME PERSONALITY:
-{time_ctx['personality_addendum']}"""
+{time_ctx['personality_addendum']}{glossary_section}"""
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +153,8 @@ def get_qa_prompt(name: str, question: str) -> str:
     """Prompt for sarcastic answers to tagged questions."""
     return f"""A user named {name} tagged me and asked: "{question}"
 
+RELEVANCE CHECK: If this is a factual question (score, date, name, how-to), lead with the direct fact in plain language. Then — and only then — add Trivandrum persona and commentary.
+
 Requirements:
 - Reply to their question in a highly sarcastic and dismissive manner.
 - Must be in Trivandrum Manglish.
@@ -185,6 +200,25 @@ def get_daily_omen_prompt(
         rain_mm=rain_mm,
         landmark=landmark,
     )
+
+
+# ---------------------------------------------------------------------------
+# Conversation summary prompt
+# ---------------------------------------------------------------------------
+
+def get_summ_prompt(conversation: str) -> str:
+    """Prompt for a witty Thiruvananthapuram/Kochi slang summary of a conversation."""
+    return f"""Below is a Discord conversation. Summarise it briefly and wittily, entirely in Thiruvananthapuram/Kochi Manglish slang.
+
+CONVERSATION:
+{conversation}
+
+Requirements:
+- 2–4 sentences maximum.
+- Use Trivandrum Manglish naturally (Eda, Aiyo, Shokam, Chumma, Kidilam, etc.).
+- Be slightly sarcastic but not mean.
+- Do NOT include usernames or IDs in the summary — describe people as 'one fella', 'another mone', etc.
+- Never mention religion or politics."""
 
 
 # ---------------------------------------------------------------------------

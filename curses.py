@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import random
 
 # ---------------------------------------------------------------------------
@@ -105,13 +106,37 @@ def get_random_kochi_response(username: str) -> str:
     return template.format(user=username)
 
 
+def contains_curse_word(text: str) -> tuple[bool, str | None]:
+    """Return (matched, word) using word boundaries to avoid false positives.
+
+    Uses \\b so e.g. 'mandarin' will not match 'mandan'.
+    """
+    lower = text.lower()
+    for word in CURSE_WORDS:
+        if re.search(rf"\b{re.escape(word)}\b", lower):
+            return True, word
+    return False, None
+
+
 def contains_boli_trigger(content: str) -> list[str]:
-    """Return list of unique BOLI_TRIGGER_WORDS found in content (case-insensitive)."""
-    content_lower = content.lower()
-    return [word for word in BOLI_TRIGGER_WORDS if word in content_lower]
+    """Return list of unique BOLI_TRIGGER_WORDS found in content (case-insensitive).
+
+    Uses word boundaries so e.g. 'kidilam' won't match inside 'akidilam'.
+    Multi-word phrases like 'kili poyi' are matched as a contiguous span.
+    """
+    found: list[str] = []
+    for word in BOLI_TRIGGER_WORDS:
+        # Build a pattern: \b around single tokens, flexible space for multi-word
+        pattern = r"\b" + r"\s+".join(re.escape(part) for part in word.split()) + r"\b"
+        if re.search(pattern, content, re.IGNORECASE):
+            found.append(word)
+    return found
 
 
 def contains_kochi_slang(content: str) -> bool:
-    """Return True if content contains any Kochi-specific slang."""
-    content_lower = content.lower()
-    return any(slang in content_lower for slang in KOCHI_SLANG)
+    """Return True if content contains any Kochi-specific slang (whole-word match)."""
+    for slang in KOCHI_SLANG:
+        pattern = r"\b" + r"\s+".join(re.escape(part) for part in slang.split()) + r"\b"
+        if re.search(pattern, content, re.IGNORECASE):
+            return True
+    return False

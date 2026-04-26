@@ -6,13 +6,49 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import time
+import functools
 from datetime import date, datetime
 from pathlib import Path
+from typing import Callable, TypeVar
 
 import duckdb
 import os
 
 logger = logging.getLogger("astrobot.schema")
+
+_T = TypeVar("_T")
+
+# ---------------------------------------------------------------------------
+# DB write retry with exponential backoff (handles "database is locked")
+# ---------------------------------------------------------------------------
+
+_DB_RETRY_ATTEMPTS = 5
+_DB_RETRY_BASE_DELAY = 0.1  # seconds
+
+
+def _db_write(fn: Callable[[], _T]) -> _T:
+    """Execute a DuckDB write callable with exponential backoff on lock errors.
+
+    Retries up to _DB_RETRY_ATTEMPTS times (0.1s, 0.2s, 0.4s, 0.8s, 1.6s).
+    Re-raises the last exception if all attempts fail.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_DB_RETRY_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "database is locked" not in msg and "conflicting lock" not in msg:
+                raise
+            last_exc = exc
+            delay = _DB_RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(
+                "DuckDB locked (attempt %d/%d) — retrying in %.2fs", attempt + 1, _DB_RETRY_ATTEMPTS, delay
+            )
+            time.sleep(delay)
+    raise last_exc  # type: ignore[misc]
+
 
 _db_path_env = os.getenv("DB_PATH")
 DB_PATH = Path(_db_path_env) if _db_path_env else Path("data") / "astro_bot.db"
@@ -105,6 +141,28 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         )
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_perks (
+            user_id     BIGINT NOT NULL,
+            perk_type   VARCHAR NOT NULL,
+            expires_at  TIMESTAMP NOT NULL,
+            PRIMARY KEY (user_id, perk_type)
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS local_knowledge (
+            id          INTEGER PRIMARY KEY,
+            category    TEXT NOT NULL,
+            term        TEXT NOT NULL,
+            description TEXT NOT NULL,
+            tags        TEXT DEFAULT ''
+        )
+    """)
+    conn.execute("""
+        CREATE SEQUENCE IF NOT EXISTS local_knowledge_seq START 1
+    """)
+
     # Insert default config if empty
     conn.execute("""
         INSERT INTO bot_config (key, value_float, value_int)
@@ -131,6 +189,18 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         SELECT 'reversal_chance_owner', 0.45
         WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'reversal_chance_owner');
     """)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_str)
+        SELECT 'WEATHER_ALERT_TIME', '07:00'
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'WEATHER_ALERT_TIME');
+    """)
+    # Feature on/off flags (1 = enabled, 0 = disabled)
+    for flag in ("feature_kochi_replies", "feature_curse_replies", "feature_boli_points", "feature_welcome"):
+        conn.execute(f"""
+            INSERT INTO bot_config (key, value_int)
+            SELECT '{flag}', 1
+            WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = '{flag}');
+        """)
 
     conn.commit()
 
@@ -176,7 +246,6 @@ def save_prediction(
     original_prompt: str | None = None,
 ) -> None:
     """Save a generalized (templatized) prediction to the cache."""
-    # Avoid exact duplicates
     exists = conn.execute(
         "SELECT 1 FROM predictions_cache WHERE template_text = ? AND cache_type = ?",
         [template_text, cache_type],
@@ -184,14 +253,16 @@ def save_prediction(
     if exists:
         return
 
-    conn.execute(
-        """
-        INSERT INTO predictions_cache (id, cache_type, user_id, original_prompt, template_text)
-        VALUES (nextval('predictions_cache_seq'), ?, ?, ?, ?)
-        """,
-        [cache_type, user_id, original_prompt, template_text],
-    )
-    conn.commit()
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO predictions_cache (id, cache_type, user_id, original_prompt, template_text)
+            VALUES (nextval('predictions_cache_seq'), ?, ?, ?, ?)
+            """,
+            [cache_type, user_id, original_prompt, template_text],
+        )
+        conn.commit()
+    _db_write(_write)
 
 
 # ---------------------------------------------------------------------------
@@ -228,17 +299,17 @@ def upsert_user(
 ) -> None:
     """Insert or update a user record."""
     existing = get_user_profile(conn, user_id)
-    if existing is None:
-        conn.execute(
-            """
-            INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count)
-            VALUES (?, ?, ?, 0, current_timestamp, 0)
-            """,
-            [user_id, username, rashi],
-        )
-    else:
-        # Only update rashi if explicitly provided
-        if rashi:
+
+    def _write() -> None:
+        if existing is None:
+            conn.execute(
+                """
+                INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count)
+                VALUES (?, ?, ?, 0, current_timestamp, 0)
+                """,
+                [user_id, username, rashi],
+            )
+        elif rashi:
             conn.execute(
                 "UPDATE user_stats SET username=?, rashi=?, last_seen=current_timestamp WHERE user_id=?",
                 [username, rashi, user_id],
@@ -248,7 +319,8 @@ def upsert_user(
                 "UPDATE user_stats SET username=?, last_seen=current_timestamp WHERE user_id=?",
                 [username, user_id],
             )
-    conn.commit()
+        conn.commit()
+    _db_write(_write)
 
 
 def update_boli_points(
@@ -257,22 +329,26 @@ def update_boli_points(
     delta: int,
 ) -> None:
     """Add (or subtract) Boli Points for a user."""
-    conn.execute(
-        "UPDATE user_stats SET boli_points = boli_points + ? WHERE user_id = ?",
-        [delta, user_id],
-    )
-    conn.commit()
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE user_stats SET boli_points = boli_points + ? WHERE user_id = ?",
+            [delta, user_id],
+        ),
+        conn.commit(),
+    ))
 
 
 def increment_prediction_count(
     conn: duckdb.DuckDBPyConnection,
     user_id: int,
 ) -> None:
-    conn.execute(
-        "UPDATE user_stats SET prediction_count = prediction_count + 1 WHERE user_id = ?",
-        [user_id],
-    )
-    conn.commit()
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE user_stats SET prediction_count = prediction_count + 1 WHERE user_id = ?",
+            [user_id],
+        ),
+        conn.commit(),
+    ))
 
 
 def get_leaderboard(
@@ -318,14 +394,16 @@ def save_user_prediction(
     prediction_text: str,
 ) -> None:
     """Persist a prediction to the user's history."""
-    conn.execute(
-        """
-        INSERT INTO user_prediction_history (id, user_id, prediction_text)
-        VALUES (nextval('prediction_history_seq'), ?, ?)
-        """,
-        [user_id, prediction_text],
-    )
-    conn.commit()
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO user_prediction_history (id, user_id, prediction_text)
+            VALUES (nextval('prediction_history_seq'), ?, ?)
+            """,
+            [user_id, prediction_text],
+        )
+        conn.commit()
+    _db_write(_write)
 
 
 def get_todays_user_prediction(
@@ -354,14 +432,16 @@ def log_curse(
     username: str,
     curse_used: str,
 ) -> None:
-    conn.execute(
-        """
-        INSERT INTO curse_logs (id, user_id, username, curse_used)
-        VALUES (nextval('curse_logs_seq'), ?, ?, ?)
-        """,
-        [user_id, username, curse_used],
-    )
-    conn.commit()
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO curse_logs (id, user_id, username, curse_used)
+            VALUES (nextval('curse_logs_seq'), ?, ?, ?)
+            """,
+            [user_id, username, curse_used],
+        )
+        conn.commit()
+    _db_write(_write)
 
 
 # ---------------------------------------------------------------------------
@@ -386,20 +466,23 @@ def save_daily_omen(
     existing = conn.execute(
         "SELECT id FROM daily_omens WHERE omen_date = ?", [today]
     ).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE daily_omens SET generated_text=?, landmark=? WHERE omen_date=?",
-            [text, landmark, today],
-        )
-    else:
-        conn.execute(
-            """
-            INSERT INTO daily_omens (id, generated_text, landmark, omen_date)
-            VALUES (nextval('daily_omens_seq'), ?, ?, ?)
-            """,
-            [text, landmark, today],
-        )
-    conn.commit()
+
+    def _write() -> None:
+        if existing:
+            conn.execute(
+                "UPDATE daily_omens SET generated_text=?, landmark=? WHERE omen_date=?",
+                [text, landmark, today],
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO daily_omens (id, generated_text, landmark, omen_date)
+                VALUES (nextval('daily_omens_seq'), ?, ?, ?)
+                """,
+                [text, landmark, today],
+            )
+        conn.commit()
+    _db_write(_write)
 
 
 # ---------------------------------------------------------------------------
@@ -415,18 +498,20 @@ def get_config_int(conn: duckdb.DuckDBPyConnection, key: str, default: int) -> i
     return int(row[0]) if row and row[0] is not None else default
 
 def set_config_float(conn: duckdb.DuckDBPyConnection, key: str, value: float) -> None:
-    conn.execute(
-        "UPDATE bot_config SET value_float = ? WHERE key = ?",
-        [value, key]
-    )
-    conn.commit()
+    _db_write(lambda: (
+        conn.execute("UPDATE bot_config SET value_float = ? WHERE key = ?", [value, key]),
+        conn.commit(),
+    ))
 
 def set_config_int(conn: duckdb.DuckDBPyConnection, key: str, value: int) -> None:
-    conn.execute(
-        "UPDATE bot_config SET value_int = ? WHERE key = ?",
-        [value, key]
-    )
-    conn.commit()
+    _db_write(lambda: (
+        conn.execute("UPDATE bot_config SET value_int = ? WHERE key = ?", [value, key]),
+        conn.commit(),
+    ))
+
+def get_config_str(conn: duckdb.DuckDBPyConnection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value_str FROM bot_config WHERE key = ?", [key]).fetchone()
+    return str(row[0]) if row and row[0] is not None else default
 
 def get_all_configs(conn: duckdb.DuckDBPyConnection) -> dict:
     rows = conn.execute("SELECT key, value_str, value_float, value_int FROM bot_config").fetchall()
@@ -440,6 +525,126 @@ def get_all_configs(conn: duckdb.DuckDBPyConnection) -> dict:
         else:
             config[key] = r[1]
     return config
+
+
+# ---------------------------------------------------------------------------
+# Local Knowledge seed
+# ---------------------------------------------------------------------------
+
+_LOCAL_KNOWLEDGE_DATA: list[tuple[str, str, str, str]] = [
+    # (category, term, description, tags)
+    # ---- LANDMARKS ----
+    ("landmark", "Palayam / Connemara Market", "The bustling heart of the city for wholesale groceries, flowers, and chaos", "market,heritage,morning"),
+    ("landmark", "Thampanoor", "The absolute epicenter of transit — central Railway Station and KSRTC bus stand", "transport,morning,junction"),
+    ("landmark", "KD Puram", "Local abbreviation for Kesavadasapuram — a major traffic bottleneck and residential hub", "transport,evening,junction"),
+    ("landmark", "Vellayambalam to Kowdiar Stretch", "The VIP road — wide, shaded by massive trees, lined with cafes and Rajapatham aesthetics", "posh,morning,culture"),
+    ("landmark", "Chalai Market", "The labyrinthine heritage market near East Fort — from hardware to wholesale stationery", "market,heritage,nostalgia"),
+    ("landmark", "Ponmudi", "The local hill station — standard weekend ride for youths and bikers", "weekend,nature,nostalgia"),
+    ("landmark", "Sreekaryam / Pongumoodu", "Gateways to the tech-corridor — Technopark and Kazhakkoottam", "IT-crowd,weekday,morning"),
+    ("landmark", "Museum Campus", "Napier Museum, Zoo, and Kanakakkunnu Palace — ultimate morning-walk and family hangout spot", "morning,heritage,family"),
+    ("landmark", "Technopark", "Kerala's largest IT park — the realm of the IT Ambitions crowd", "IT-crowd,weekday,morning"),
+    ("landmark", "East Fort", "Historical heart of the city near Padmanabhaswamy Temple — always busy", "heritage,morning,market"),
+    ("landmark", "Vazhuthacaud", "The coaching centre universe — students everywhere with heavy bags", "students,morning,weekday"),
+    ("landmark", "Jagathy", "Residential locality with a distinct old-city character", "nostalgia,morning"),
+    ("landmark", "Sasthamangalam", "Quiet, leafy residential area — the old-money neighbourhood", "posh,morning"),
+    ("landmark", "Pettah", "Junction area connecting Thampanoor to the old city — chaotic and busy", "transport,morning,junction"),
+    ("landmark", "Varkala Cliff", "The Bali of TVM — laid-back cliffside vibes and backpacker energy", "beach,relaxed,weekend"),
+    ("landmark", "Kanakakkunnu Palace", "Evening dates, cultural exhibitions, and open-air events in a colonial setting", "evening,posh,culture"),
+    ("landmark", "Vizhinjam Port", "Massive cranes and non-stop development talk — the city's infrastructure pride", "infrastructure,modern,weekend"),
+    ("landmark", "Akkulam Tourist Village", "Weekend picnic nostalgia — paddle boats and school-trip memories", "weekend,nostalgia,family"),
+    ("landmark", "Technopark Phase 3", "The Ganga and Yamuna buildings — IT crowd gossip central", "IT-crowd,morning,weekday"),
+    ("landmark", "Beemapally", "Vibrant market quarter with deep spiritual energy and Uroos festival fame", "market,spiritual,weekend"),
+    ("landmark", "Vellayambalam Square", "The neon-lit city heart — always busy, never boring", "evening,junction"),
+    ("landmark", "Shankumugham Beach", "Sunset rounds and the iconic giant mermaid statue by the sea", "evening,beach,sunset"),
+    ("landmark", "Manaveeyam Veedhi", "The intellectual and cultural street — bookshops, debates, street art", "culture,arts,evening"),
+    ("landmark", "Putharikandam Maidanam", "Political rallies and massive city exhibitions — Trivandrum's public square", "politics,events,morning"),
+    ("landmark", "Kowdiar Avenue", "Posh road where the Rajahs live — broad, quiet, and dripping with old wealth", "posh,morning"),
+    ("landmark", "Padmanabhaswamy Temple", "The world's richest temple — Vault B rumors never end", "spiritual,history,morning"),
+    ("landmark", "Priyadarshini Planetarium", "School trip nostalgia — where every Trivandrum child learned about space", "nostalgia,family,morning"),
+    ("landmark", "Napier Museum", "Morning walkers' paradise — heritage building, peacocks, and bureaucrats jogging", "morning,heritage"),
+    ("landmark", "Lulu Mall TVM", "The new weekend traffic nightmare — shopping, food court, and parking grief", "weekend,shopping"),
+    ("landmark", "Aruvikkara Dam", "Quick getaway for fresh water, peace, and picnics outside the city", "weekend,nature"),
+    ("landmark", "Neyyar Dam", "Scenic spot with the lion safari — proper family outing material", "weekend,nature,family"),
+    ("landmark", "Ponmudi Hill Station", "Mist-covered hairpin turns and cool air — the classic TVM escape", "weekend,nature,nostalgia"),
+    ("landmark", "Agasthyarkoodam", "The ultimate trekking goal for serious hikers — breathtaking summit views", "nature,adventure,weekend"),
+    # ---- FOOD ----
+    ("food", "Boli and Paal Payasam", "The undisputed king of Trivandrum Sadya — sweet crepe mashed into warm milk payasam", "feast,traditional"),
+    ("food", "Kethel's Chicken (Rahmaniya)", "Legendary roadside eatery — signature spicy chicken that draws queues", "street-food,spicy,nostalgia"),
+    ("food", "Zam Zam (Palayam)", "Pioneer of Al Faham and Shawarma in the city — a cultural institution for youth", "street-food,evening,nostalgia"),
+    ("food", "Indian Coffee House (Thampanoor)", "Iconic spiraling red-brick building — beetroot cutlets and uniformed waiters", "nostalgia,snack,morning"),
+    ("food", "Sree Muruka Cafe (SMS)", "Famous for the classic Kerala combo: Pazham Pori and Beef Roast", "snack,morning,nostalgia"),
+    ("food", "Maha Boly", "The dedicated shop for buying Boli in bulk — every TVM event needs this place", "snack,sweet,nostalgia"),
+    ("food", "Rasavadai", "Popular evening snack heavily influenced by Tamil cuisine — spicy and addictive", "snack,spicy,evening"),
+    ("food", "Evening chaya from thattukada", "Street tea at a local stall — mandatory daily ritual for every true Trivandrumite", "evening,social,nostalgia"),
+    ("food", "Kizhi Parotta", "Steamed in banana leaf and soaked in rich gravy — dinner perfection", "dinner,rich"),
+    ("food", "Pazham Pori and Beef Roast", "The Kochi-origin combo that Trivandrum has fully and proudly adopted", "snack,evening"),
+    ("food", "Pazhamkanji", "Fermented rice served in earthen pots with fresh fish fry — morning soul food", "morning,traditional"),
+    ("food", "Nadan Pothu Roast", "Spicy beef roast that pairs with absolutely anything on the menu", "dinner,spicy"),
+    ("food", "Kappa and Meen Mulakittathu", "Spicy fish curry and mashed cassava — the classic Kerala lunch combo", "lunch,traditional"),
+    ("food", "Sharjah Shake", "The quintessential Kerala milkshake — thick, sweet, and nostalgic", "evening,dessert,nostalgia"),
+    ("food", "Unnakkaya", "Sweet banana snack stuffed with coconut — traditional teatime treat", "snack,sweet,traditional"),
+    ("food", "Thattukada Omelette", "Street-style omelette heavy on onions and green chilies — late-night staple", "street-food,evening"),
+    ("food", "Kulukki Sarbath", "Shaken lemonade with basil seeds — the summer street drink of choice", "drink,summer,evening"),
+    ("food", "Fish Peera", "Small fish cooked with grated coconut — humble and delicious traditional dish", "lunch,traditional"),
+    # ---- CULTURE ----
+    ("culture", "IFFK (International Film Festival of Kerala)", "Every December the city turns into a cinephile paradise — delegates with Kalamandalam bags everywhere", "culture,arts,evening"),
+    ("culture", "Attukal Pongala", "World's largest gathering of women — entire city shuts down, every street becomes an open-air kitchen", "festival,spiritual,morning"),
+    ("culture", "Techie vs Core City Divide", "Gentle cultural gap between IT crowd in Technopark and traditional inner-city residents of Kowdiar/Sasthamangalam", "IT-crowd,culture,weekday"),
+    ("culture", "Ramachandran Textiles East Fort", "The absolute juggernaut of local shopping — if a local buys budget clothes, they are here", "market,nostalgia,morning"),
+    ("culture", "Evening Chaya at Thattukada", "Trivandrum operates on a slower bureaucratic clock — evening tea with politics and cinema discussion is sacred", "evening,social,nostalgia"),
+    ("culture", "Tagore Theatre Events", "Heart of the city's arts scene — theatre, music, and cultural programmes", "culture,arts,evening"),
+    ("culture", "Napier Museum Morning Walk", "High-profile bureaucrats and retirees jogging between heritage buildings — a daily Trivandrum ritual", "morning,posh,heritage"),
+    ("culture", "KSRTC Minnal Bus", "Highway terror incarnate — the fear of God on every inter-city route", "transport,nostalgia"),
+    ("culture", "Technopark Swipe Cards", "The mark of the IT Ambitions crowd — the badge that separates tech from the rest", "IT-crowd,weekday"),
+    ("culture", "Beemapally Uroos", "Massive annual spiritual and market event — draws the whole city to the southern quarter", "festival,spiritual,weekend"),
+    ("culture", "Onam Lighting", "Vellayambalam to East Fort glowing in festive lights — the city at its most beautiful", "festival,evening"),
+    ("culture", "Chaver Bus Drivers", "The legendary private bus drivers who treat every route as a Formula 1 race", "transport,nostalgia"),
+    ("culture", "Thampanoor Rush Hour", "The ultimate test of patience — every mode of transport colliding at once", "transport,morning"),
+    ("culture", "Vazhuthacaud Coaching Vibe", "Thousands of students cramming for exams — the coaching centre capital of TVM", "students,morning,weekday"),
+    ("culture", "Rainy Day Chaya", "The collective Malayali monsoon obsession — tea tastes better when it rains, fact", "monsoon,evening,social"),
+    ("culture", "Technopark Friday Home-Runs", "Mass exodus of IT employees every Friday evening — entire Kazhakkoottam empties out", "IT-crowd,evening"),
+    ("culture", "Padmanabhaswamy Treasure Mystery", "Endless speculation about Vault B — the rumour that never dies in TVM", "history,mystery"),
+    ("culture", "Chalai Market Squeeze", "The beautiful chaos of buying everything from a pin to an elephant in one labyrinthine market", "market,heritage,nostalgia"),
+    ("culture", "KD Puram Traffic Jam", "The legendary jam that defines TVM evenings — nothing moves, everyone accepts it", "transport,evening"),
+    # ---- EXPRESSIONS ----
+    ("expression", "Appi", "Term of endearment for a baby or child — true locals know its innocent Trivandrum roots", "language,local"),
+    ("expression", "Kili poyi", "Literally the bird flew away — used when someone is utterly confused or shocked", "language,local"),
+    ("expression", "Oola", "Useless, pathetic, or of very poor quality — the ultimate dismissal", "language,local"),
+    ("expression", "Shokam", "A sad, boring, or pathetic situation — Trivandrum's favourite word for disappointment", "language,local"),
+    ("expression", "Chumma", "Simply or for no reason — a universal Malayali word heavily overused in TVM", "language,local"),
+    ("expression", "Eda / Edi", "Informal hey used constantly among friends — gender variant matters in Trivandrum", "language,local"),
+    ("expression", "Thirontharam", "How locals casually pronounce Thiruvananthapuram at speed — the true insider marker", "language,local"),
+    ("expression", "Vayye?", "Are you not well? or Can't you do it? — frequently sarcastic", "language,local"),
+    ("expression", "Pillacha", "Respectful but familiar address for an older man — shopkeeper or neighbour energy", "language,local"),
+    ("expression", "Kidilam / Kidu", "Absolutely awesome or fantastic — the highest praise in the TVM lexicon", "language,local"),
+    ("expression", "Vishayam", "Matter, issue, situation — as in what is this vishayam?", "language,local"),
+    ("expression", "Lokam", "World or scene — IT lokam means the tech crowd and their universe", "language,local"),
+    ("expression", "Chetta", "Elder brother; respectful address for older men you don't know well", "language,local"),
+    ("expression", "Mone", "Son; affectionate address that can also sound patronising depending on tone", "language,local"),
+    ("expression", "IT Ambitions", "The Technopark crowd who believe they have escaped Thirontharam — they haven't", "language,local,IT-crowd"),
+]
+
+
+def seed_local_knowledge(conn: duckdb.DuckDBPyConnection, force: bool = False) -> None:
+    """Populate local_knowledge table from curated data. Skips if already seeded unless force=True."""
+    count = conn.execute("SELECT COUNT(*) FROM local_knowledge").fetchone()[0]
+    if count > 0 and not force:
+        logger.info("local_knowledge already seeded (%d rows) — skipping.", count)
+        return
+
+    def _write() -> None:
+        conn.execute("DELETE FROM local_knowledge")
+        conn.executemany(
+            """
+            INSERT INTO local_knowledge (id, category, term, description, tags)
+            VALUES (nextval('local_knowledge_seq'), ?, ?, ?, ?)
+            """,
+            [(cat, term, desc, tags) for cat, term, desc, tags in _LOCAL_KNOWLEDGE_DATA],
+        )
+        conn.commit()
+
+    _db_write(_write)
+    logger.info("Seeded local_knowledge with %d entries.", len(_LOCAL_KNOWLEDGE_DATA))
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +694,57 @@ def points_for_level(level: int) -> int:
         return 0
     n = min(level, 100)
     return 5 * n * (n + 3)
+
+
+# ---------------------------------------------------------------------------
+# User Perks (Boli Marketplace)
+# ---------------------------------------------------------------------------
+
+def has_active_perk(
+    conn: duckdb.DuckDBPyConnection,
+    user_id: int,
+    perk_type: str,
+) -> bool:
+    """Return True if the user has a non-expired perk of the given type."""
+    row = conn.execute(
+        "SELECT 1 FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > current_timestamp",
+        [user_id, perk_type],
+    ).fetchone()
+    return row is not None
+
+
+def grant_perk(
+    conn: duckdb.DuckDBPyConnection,
+    user_id: int,
+    perk_type: str,
+    duration_hours: int = 24,
+) -> None:
+    """Grant a timed perk to a user, extending if they already have one."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO user_perks (user_id, perk_type, expires_at)
+            VALUES (?, ?, current_timestamp + INTERVAL (?) HOUR)
+            ON CONFLICT (user_id, perk_type) DO UPDATE SET
+                expires_at = GREATEST(user_perks.expires_at, excluded.expires_at)
+            """,
+            [user_id, perk_type, duration_hours],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_perk_expiry(
+    conn: duckdb.DuckDBPyConnection,
+    user_id: int,
+    perk_type: str,
+) -> datetime | None:
+    """Return the expiry datetime of a perk, or None if not active."""
+    row = conn.execute(
+        "SELECT expires_at FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > current_timestamp",
+        [user_id, perk_type],
+    ).fetchone()
+    return row[0] if row else None
 
 
 def get_level_from_points(points: int) -> int:

@@ -12,88 +12,6 @@ import requests
 logger = logging.getLogger("astrobot.glossary")
 
 # ---------------------------------------------------------------------------
-# Expressions
-# ---------------------------------------------------------------------------
-
-EXPRESSIONS: dict[str, str] = {
-    "Appi": "Term of endearment for a baby/child",
-    "Kili poyi": "Literally 'the bird flew away' - when someone is confused or shocked",
-    "Oola": "Useless, pathetic, or poor quality",
-    "Shokam": "Sad, boring, or pathetic situation",
-    "Chumma": "Simply, for no reason",
-    "Eda": "Informal 'hey' (used among friends, male)",
-    "Edi": "Informal 'hey' (used among friends, female)",
-    "Vayye?": "Are you not well? or Can't you do it? (often sarcastic)",
-    "Pillacha": "Respectful address for older man (shopkeeper/neighbor)",
-    "Kidilam": "Absolutely awesome or fantastic",
-    "Kidu": "Absolutely awesome or fantastic",
-    "Thirontharam": "Local pronunciation of Thiruvananthapuram",
-    "Vishayam": "Matter, issue, situation — as in 'what is this vishayam?'",
-    "Lokam": "World, scene — 'IT lokam' means the IT crowd/world",
-    "Chetta": "Elder brother; used to address older men respectfully",
-    "Mone": "Son; affectionate address (also slightly patronising)",
-    "IT Ambitions": "The Technopark/IT crowd who think they have escaped Thirontharam",
-}
-
-# ---------------------------------------------------------------------------
-# Landmarks
-# ---------------------------------------------------------------------------
-
-LANDMARKS: list[str] = [
-    "Palayam",
-    "Thampanoor",
-    "KD Puram",
-    "Vellayambalam",
-    "Kowdiar",
-    "Chalai Market",
-    "Ponmudi",
-    "Sreekaryam",
-    "Kazhakkoottam",
-    "Museum Campus",
-    "Technopark",
-    "Connemara Market",
-    "East Fort",
-    "Sasthamangalam",
-    "Pongumoodu",
-    "Pettah",
-    "Vazhuthacaud",
-    "Jagathy",
-]
-
-# ---------------------------------------------------------------------------
-# Food & eateries
-# ---------------------------------------------------------------------------
-
-FOOD: list[str] = [
-    "Boli and Paal Payasam",
-    "Kethel's Chicken (Rahmaniya)",
-    "Zam Zam Palayam",
-    "Indian Coffee House Thampanoor",
-    "Sree Muruka Cafe",
-    "Rasavadai",
-    "Pazham Pori and Beef Roast",
-    "Maha Boly",
-    "Evening chaya from thattukada",
-    "Shawarma from Zam Zam",
-]
-
-# ---------------------------------------------------------------------------
-# Culture
-# ---------------------------------------------------------------------------
-
-CULTURE: list[str] = [
-    "IFFK (International Film Festival of Kerala)",
-    "Tagore Theatre",
-    "Attukal Pongala",
-    "Ramachandran Textiles East Fort",
-    "Technopark",
-    "Thattukada (street tea stall)",
-    "KSRTC bus stand",
-    "Napier Museum",
-    "Kanakakkunnu Palace",
-]
-
-# ---------------------------------------------------------------------------
 # Rashi (Star Signs) — Trivandrum-flavoured
 # ---------------------------------------------------------------------------
 
@@ -240,99 +158,190 @@ def get_daily_weather_forecast() -> dict:
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+# Rotating "avoid this topic" addendums injected per time period to stop the AI
+# from defaulting to the same metaphors in each slot.
+_MORNING_AVOIDS: list[str] = [
+    "Do NOT talk about buses, tea, or traffic jams this time.",
+    "Avoid chaya, KSRTC, and Thampanoor station — find a fresh angle.",
+    "Skip the morning-commute metaphors. Talk about something unexpected instead.",
+    "No bus references or tea jokes this round. The cosmos has other opinions.",
+]
+_NOON_AVOIDS: list[str] = [
+    "Do NOT use 'melting', 'sweating', or heat metaphors this time.",
+    "Avoid sun, heat, and sweat jokes — find something more original.",
+    "Skip the obvious noon-heat angle. The universe has stranger doom today.",
+    "No 'scorching' or 'unbearable heat' this round. Try cosmic irony instead.",
+]
+_AFTERNOON_AVOIDS: list[str] = [
+    "Do NOT mention lunch, naps, or post-meal sluggishness.",
+    "Avoid 'sleepy afternoon' tropes — find a stranger afternoon omen.",
+    "Skip the drowsy-office-worker angle. Surprise the reader.",
+    "No references to food coma or sleeping at desks this time.",
+]
+_EVENING_AVOIDS: list[str] = [
+    "Do NOT mention thattukada, Pazham Pori, or evening snacks.",
+    "Avoid the evening-chaya ritual entirely — go somewhere unexpected.",
+    "Skip the 'going home from office' angle this round.",
+    "No street food or evening-snack references. Pick a different doom.",
+]
+_NIGHT_AVOIDS: list[str] = [
+    "Do NOT mention traffic, IT crowd, or Technopark this time.",
+    "Avoid the stuck-in-traffic trope — find a different night-time fate.",
+    "Skip the KD Puram traffic jam. The cosmos has fresher punishments.",
+    "No office-commute jokes this round. Try something existential instead.",
+]
+_LATENIGHT_AVOIDS: list[str] = [
+    "Do NOT mention ghosts, Museum Campus, or darkness.",
+    "Avoid the 'mysterious late-night energy' cliché. Go philosophical.",
+    "Skip ghost references entirely — the stars have stranger late-night truths.",
+    "No horror or haunted-place references this round. Try regret or ambition.",
+]
+
 
 def get_time_context() -> dict:
     """Return a dict describing the current time period in Trivandrum.
 
-    Keys: period (str), landmark_hint (str), personality_addendum (str)
+    Keys: period (str), landmark_hint (str), personality_addendum (str).
+    The personality_addendum includes a rotating topic-avoidance instruction
+    to prevent the LLM from defaulting to the same metaphors every slot.
     """
     now = datetime.now(_IST)
     hour = now.hour
+    # Rotate avoidance hint using the current minute so it shifts each call
+    slot = now.minute % 4
 
     if 6 <= hour < 10:
+        avoid = _MORNING_AVOIDS[slot]
         return {
             "period": "morning",
             "landmark_hint": "Thampanoor KSRTC stand",
             "personality_addendum": (
-                "It is morning rush hour in Thirontharam. You might hint at the chaos "
-                "at Thampanoor or the fact that nobody has had their chaya yet. "
-                "VARY YOUR PREDICTIONS wildly — do not always talk about buses or tea. "
-                "Instead, find strange new ways the morning can go wrong."
+                "It is morning rush hour in Thirontharam. "
+                "VARY YOUR PREDICTIONS wildly — find strange new ways the morning can go wrong. "
+                f"ROTATION RULE: {avoid}"
             ),
         }
     elif 10 <= hour < 14:
+        avoid = _NOON_AVOIDS[slot]
         return {
             "period": "noon",
             "landmark_hint": "Thampanoor footpath",
             "personality_addendum": (
-                "It is scorching noon in Thirontharam. You are irritable because of the heat. "
-                "You might optionally mention sweating or poor decisions made in the sun, "
-                "but YOU MUST VARY YOUR TOPICS. Do not repeat 'melting' every time."
+                "It is scorching noon in Thirontharam. You are irritable. "
+                "YOU MUST VARY YOUR TOPICS across predictions. "
+                f"ROTATION RULE: {avoid}"
             ),
         }
     elif 14 <= hour < 16:
+        avoid = _AFTERNOON_AVOIDS[slot]
         return {
             "period": "afternoon",
             "landmark_hint": "Palayam",
             "personality_addendum": (
-                "It is a sleepy afternoon in Thirontharam. Everyone is in post-lunch stupor. "
-                "Your predictions are sluggish but still dramatic."
+                "It is a sleepy afternoon in Thirontharam. Your predictions are sluggish but still dramatic. "
+                f"ROTATION RULE: {avoid}"
             ),
         }
     elif 16 <= hour < 19:
+        avoid = _EVENING_AVOIDS[slot]
         return {
             "period": "evening",
             "landmark_hint": "thattukada near Technopark",
             "personality_addendum": (
                 "It is evening in Thirontharam. "
-                "You might occasionally wonder if people have had their evening chaya and Pazham Pori. "
-                "CRITICAL: VARY your topics wildly. Talk about traffic, bad dates, office politics, "
-                "or random cosmic doom. Do not get stuck talking about thattukadas."
+                "CRITICAL: VARY your topics wildly — traffic, bad dates, office politics, random cosmic doom. "
+                f"ROTATION RULE: {avoid}"
             ),
         }
     elif 19 <= hour < 22:
+        avoid = _NIGHT_AVOIDS[slot]
         return {
             "period": "night",
             "landmark_hint": "KD Puram",
             "personality_addendum": (
-                "It is evening and the Technopark IT crowd is stuck in traffic. "
-                "You pity them but also find it funny. "
-                "VARY YOUR PREDICTIONS: talk about anything from lost keys to bad internet, "
-                "do not restrict yourself to just traffic jokes."
+                "It is night in Thirontharam. "
+                "VARY YOUR PREDICTIONS: lost keys, bad internet, unreplied texts, existential dread. "
+                f"ROTATION RULE: {avoid}"
             ),
         }
     else:
+        avoid = _LATENIGHT_AVOIDS[slot]
         return {
             "period": "late night",
             "landmark_hint": "Trivandrum at night",
             "personality_addendum": (
                 "It is late night in Thirontharam. The city has gone to sleep. "
-                "You hint at mysterious late-night energies, bad life decisions made after midnight, "
-                "or the existential dread of waking up early tomorrow. "
-                "Predictions should be slightly darker or philosophical, but DO NOT always mention ghosts or Museum Campus. VARY your late-night topics."
+                "Predictions should be slightly darker or philosophical. VARY your late-night topics. "
+                f"ROTATION RULE: {avoid}"
             ),
         }
 
 
 # ---------------------------------------------------------------------------
-# Formatted glossary for prompt injection
+# DB-backed glossary for prompt injection
 # ---------------------------------------------------------------------------
 
-def get_glossary_text() -> str:
-    """Returns formatted glossary for prompt injection (random subset to ensure variety)."""
-    import random
-    
-    # Pick random subset to force LLM to vary its topics on every request
-    expr_items = random.sample(list(EXPRESSIONS.items()), k=min(4, len(EXPRESSIONS)))
-    exprs = ", ".join([f"{k} ({v})" for k, v in expr_items])
-    
-    landmarks = ", ".join(random.sample(LANDMARKS, k=min(4, len(LANDMARKS))))
-    foods = ", ".join(random.sample(FOOD, k=min(3, len(FOOD))))
-    culture = ", ".join(random.sample(CULTURE, k=min(3, len(CULTURE))))
-    
-    return f"""
-AVAILABLE EXPRESSIONS (Trivandrum Manglish): {exprs}
-AVAILABLE LANDMARKS: {landmarks}
-AVAILABLE FOOD & EATERIES: {foods}
-AVAILABLE CULTURE: {culture}
-"""
+def _current_time_tag() -> str:
+    """Map current IST hour to a tag used to prioritise time-relevant DB entries."""
+    hour = datetime.now(_IST).hour
+    if 6 <= hour < 10:
+        return "morning"
+    if 10 <= hour < 17:
+        return "weekday"
+    if 17 <= hour < 21:
+        return "evening"
+    return "night"
+
+
+def get_contextual_sample(
+    db_conn,
+    category: str,
+    limit: int = 5,
+    time_tag: str | None = None,
+) -> list[dict]:
+    """Return a random sample of local_knowledge rows for a category.
+
+    When time_tag is provided, rows whose tags column contains that tag are
+    sorted first, then filled with random others to reach *limit*.
+    """
+    if time_tag:
+        rows = db_conn.execute(
+            """
+            SELECT term, description, tags FROM local_knowledge
+            WHERE category = ?
+            ORDER BY (CASE WHEN tags LIKE '%' || ? || '%' THEN 0 ELSE 1 END),
+                     random()
+            LIMIT ?
+            """,
+            [category, time_tag, limit],
+        ).fetchall()
+    else:
+        rows = db_conn.execute(
+            """
+            SELECT term, description, tags FROM local_knowledge
+            WHERE category = ?
+            ORDER BY random()
+            LIMIT ?
+            """,
+            [category, limit],
+        ).fetchall()
+    return [{"term": r[0], "description": r[1], "tags": r[2]} for r in rows]
+
+
+def get_glossary_text(db_conn) -> str:
+    """Return a formatted glossary snippet for prompt injection.
+
+    Pulls a time-aware random sample from the local_knowledge DuckDB table.
+    Each line includes the term name and its usage description so Gemini has
+    actionable context, not just a bare list of names.
+    """
+    time_tag = _current_time_tag()
+    parts: list[str] = []
+    for category, limit in [("expression", 4), ("landmark", 4), ("food", 3), ("culture", 3)]:
+        items = get_contextual_sample(db_conn, category, limit, time_tag)
+        if not items:
+            continue
+        parts.append(f"[{category.upper()}]")
+        for item in items:
+            parts.append(f"- {item['term']}: {item['description']}")
+    return "\n".join(parts)

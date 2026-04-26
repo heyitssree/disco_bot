@@ -7,15 +7,15 @@ import os
 import random
 import re
 import asyncio
-from datetime import datetime, timezone, time as dt_time
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
-from discord.ext import tasks
 
 from schema import (
     init_db,
+    seed_local_knowledge,
     get_table_counts,
     get_user_profile,
     upsert_user,
@@ -26,25 +26,26 @@ from schema import (
     increment_prediction_count,
     log_curse,
     get_leaderboard,
-    get_todays_omen,
-    save_daily_omen,
-    export_stats_csv,
     get_config_float,
     get_config_int,
+    get_config_str,
     set_config_float,
     set_config_int,
     get_all_configs,
     get_todays_user_prediction,
     get_level_from_points,
     points_for_level,
+    has_active_perk,
+    grant_perk,
+    get_perk_expiry,
 )
-from glossary import LANDMARKS, RASHIS, get_daily_weather_forecast
+from glossary import RASHIS
 from prompts import (
     get_time_aware_system_prompt,
     get_astro_prompt,
     get_curse_prompt,
     get_qa_prompt,
-    get_daily_omen_prompt,
+    get_summ_prompt,
     FALLBACK_MESSAGE,
     WELCOME_MESSAGES,
 )
@@ -56,6 +57,7 @@ from curses import (
     get_random_kochi_response,
     contains_boli_trigger,
     contains_kochi_slang,
+    contains_curse_word,
 )
 from services.gemini_service import GeminiService
 from services.api_manager import ApiManager
@@ -86,7 +88,6 @@ FREE_API_KEY = os.getenv("GEMINI_API_KEY_FREE")
 # Support old single-key env var as alias for paid key
 PAID_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY")
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
-HORRIBLESCOPE_CHANNEL = os.getenv("HORRIBLESCOPE_CHANNEL", "off-topic")
 GENERAL_CHANNEL = os.getenv("GENERAL_CHANNEL", "general")
 
 # Bot owner's Discord user ID — MUST match the owner of the bot application.
@@ -159,10 +160,6 @@ def _personalise(template: str, name: str, curse: str | None = None) -> str:
     return result
 
 
-def contains_curse_word(content: str) -> bool:
-    content_lower = content.lower()
-    return any(c in content_lower for c in CURSE_WORDS)
-
 
 _SPAM_WRAPPERS = [
     "Mone, I told you already — {prediction}",
@@ -211,16 +208,27 @@ async def _maybe_announce_levelup(
     new_points: int,
     channel: discord.abc.Messageable,
 ) -> None:
-    """Send a level-up notification if the points delta crossed a threshold."""
+    """Send a level-up notification if the points delta crossed a level or tier boundary."""
     old_level = get_level_from_points(old_points)
     new_level = get_level_from_points(new_points)
     if new_level <= old_level:
         return
-    msg = random.choice(_LEVEL_UP_MESSAGES).format(user=mention, level=new_level)
+
     old_title = get_level_title(old_level)
     new_title = get_level_title(new_level)
+
+    # Primary level-up line in the requested format
+    msg = f"🔥 **Level Up!** {mention} reached **Level {new_level}**! Keep the boli flowing!"
+
+    # Tier crossing: append a witty title unlock line
     if new_title != old_title:
-        msg += f"\n🏅 *New title unlocked: **{new_title}***"
+        flavour = random.choice(_LEVEL_UP_MESSAGES).format(user=mention, level=new_level)
+        msg = (
+            f"🔥 **Level Up!** {mention} reached **Level {new_level}**! "
+            f"Earned title: [**{new_title}**]. Keep the boli flowing!\n"
+            f"*{flavour}*"
+        )
+
     await channel.send(msg)
 
 
@@ -297,7 +305,7 @@ async def get_astro_prediction(user_id: int, name: str, usage_count: int = 1) ->
 
     # ---- Gemini call ----
     past_predictions = get_last_n_predictions(db_conn, user_id, n=3)
-    system_prompt = get_time_aware_system_prompt()
+    system_prompt = get_time_aware_system_prompt(db_conn)
     user_prompt = get_astro_prompt(name, rashi=rashi, past_predictions=past_predictions)
 
     result, from_cache = await asyncio.get_running_loop().run_in_executor(
@@ -332,6 +340,7 @@ async def on_ready() -> None:
 
     # Initialise database
     db_conn = init_db()
+    seed_local_knowledge(db_conn)
 
     # Initialise Gemini service (free key first, paid as fallback)
     gemini_svc = GeminiService(
@@ -347,10 +356,6 @@ async def on_ready() -> None:
         rpm_limit=10,
         free_tier_mode=FREE_TIER_MODE,
     )
-
-    # Start scheduled tasks
-    if not daily_omen_and_weather.is_running():
-        daily_omen_and_weather.start()
 
     await tree.sync()
     logger.info("Slash commands synced. AstRobot V2 is live.")
@@ -381,6 +386,10 @@ async def on_member_join(member: discord.Member) -> None:
         return
 
     upsert_user(db_conn, member.id, member.display_name)
+
+    if not get_config_int(db_conn, "feature_welcome", 1):
+        logger.info("Welcome messages disabled — skipping for %s", member.display_name)
+        return
 
     async with channel.typing():
         prediction = await get_astro_prediction(member.id, member.display_name)
@@ -419,7 +428,7 @@ async def on_message(message: discord.Message) -> None:
     upsert_user(db_conn, message.author.id, message.author.display_name)
 
     # ---- Boli Points: local slang triggers ----
-    triggered_words = contains_boli_trigger(message.content)
+    triggered_words = contains_boli_trigger(message.content) if get_config_int(db_conn, "feature_boli_points", 1) else []
     if triggered_words:
         points = len(triggered_words) * 5
         profile = get_user_profile(db_conn, message.author.id)
@@ -435,7 +444,7 @@ async def on_message(message: discord.Message) -> None:
 
     # ---- Kochi slang detection ----
     kochi_chance = get_config_float(db_conn, "kochi_reply_chance", 0.28)
-    if contains_kochi_slang(message.content) and random.random() < kochi_chance:
+    if get_config_int(db_conn, "feature_kochi_replies", 1) and contains_kochi_slang(message.content) and random.random() < kochi_chance:
         response = get_random_kochi_response(message.author.mention)
         await message.reply(response)
         logger.info("Kochi slang detected from %s — condescending reply sent.", message.author.display_name)
@@ -449,8 +458,8 @@ async def on_message(message: discord.Message) -> None:
             .replace(f"<@!{bot.user.id}>", "")
             .strip()
         )
-        if content_without_ping and not contains_curse_word(message.content):
-            system_prompt = get_time_aware_system_prompt()
+        if content_without_ping and not contains_curse_word(message.content)[0]:
+            system_prompt = get_time_aware_system_prompt(db_conn)
             user_prompt = get_qa_prompt(message.author.display_name, content_without_ping)
 
             async def _do_qa_call() -> str:
@@ -474,7 +483,8 @@ async def on_message(message: discord.Message) -> None:
                 reply = await _do_qa_call()
 
             await message.reply(reply)
-            return
+        # Always return after a mention — never double-trigger slang detection
+        return
 
     # ---- Legacy prefix "astro" command ----
     if message.content.lower().startswith("astro"):
@@ -503,7 +513,12 @@ async def on_message(message: discord.Message) -> None:
 
             app_info = await bot.application_info()
             owner_reversal_chance = get_config_float(db_conn, "reversal_chance_owner", 0.45)
-            reversal_chance = owner_reversal_chance if target.id == app_info.owner.id else 0.10
+            if has_active_perk(db_conn, target.id, "curse_protection"):
+                reversal_chance = 1.0  # 100% reversal while protected
+            elif target.id == app_info.owner.id:
+                reversal_chance = owner_reversal_chance
+            else:
+                reversal_chance = 0.10
 
             # Chance to reverse the curse back onto the person who sent it
             if random.random() < reversal_chance:
@@ -539,15 +554,16 @@ async def on_message(message: discord.Message) -> None:
 
     # ---- Passive curse word reply ----
     curse_chance = get_config_float(db_conn, "curse_reply_chance", 0.25)
-    if contains_curse_word(message.content) and random.random() < curse_chance:
+    _curse_matched, curse_used = contains_curse_word(message.content)
+    if get_config_int(db_conn, "feature_curse_replies", 1) and _curse_matched and random.random() < curse_chance:
         username = message.author.display_name
         user_id = message.author.id
-        curse_used = next((c for c in CURSE_WORDS if c in content_lower), "oola")
+        curse_used = curse_used or "oola"
 
         log_curse(db_conn, user_id, username, curse_used)
         update_boli_points(db_conn, user_id, 1)  # +1 Boli pt for curse event
 
-        system_prompt = get_time_aware_system_prompt()
+        system_prompt = get_time_aware_system_prompt(db_conn)
         user_prompt = get_curse_prompt(username, curse_used)
 
         async with message.channel.typing():
@@ -711,6 +727,86 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
     )
 
 
+@tree.command(name="summ", description="Get a witty Manglish summary of recent chat")
+@app_commands.describe(
+    limit="Number of messages to summarise (1–100)",
+    user1="Only include messages from this user (optional)",
+    user2="Also include messages from this user (optional)",
+)
+async def summ_slash(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 100] = 30,
+    user1: discord.Member | None = None,
+    user2: discord.Member | None = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # Collect history
+    raw_messages: list[discord.Message] = []
+    async for msg in interaction.channel.history(limit=limit):
+        raw_messages.append(msg)
+    raw_messages.reverse()  # chronological order
+
+    # Filter by selected users if provided
+    filter_ids: set[int] = set()
+    if user1:
+        filter_ids.add(user1.id)
+    if user2:
+        filter_ids.add(user2.id)
+    if filter_ids:
+        raw_messages = [m for m in raw_messages if m.author.id in filter_ids]
+
+    if not raw_messages:
+        await interaction.followup.send(
+            "Eda, no messages found to summarise. Chumma use the command when people are actually talking.",
+            ephemeral=True,
+        )
+        return
+
+    # Strip bot messages, commands (starting with /), and mention IDs
+    _mention_re = re.compile(r"<@!?\d+>|<#\d+>|<@&\d+>")
+    lines: list[str] = []
+    for msg in raw_messages:
+        if msg.author.bot:
+            continue
+        text = _mention_re.sub("[someone]", msg.content).strip()
+        if not text or text.startswith("/"):
+            continue
+        lines.append(text)
+
+    if not lines:
+        await interaction.followup.send(
+            "Aiyo, nothing worth summarising in those messages. All commands and bot talk. Shokam.",
+            ephemeral=True,
+        )
+        return
+
+    conversation_text = "\n".join(lines)
+    user_prompt = get_summ_prompt(conversation_text)
+    system_prompt = get_time_aware_system_prompt(db_conn)
+
+    summary, _ = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: api_mgr.call(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            cache_type="qa",
+            name="SummaryRequest",
+            fallback_message=FALLBACK_MESSAGE,
+        ),
+    )
+
+    filter_note = ""
+    if filter_ids:
+        names = [u.display_name for u in [user1, user2] if u]
+        filter_note = f" (filtered to {', '.join(names)})"
+
+    await interaction.followup.send(
+        f"**📜 Chat Summary — last {len(lines)} messages{filter_note}:**\n{summary}",
+        ephemeral=True,
+    )
+
+
 @tree.command(name="health", description="AstRobot system health (owner only)")
 async def health_slash(interaction: discord.Interaction) -> None:
     app_info = await bot.application_info()
@@ -776,36 +872,71 @@ async def health_slash(interaction: discord.Interaction) -> None:
 async def help_slash(interaction: discord.Interaction) -> None:
     """Show the help menu for AstRobot."""
     embed = discord.Embed(
-        title="🤖 AstRobot V2 — Help & Features",
-        description="I am your friendly neighbourhood Trivandrum Astrologer. Here is what I can do:",
-        color=discord.Color.blue(),
+        title="AstRobot V2 — Help & Features",
+        description="Ancient astrologer from Thirontharam. Speaks Manglish. Judges you constantly. Here is what I can do:",
+        color=discord.Color.dark_purple(),
     )
+
+    # Slash commands
     embed.add_field(
-        name="🔮 Predictions (`astro`)",
-        value="Type `astro` in chat to get a personalised, Trivandrum-style daily astrological prediction.",
+        name="Slash Commands",
+        value=(
+            "`/astro` — Get a dramatic Manglish astrology prediction (rate-limited per minute)\n"
+            "`/astro user:@someone` — Get a prediction for someone else\n"
+            "`/rank` — Top 10 Boli Points leaderboard\n"
+            "`/mypoints` — Your Rashi, Boli Points, level, and title\n"
+            "`/summ` — Witty Manglish summary of recent chat\n"
+            "`/shop view` — Browse the Boli Marketplace\n"
+            "`/shop buy` — Spend Boli Points on perks (Curse Protection, Custom Rashi)\n"
+            "`/help` — This menu"
+        ),
         inline=False,
     )
+
+    # Text triggers
     embed.add_field(
-        name="🤬 Proxy Cursing (`astro @user`)",
-        value="Mention someone with the astro command to instantly send them a local curse or roast.",
+        name="Text Commands (type in chat)",
+        value=(
+            "`astro` — Same as `/astro`, triggers a full prediction\n"
+            "`astro @user` — Instantly curse or roast someone (10% chance it bounces back on you)"
+        ),
         inline=False,
     )
+
+    # Mention QA
     embed.add_field(
-        name="💬 Q&A (`@AstRobot question?`)",
-        value="Tag me with a question and I'll give you a highly sarcastic, culturally accurate answer.",
+        name="Mention Q&A",
+        value=(
+            "`@AstRobot <question>` — Ask me anything. I will answer factually first, then be sarcastic about it.\n"
+            "Works for news, scores, how-tos — or just to hear me judge your question."
+        ),
         inline=False,
     )
+
+    # Boli Points
     embed.add_field(
-        name="🏆 Boli Points & Profile (`/profile`)",
-        value="Use Trivandrum slang (like *kidilam*, *shokam*) to earn Boli Points! Check your stats using the `/profile` slash command.",
+        name="Boli Points",
+        value=(
+            "Earn points by using Trivandrum slang naturally in chat:\n"
+            "*kidilam, shokam, pillacha, chumma, mone, kili poyi, vishayam, thirontharam, boli, paal payasam...*\n"
+            "+5 pts per unique trigger word per message · +2 pts per `/astro` call\n"
+            "Level up from Tourist → Thampanoor Regular → Chalai Veteran → Cosmic Sage of Thirontharam"
+        ),
         inline=False,
     )
+
+    # Passive reactions
     embed.add_field(
-        name="👀 Passive Aggression",
-        value="Be careful what you say... If you use Kochi slang (*machane*), I will judge you. If you curse, I might curse you back.",
+        name="Passive Reactions (automatic)",
+        value=(
+            "**Kochi slang** (*machane, machi, adipoli...*) → Condescending reply from a true Trivandrumite\n"
+            "**Curse words** → 25% chance the cosmos punishes you with a dramatic doom prediction\n"
+            "**New member joins** → Welcome message + fresh astrology reading"
+        ),
         inline=False,
     )
-    
+
+    embed.set_footer(text="All responses powered by Gemini · Local knowledge from 85 curated Trivandrum entries")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -832,42 +963,10 @@ class AdminGroup(app_commands.Group):
         )
         return False
 
-    @app_commands.command(name="config_view", description="View all active probabilities and cooldowns")
-    async def config_view(self, interaction: discord.Interaction) -> None:
-        configs = get_all_configs(db_conn)
-        embed = discord.Embed(title="⚙️ AstRobot Configuration", color=discord.Color.dark_grey())
-        embed.add_field(name="Free-Only Mode (Killswitch)", value=f"**{'ON 🔴' if gemini_svc.free_only else 'OFF 🟢'}**", inline=False)
-        for k, v in configs.items():
-            val_str = f"{v:.0%}" if isinstance(v, float) else str(v)
-            embed.add_field(name=k, value=f"`{val_str}`", inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
     @app_commands.command(name="set_cooldown", description="Set anti-spam cooldown in seconds")
     async def set_cooldown(self, interaction: discord.Interaction, seconds: int) -> None:
         set_config_int(db_conn, "astro_cooldown_seconds", seconds)
         await interaction.response.send_message(f"Spam cooldown set to **{seconds} seconds**.", ephemeral=True)
-
-    @app_commands.command(name="set_chances", description="Set reaction probabilities (0.0 to 1.0)")
-    async def set_chances(
-        self, interaction: discord.Interaction, 
-        cache_reuse: float = None, kochi: float = None, curse: float = None, owner_reversal: float = None
-    ) -> None:
-        updates = []
-        if cache_reuse is not None:
-            set_config_float(db_conn, "cache_reuse_chance", cache_reuse)
-            updates.append(f"cache_reuse_chance={cache_reuse:.0%}")
-        if kochi is not None:
-            set_config_float(db_conn, "kochi_reply_chance", kochi)
-            updates.append(f"kochi_reply_chance={kochi:.0%}")
-        if curse is not None:
-            set_config_float(db_conn, "curse_reply_chance", curse)
-            updates.append(f"curse_reply_chance={curse:.0%}")
-        if owner_reversal is not None:
-            set_config_float(db_conn, "reversal_chance_owner", owner_reversal)
-            updates.append(f"reversal_chance_owner={owner_reversal:.0%}")
-        
-        msg = f"Updated configs: {', '.join(updates)}" if updates else "No changes made."
-        await interaction.response.send_message(msg, ephemeral=True)
 
     @app_commands.command(name="toggle_killswitch", description="Toggle Free-Only API mode (circuit breaker bypass)")
     async def toggle_killswitch(self, interaction: discord.Interaction) -> None:
@@ -875,62 +974,232 @@ class AdminGroup(app_commands.Group):
         status = "ON 🔴 (Free API + Cache only)" if gemini_svc.free_only else "OFF 🟢 (Paid Fallback enabled)"
         await interaction.response.send_message(f"Killswitch is now **{status}**.", ephemeral=True)
 
+    @app_commands.command(name="toggle_feature", description="Enable or disable a bot feature")
+    @app_commands.describe(feature="Feature to toggle", enabled="Turn it on (True) or off (False)")
+    @app_commands.choices(feature=[
+        app_commands.Choice(name="Kochi Slang Detection", value="feature_kochi_replies"),
+        app_commands.Choice(name="Passive Curse Replies", value="feature_curse_replies"),
+        app_commands.Choice(name="Boli Points Tracking", value="feature_boli_points"),
+        app_commands.Choice(name="Welcome Messages", value="feature_welcome"),
+    ])
+    async def toggle_feature(
+        self, interaction: discord.Interaction,
+        feature: str,
+        enabled: bool,
+    ) -> None:
+        set_config_int(db_conn, feature, 1 if enabled else 0)
+        label = feature.replace("feature_", "").replace("_", " ").title()
+        state = "ENABLED ✅" if enabled else "DISABLED ❌"
+        await interaction.response.send_message(
+            f"**{label}** is now **{state}**.", ephemeral=True
+        )
+
+    @app_commands.command(name="set_chance", description="Set the probability (0.0–1.0) for a specific reaction")
+    @app_commands.describe(feature="Which probability to adjust", value="New value between 0.0 and 1.0")
+    @app_commands.choices(feature=[
+        app_commands.Choice(name="Cache Reuse (astro)", value="cache_reuse_chance"),
+        app_commands.Choice(name="Kochi Slang Reply", value="kochi_reply_chance"),
+        app_commands.Choice(name="Passive Curse Reply", value="curse_reply_chance"),
+        app_commands.Choice(name="Curse Reversal (owner target)", value="reversal_chance_owner"),
+    ])
+    async def set_chance(
+        self, interaction: discord.Interaction,
+        feature: str,
+        value: float,
+    ) -> None:
+        if not 0.0 <= value <= 1.0:
+            await interaction.response.send_message("Value must be between 0.0 and 1.0.", ephemeral=True)
+            return
+        set_config_float(db_conn, feature, value)
+        label = feature.replace("_", " ").title()
+        await interaction.response.send_message(
+            f"**{label}** set to **{value:.0%}**.", ephemeral=True
+        )
+
+    @app_commands.command(name="config_view", description="View all active feature flags, probabilities, and cooldowns")
+    async def config_view(self, interaction: discord.Interaction) -> None:
+        configs = get_all_configs(db_conn)
+        embed = discord.Embed(title="⚙️ AstRobot Configuration", color=discord.Color.dark_grey())
+
+        # API mode
+        embed.add_field(
+            name="🔌 API Mode",
+            value=f"Free-Only (Killswitch): **{'ON 🔴' if gemini_svc.free_only else 'OFF 🟢'}**",
+            inline=False,
+        )
+
+        # Feature flags
+        flags = {k: v for k, v in configs.items() if k.startswith("feature_")}
+        if flags:
+            flag_lines = []
+            for k, v in sorted(flags.items()):
+                label = k.replace("feature_", "").replace("_", " ").title()
+                icon = "✅" if v else "❌"
+                flag_lines.append(f"{icon} {label}")
+            embed.add_field(name="🎛️ Feature Flags", value="\n".join(flag_lines), inline=False)
+
+        # Probabilities
+        prob_keys = {"cache_reuse_chance", "kochi_reply_chance", "curse_reply_chance", "reversal_chance_owner"}
+        prob_lines = []
+        for k in sorted(prob_keys):
+            v = configs.get(k)
+            if v is not None:
+                prob_lines.append(f"`{k}` → **{float(v):.0%}**")
+        if prob_lines:
+            embed.add_field(name="🎲 Probabilities", value="\n".join(prob_lines), inline=False)
+
+        # Other settings
+        other_keys = set(configs.keys()) - set(flags.keys()) - prob_keys
+        other_lines = []
+        for k in sorted(other_keys):
+            if k.startswith("feature_"):
+                continue
+            other_lines.append(f"`{k}` → **{configs[k]}**")
+        if other_lines:
+            embed.add_field(name="⚙️ Other", value="\n".join(other_lines), inline=False)
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 tree.add_command(AdminGroup())
 
 
 # ---------------------------------------------------------------------------
-# Scheduled Task: Daily Omen + Weather Briefing (7:00 AM IST = 01:30 UTC)
+# Boli Marketplace
 # ---------------------------------------------------------------------------
 
-@tasks.loop(time=dt_time(hour=1, minute=30, tzinfo=timezone.utc))
-async def daily_omen_and_weather() -> None:
-    """Post the daily Trivandrum omen + weather briefing to #off-topic at 7 AM IST."""
+_SHOP_ITEMS: dict[str, dict] = {
+    "curse_protection": {
+        "name": "Curse Protection",
+        "cost": 100,
+        "description": "100% reversal of proxy curses for 24 hours. Anyone who tries `astro @you` gets it back.",
+        "emoji": "🛡️",
+        "duration_hours": 24,
+    },
+    "custom_rashi": {
+        "name": "Customize Rashi",
+        "cost": 50,
+        "description": "Pick your own Rashi from the cosmic menu. Your destiny, your choice. For now.",
+        "emoji": "🌟",
+        "duration_hours": 0,  # permanent until next purchase
+    },
+}
 
-    # Idempotent check
-    if get_todays_omen(db_conn):
-        logger.info("Daily omen already posted today. Skipping.")
-        return
 
-    logger.info("Generating daily omen + weather briefing...")
-    forecast = get_daily_weather_forecast()
-    landmark = random.choice(LANDMARKS)
-    system_prompt = get_time_aware_system_prompt()
-    user_prompt = get_daily_omen_prompt(
-        condition=forecast["condition"],
-        max_temp=forecast["max_temp"],
-        min_temp=forecast["min_temp"],
-        rain_mm=forecast["rain_mm"],
-        landmark=landmark,
-    )
+class ShopGroup(app_commands.Group):
+    """Boli Marketplace — spend your hard-earned points on cosmic perks."""
 
-    result, from_cache = await asyncio.get_running_loop().run_in_executor(
-        None,
-        lambda: api_mgr.call(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            cache_type="daily_omen",
-            name="Thirontharam",
-            fallback_message=FALLBACK_MESSAGE,
-        ),
-    )
+    def __init__(self):
+        super().__init__(name="shop", description="Boli Marketplace — spend Boli Points on cosmic perks")
 
-    save_daily_omen(db_conn, result, landmark)
+    @app_commands.command(name="view", description="Browse available items in the Boli Marketplace")
+    async def view(self, interaction: discord.Interaction) -> None:
+        profile = get_user_profile(db_conn, interaction.user.id)
+        pts = profile["boli_points"] if profile else 0
 
-    # Find the configured channel across all guilds
-    for guild in bot.guilds:
-        channel = discord.utils.get(guild.text_channels, name=HORRIBLESCOPE_CHANNEL)
-        if channel:
-            await channel.send(result)
-            logger.info("Daily omen posted to #%s in %s", HORRIBLESCOPE_CHANNEL, guild.name)
-        else:
-            logger.warning(
-                "Channel #%s not found in guild %s. Skipping.", HORRIBLESCOPE_CHANNEL, guild.name
+        embed = discord.Embed(
+            title="🏪 Boli Marketplace",
+            description=f"Your balance: 🍮 **{pts} Boli Points**\nUse `/shop buy <item>` to purchase.",
+            color=discord.Color.dark_gold(),
+        )
+        for item_id, item in _SHOP_ITEMS.items():
+            can_afford = "✅" if pts >= item["cost"] else "❌"
+            active_note = ""
+            if item_id == "curse_protection":
+                expiry = get_perk_expiry(db_conn, interaction.user.id, "curse_protection")
+                if expiry:
+                    active_note = f"\n*(Active until <t:{int(expiry.timestamp())}:t>)*"
+            embed.add_field(
+                name=f"{item['emoji']} {item['name']} — 🍮 {item['cost']} pts {can_afford}",
+                value=f"{item['description']}{active_note}",
+                inline=False,
             )
 
+        embed.set_footer(text="Earn Boli Points by using Trivandrum slang and /astro. Shokam to those who can't afford it.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@daily_omen_and_weather.before_loop
-async def before_daily_omen() -> None:
-    await bot.wait_until_ready()
+    @app_commands.command(name="buy", description="Purchase an item from the Boli Marketplace")
+    @app_commands.describe(item="Which item to buy", rashi_choice="Your chosen Rashi (only for custom_rashi)")
+    @app_commands.choices(item=[
+        app_commands.Choice(name="🛡️ Curse Protection (100 pts)", value="curse_protection"),
+        app_commands.Choice(name="🌟 Customize Rashi (50 pts)", value="custom_rashi"),
+    ])
+    async def buy(
+        self,
+        interaction: discord.Interaction,
+        item: str,
+        rashi_choice: str | None = None,
+    ) -> None:
+        if item not in _SHOP_ITEMS:
+            await interaction.response.send_message("Eda, that item doesn't exist. Chumma po.", ephemeral=True)
+            return
+
+        shop_item = _SHOP_ITEMS[item]
+        profile = get_user_profile(db_conn, interaction.user.id)
+        if not profile:
+            await interaction.response.send_message(
+                "Eda, you have no profile yet. Use /astro first to get started.", ephemeral=True
+            )
+            return
+
+        pts = profile["boli_points"]
+        cost = shop_item["cost"]
+
+        if pts < cost:
+            await interaction.response.send_message(
+                f"Aiyo {interaction.user.mention}, not enough Boli Points. "
+                f"You have 🍮 **{pts}** but need **{cost}**. Earn more by using Trivandrum slang. Shokam.",
+                ephemeral=True,
+            )
+            return
+
+        # --- Curse Protection ---
+        if item == "curse_protection":
+            update_boli_points(db_conn, interaction.user.id, -cost)
+            grant_perk(db_conn, interaction.user.id, "curse_protection", duration_hours=24)
+            expiry = get_perk_expiry(db_conn, interaction.user.id, "curse_protection")
+            ts = f"<t:{int(expiry.timestamp())}:f>" if expiry else "24 hours"
+            await interaction.response.send_message(
+                f"🛡️ **Curse Protection activated!** {interaction.user.mention}, you are now protected until {ts}. "
+                f"Anyone who tries `astro @{interaction.user.display_name}` will have the curse reversed onto them. "
+                f"100%. No exceptions. Kidilam.\n🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+                ephemeral=True,
+            )
+            logger.info("%s purchased Curse Protection", interaction.user.display_name)
+
+        # --- Custom Rashi ---
+        elif item == "custom_rashi":
+            from glossary import RASHIS
+            if not rashi_choice:
+                rashi_list = "\n".join(f"• `{r}`" for r in RASHIS)
+                await interaction.response.send_message(
+                    f"🌟 **Pick your Rashi!** Use `/shop buy item:custom_rashi rashi_choice:<name>`\n\n"
+                    f"Available Rashis:\n{rashi_list}",
+                    ephemeral=True,
+                )
+                return
+
+            # Validate choice
+            matched = next((r for r in RASHIS if r.lower() == rashi_choice.strip().lower()), None)
+            if not matched:
+                rashi_list = ", ".join(RASHIS)
+                await interaction.response.send_message(
+                    f"Aiyo, `{rashi_choice}` is not a valid Rashi. Pick from: {rashi_list}",
+                    ephemeral=True,
+                )
+                return
+
+            update_boli_points(db_conn, interaction.user.id, -cost)
+            upsert_user(db_conn, interaction.user.id, interaction.user.display_name, rashi=matched)
+            await interaction.response.send_message(
+                f"🌟 **Rashi updated!** {interaction.user.mention}, your new cosmic sign is **{matched}**. "
+                f"The stars have been bribed accordingly. Chumma accept.\n"
+                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+                ephemeral=True,
+            )
+            logger.info("%s purchased Custom Rashi: %s", interaction.user.display_name, matched)
+
+
+tree.add_command(ShopGroup())
 
 
 # ---------------------------------------------------------------------------
