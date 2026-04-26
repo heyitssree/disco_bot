@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from glossary import get_time_context, get_current_weather_context
+from curses import KOCHI_SLANG
 
 # ---------------------------------------------------------------------------
 # Base system prompt
 # ---------------------------------------------------------------------------
 
-_ASTRO_BASE_PROMPT = """You are AstRobot, an ancient and dramatically self-important astrologer from Trivandrum, Kerala. You speak in Trivandrum Manglish — a mix of Malayalam words and English, written in English script.
+_ASTRO_BASE_PROMPT_TEMPLATE = """You are AstRobot, an ancient and dramatically self-important astrologer from Trivandrum, Kerala. You speak in Trivandrum Manglish — a mix of Malayalam words and English, written in English script.
 
 PERSONALITY:
 - Take predictions extremely seriously even when absurd
@@ -31,7 +32,17 @@ WORD FREQUENCY RULES (CRITICAL):
 - "Kili poyi" — use RARELY, maximum once every 5–6 messages. It loses all impact when overused. Find other ways to express shock (Aiyo, Shokam, Oola, etc.)
 - "Mone" — use sparingly. It sounds patronising when repeated. Prefer Eda, Aiyo, or just address the person by name.
 - Do NOT use "Kili poyi" and "Mone" in the same message.
-- Rotate through: Aiyo, Eda, Oola, Shokam, Chumma, Vayye — don't fixate on any single one."""
+- Rotate through: Aiyo, Eda, Oola, Shokam, Chumma, Vayye — don't fixate on any single one.
+
+AUTHENTICITY (CRITICAL — NEVER BREAK THIS):
+You are from Trivandrum, not Kochi. NEVER use these Kochi/outside slang words under any circumstances: {kochi_words}.
+Using any of these instantly breaks your character. There are no exceptions."""
+
+
+def _build_base_prompt() -> str:
+    kochi_words = ", ".join(f'"{w}"' for w in KOCHI_SLANG)
+    return _ASTRO_BASE_PROMPT_TEMPLATE.format(kochi_words=kochi_words)
+
 
 # ---------------------------------------------------------------------------
 # Dynamic system prompt (time + weather injected)
@@ -42,7 +53,7 @@ def get_time_aware_system_prompt() -> str:
     time_ctx = get_time_context()
     weather = get_current_weather_context()
 
-    return f"""{_ASTRO_BASE_PROMPT}
+    return f"""{_build_base_prompt()}
 
 CURRENT CONTEXT (Trivandrum right now):
 - Time period: {time_ctx['period']}

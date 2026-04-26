@@ -356,9 +356,21 @@ async def on_ready() -> None:
     logger.info("Slash commands synced. AstRobot V2 is live.")
 
 
+_MODA_INTROS: list[str] = [
+    "If you have any questions, ask Moda. He is the moderator here. He will pretend to know the answer.",
+    "Moda is our moderator. Treat him with respect. He earned it by doing absolutely nothing special.",
+    "The server moderator Moda will guide you. Or he will just stare at the screen and nod. Same thing.",
+    "Moda is the boss here — in the sense that he has a badge. Whether he uses it wisely is another vishayam entirely.",
+    "Our moderator Moda is very capable. At least that is what he tells himself every morning.",
+    "If lost, contact Moda. He is the moderator. He will send you in the wrong direction with full confidence.",
+    "Moda runs this server. In the same way KSRTC runs on time — technically yes, practically no.",
+    "The one called Moda will moderate you. What that means, even the stars are not sure. But he has the role.",
+]
+
+
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    """Welcome new member and generate a fresh astrology prediction for them."""
+    """Welcome new member with a single combined message and fresh astrology prediction."""
     channel = (
         discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
         or discord.utils.get(member.guild.text_channels, name="general")
@@ -368,19 +380,14 @@ async def on_member_join(member: discord.Member) -> None:
         logger.warning("Could not find a welcome channel for new member %s", member.display_name)
         return
 
-    # Register the user
     upsert_user(db_conn, member.id, member.display_name)
 
-    # Send welcome message first
-    welcome_msg = random.choice(WELCOME_MESSAGES).format(user=member.mention)
-    await channel.send(welcome_msg)
-
-    # Generate a fresh prediction for them
     async with channel.typing():
         prediction = await get_astro_prediction(member.id, member.display_name)
-        # Replace plain name with mention in the prediction
-        personalised = prediction.replace(member.display_name, member.mention)
-        await channel.send(f"And your first cosmic doom reading, {member.mention}:\n{personalised}")
+
+    welcome_line = random.choice(WELCOME_MESSAGES).format(user=member.mention)
+    moda_line = f"\n{random.choice(_MODA_INTROS)}" if random.random() < 0.40 else ""
+    await channel.send(f"{welcome_line}{moda_line}\n{prediction}")
 
     logger.info("Welcomed new member %s with prediction in #%s", member.display_name, channel.name)
 
