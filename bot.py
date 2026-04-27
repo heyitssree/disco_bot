@@ -283,7 +283,35 @@ def _contains_severe_curse(text: str) -> bool:
 intents = discord.Intents.all()
 intents.message_content = True
 bot = discord.Client(intents=intents)
-tree = app_commands.CommandTree(bot)
+
+
+class _AstRobotTree(app_commands.CommandTree):
+    """CommandTree subclass that enforces the master kill switch globally."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not _feat("master_killswitch"):
+            return True  # bot alive — allow all
+
+        # Bot is dead — only owner can reach /admin commands
+        is_owner = bool(OWNER_ID and interaction.user.id == OWNER_ID)
+        if not is_owner:
+            try:
+                app_info = await bot.application_info()
+                is_owner = interaction.user.id == app_info.owner.id
+            except Exception:
+                pass
+
+        if is_owner and interaction.command and interaction.command.qualified_name.startswith("admin"):
+            return True
+
+        await interaction.response.send_message(
+            "AstRobot is currently in sleep mode. Only the owner can wake it up. Chumma wait mone.",
+            ephemeral=True,
+        )
+        return False
+
+
+tree = _AstRobotTree(bot)
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -603,6 +631,10 @@ async def on_member_join(member: discord.Member) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    # Guard against messages arriving before on_ready finishes initialising
+    if db_conn is None:
+        return
+
     # Master kill switch — ignore everything (except owner text commands)
     if _feat("master_killswitch"):
         return
@@ -816,7 +848,7 @@ _URL_RE = re.compile(r"https?://[^\s]+")
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     """Summarise a linked article when a user reacts with the configured emoji."""
-    if payload.user_id == bot.user.id:
+    if db_conn is None or payload.user_id == bot.user.id:
         return
 
     if not _feat("feature_link_summary"):
@@ -881,35 +913,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     except Exception as exc:
         logger.warning("Link summary failed for %s: %s", url, exc)
         await message.reply("Aiyo, something went wrong while reading that link. KSEB-style failure.")
-
-
-# ---------------------------------------------------------------------------
-# Global interaction check — Master Kill Switch (Feature 8)
-# ---------------------------------------------------------------------------
-
-@tree.interaction_check
-async def _global_killswitch_check(interaction: discord.Interaction) -> bool:
-    """Block all slash commands when master_killswitch is ON.
-
-    Exception: the bot owner can always use /admin killswitch to revive the bot.
-    """
-    if not _feat("master_killswitch"):
-        return True  # bot is alive — allow all interactions
-
-    # Bot is dead — only let the owner through, and only for /admin commands
-    is_owner = (OWNER_ID and interaction.user.id == OWNER_ID)
-    if not is_owner:
-        app_info = await bot.application_info()
-        is_owner = interaction.user.id == app_info.owner.id
-
-    if is_owner and interaction.command and interaction.command.qualified_name.startswith("admin"):
-        return True
-
-    await interaction.response.send_message(
-        "AstRobot is currently in sleep mode. Only the owner can wake it up. Chumma wait mone.",
-        ephemeral=True,
-    )
-    return False
 
 
 # ---------------------------------------------------------------------------
