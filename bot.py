@@ -1619,7 +1619,7 @@ class AdminGroup(app_commands.Group):
         super().__init__(
             name="admin",
             description="Navi owner configuration controls",
-            default_member_permissions=discord.Permissions(administrator=True),
+            default_permissions=discord.Permissions(administrator=True),
         )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
