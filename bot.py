@@ -1,4 +1,4 @@
-# bot.py - AstRobot V2 — Main Discord bot entrypoint
+# bot.py - Navi (disco_bot) — Main Discord bot entrypoint
 
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ logging.basicConfig(
         logging.FileHandler("logs/bot.log", encoding="utf-8"),
     ],
 )
-logger = logging.getLogger("astrobot")
+logger = logging.getLogger("navi")
 
 # ---------------------------------------------------------------------------
 # Load environment
@@ -202,7 +202,7 @@ async def _check_vibe(message: discord.Message) -> None:
             system_prompt=system_prompt,
             cache_type="qa",
             name="VibeCheck",
-            fallback_message="Aiyo, everyone chill please. This is not KSRTC Thampanoor — no need to fight like this mone.",
+            fallback_message="Hey! Listen! Everyone chill please. Navi has seen Ganon's army and this server is somehow louder. Sit down mone.",
         ),
     )
     await message.channel.send(reply)
@@ -222,8 +222,8 @@ async def _handle_strike(member: discord.Member, channel: discord.abc.Messageabl
 
     if new_strikes == 1:
         await channel.send(
-            f"Eda {member.mention}, that's Strike 1. Watch your language mone. "
-            f"Two more and AstRobot will personally arrange your cosmic punishment at Thampanoor."
+            f"Hey! {member.mention}, listen! That's Strike 1. Watch your language mone. "
+            f"Two more and Navi will personally guide you straight into Thampanoor traffic with no return."
         )
         logger.info("Strike 1 issued to %s", member.display_name)
 
@@ -237,7 +237,7 @@ async def _handle_strike(member: discord.Member, channel: discord.abc.Messageabl
             jail_role = discord.utils.get(channel.guild.roles, name=JAIL_ROLE_NAME)
             if jail_role:
                 try:
-                    await member.add_roles(jail_role, reason="AstRobot Strike 2 — Thampanoor Jail")
+                    await member.add_roles(jail_role, reason="Navi Strike 2 — Thampanoor Jail")
                     asyncio.create_task(_release_from_jail(member, jail_role, _JAIL_TIMEOUT_MINUTES * 60))
                 except discord.Forbidden:
                     logger.warning("Missing permissions to assign jail role to %s", member.display_name)
@@ -264,7 +264,7 @@ async def _release_from_jail(member: discord.Member, role: discord.Role, delay_s
     """Remove jail role after delay_seconds."""
     await asyncio.sleep(delay_seconds)
     try:
-        await member.remove_roles(role, reason="AstRobot jail sentence served")
+        await member.remove_roles(role, reason="Navi jail sentence served")
         logger.info("Released %s from Thampanoor Jail", member.display_name)
     except Exception as exc:
         logger.warning("Could not remove jail role from %s: %s", member.display_name, exc)
@@ -285,7 +285,7 @@ intents.message_content = True
 bot = discord.Client(intents=intents)
 
 
-class _AstRobotTree(app_commands.CommandTree):
+class _NaviTree(app_commands.CommandTree):
     """CommandTree subclass that enforces the master kill switch globally."""
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -305,13 +305,13 @@ class _AstRobotTree(app_commands.CommandTree):
             return True
 
         await interaction.response.send_message(
-            "AstRobot is currently in sleep mode. Only the owner can wake it up. Chumma wait mone.",
+            "Navi is currently in sleep mode. Even fairies need rest. Only the owner can wake me up. Chumma wait mone.",
             ephemeral=True,
         )
         return False
 
 
-tree = _AstRobotTree(bot)
+tree = _NaviTree(bot)
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -341,6 +341,7 @@ _FEATURE_DEFAULTS: dict[str, int] = {
     "feature_curse_replies": 1,
     "feature_boli_points":  1,
     "feature_welcome":      1,
+    "feature_temp_vc":      1,
 }
 
 # Populated in on_ready() after db_conn is available
@@ -413,7 +414,7 @@ _LEVEL_UP_MESSAGES: list[str] = [
     "{user} has reached Level **{level}**! Even the thattukada pillacha is impressed. Slightly.",
     "Oola! {user} is now Level **{level}**! The cosmos updated your file. Long overdue, honestly.",
     "Shokam to everyone else — {user} just hit Level **{level}**! The universe is watching. And judging the rest.",
-    "{user} Level **{level}** achieved! AstRobot acknowledges your slang dedication. Chumma. Keep going.",
+    "{user} Level **{level}** achieved! Navi acknowledges your slang dedication. Even Link was not this committed. Chumma. Keep going.",
     "Aiyo {user}, Level **{level}**! Even the Ponmudi mist parted briefly to recognise this moment. Kidilam.",
     "Eda {user}, you are now Level **{level}**! Indian Coffee House Thampanoor will serve you slightly faster now.",
 ]
@@ -586,7 +587,7 @@ async def on_ready() -> None:
     _load_feature_cache()
 
     await tree.sync()
-    logger.info("Slash commands synced. AstRobot V2 is live.")
+    logger.info("Slash commands synced. Navi is live. Hey! Listen!")
 
 
 _MODA_INTROS: list[str] = [
@@ -842,7 +843,52 @@ async def on_message(message: discord.Message) -> None:
 # Emoji-triggered link summarizer (Feature 3)
 # ---------------------------------------------------------------------------
 
+# Strips trailing punctuation that gets swept into a URL match (e.g. "url.")
 _URL_RE = re.compile(r"https?://[^\s]+")
+_URL_TRAIL_RE = re.compile(r"[)\].,;!?\"'>]+$")
+
+# Tracks message IDs already summarised to prevent duplicate replies when
+# multiple users react with the summary emoji in quick succession.
+_summarized_messages: set[int] = set()
+_SUMMARIZED_MAX = 500  # cap so it never grows unbounded
+
+_SCRAPE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _extract_article_text(html: str) -> str:
+    """Return the most article-like text content from raw HTML, capped at 4 000 chars."""
+    import importlib
+    bs4 = importlib.import_module("bs4")
+    BeautifulSoup = bs4.BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Strip noise nodes that add no article content
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+        tag.decompose()
+
+    # Prefer a semantic article container; fall back to <main>, then whole body
+    container = soup.find("article") or soup.find("main") or soup
+
+    paragraphs = [
+        p.get_text(separator=" ", strip=True)
+        for p in container.find_all("p")
+        if len(p.get_text(strip=True)) > 40  # drop nav labels / button text
+    ]
+
+    # If the article container had too little text, widen to the whole document
+    if len(" ".join(paragraphs)) < 300:
+        paragraphs = [
+            p.get_text(separator=" ", strip=True)
+            for p in soup.find_all("p")
+            if len(p.get_text(strip=True)) > 40
+        ]
+
+    return " ".join(paragraphs)[:4000]
 
 
 @bot.event
@@ -858,40 +904,63 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
     if str(payload.emoji) != summary_emoji:
         return
 
+    # Deduplicate: ignore if another reaction already triggered a summary
+    if payload.message_id in _summarized_messages:
+        return
+
+    # get_channel misses uncached channels (threads, recently created channels)
     channel = bot.get_channel(payload.channel_id)
     if channel is None:
-        return
+        try:
+            channel = await bot.fetch_channel(payload.channel_id)
+        except (discord.NotFound, discord.Forbidden):
+            return
 
     try:
         message = await channel.fetch_message(payload.message_id)
-    except discord.NotFound:
+    except (discord.NotFound, discord.Forbidden):
         return
 
-    urls = _URL_RE.findall(message.content)
-    if not urls:
+    raw_urls = _URL_RE.findall(message.content)
+    if not raw_urls:
         return
 
-    url = urls[0]
+    # Strip trailing punctuation that the regex sweeps up (e.g. "https://x.com.")
+    url = _URL_TRAIL_RE.sub("", raw_urls[0])
+
+    # Mark as in-progress before the async fetch so concurrent reactions are dropped
+    _summarized_messages.add(payload.message_id)
+    if len(_summarized_messages) > _SUMMARIZED_MAX:
+        try:
+            _summarized_messages.pop()
+        except KeyError:
+            pass
 
     try:
         import aiohttp
-        from bs4 import BeautifulSoup
 
         async with aiohttp.ClientSession(
-            headers={"User-Agent": "Mozilla/5.0 AstRobot/2.0 link-summariser"}
+            headers={"User-Agent": _SCRAPE_UA}
         ) as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(connect=5, total=15),
+                allow_redirects=True,
+            ) as resp:
                 if resp.status != 200:
-                    await message.reply(f"Aiyo, couldn't fetch that link (HTTP {resp.status}). Shokam.")
+                    await message.reply(
+                        f"Aiyo, couldn't fetch that link (HTTP {resp.status}). Shokam."
+                    )
                     return
                 html = await resp.text(errors="replace")
 
-        soup = BeautifulSoup(html, "html.parser")
-        paragraphs = [p.get_text(separator=" ", strip=True) for p in soup.find_all("p")]
-        page_text = " ".join(paragraphs)[:4000]  # cap to avoid token overrun
+        page_text = _extract_article_text(html)
 
         if not page_text.strip():
-            await message.reply("Eda, that page has no readable text. Maybe a paywall or JS-only site. Chumma.")
+            await message.reply(
+                "Eda, that page has no readable text. "
+                "Maybe a paywall or JS-only site. Chumma."
+            )
             return
 
         user_prompt = get_link_summary_prompt(page_text, url)
@@ -904,7 +973,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
                 system_prompt=system_prompt,
                 cache_type="qa",
                 name="LinkSummary",
-                fallback_message="AstRobot-nte lamp went off. KSEB current problem. Try again mone.",
+                fallback_message="Navi-nte glow went off. KSEB took the current. Even fairies need electricity mone. Try again.",
             ),
         )
         await message.reply(f"📰 **Link Summary:**\n{summary}")
@@ -912,7 +981,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
     except Exception as exc:
         logger.warning("Link summary failed for %s: %s", url, exc)
-        await message.reply("Aiyo, something went wrong while reading that link. KSEB-style failure.")
+        await message.reply("Aiyo, something went wrong while reading that link. KSEB-style failure — even Navi's glow couldn't help.")
 
 
 # ---------------------------------------------------------------------------
@@ -997,7 +1066,7 @@ async def rank_slash(interaction: discord.Interaction) -> None:
 
     embed = discord.Embed(
         title="🍮 Top Appis — Boli Points Leaderboard",
-        description="The most Thirontharam people in this server, ranked by AstRobot.",
+        description="The most Thirontharam people in this server, ranked by Navi. Hey! Listen to these legends.",
         color=discord.Color.gold(),
     )
 
@@ -1044,7 +1113,7 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
         progress_line = "🌟 Maximum level reached! Ninte cosmic destiny is sealed, mone."
 
     await interaction.response.send_message(
-        f"**Your AstRobot Profile**\n"
+        f"**Your Navi Profile**\n"
         f"🌟 Rashi: **{rashi}**\n"
         f"⚔️ Level: **{level}** — *{title}*\n"
         f"{progress_line}\n"
@@ -1154,7 +1223,7 @@ async def kanmanilla_slash(interaction: discord.Interaction, user: discord.Membe
     profile = get_user_profile(db_conn, user.id)
     if not profile:
         await interaction.response.send_message(
-            f"Eda, {user.mention} hasn't even properly registered with AstRobot yet. Cannot make missing poster for a stranger.",
+            f"Eda, {user.mention} hasn't even registered with Navi yet. Cannot track what I have never seen. Chumma.",
             ephemeral=True,
         )
         return
@@ -1324,7 +1393,8 @@ async def mod_tldr_slash(interaction: discord.Interaction) -> None:
     logger.info("mod_tldr run by %s in thread #%s", interaction.user.display_name, thread.name)
 
 
-@tree.command(name="health", description="AstRobot system health (owner only)")
+@tree.command(name="health", description="Navi system health (owner only)")
+@app_commands.default_permissions(administrator=True)
 async def health_slash(interaction: discord.Interaction) -> None:
     app_info = await bot.application_info()
     if interaction.user.id != app_info.owner.id:
@@ -1360,7 +1430,7 @@ async def health_slash(interaction: discord.Interaction) -> None:
     )
 
     embed = discord.Embed(
-        title="🔧 AstRobot V2 — Health Status",
+        title="🔧 Navi — Health Status",
         color=discord.Color.red() if gemini_status["circuit_open"] else discord.Color.green(),
     )
 
@@ -1454,12 +1524,12 @@ async def health_slash(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name="help", description="Learn how to interact with AstRobot")
+@tree.command(name="help", description="Learn how to interact with Navi")
 async def help_slash(interaction: discord.Interaction) -> None:
     """Show the help menu — only lists features that are currently enabled."""
     embed = discord.Embed(
-        title="AstRobot V2 — Help & Features",
-        description="Ancient astrologer from Thirontharam. Speaks Manglish. Judges you constantly. Here is what I can do:",
+        title="Navi — Help & Features",
+        description="Fairy from Hyrule. Now stationed in Thirontharam. Speaks Manglish. Has seen things. Here is what I can do:",
         color=discord.Color.dark_purple(),
     )
 
@@ -1476,6 +1546,8 @@ async def help_slash(interaction: discord.Interaction) -> None:
         core_cmds.insert(1, "`/astro user:@someone` — Get a prediction for someone else")
     if _feat("feature_kanmanilla"):
         core_cmds.append("`/kanmanilla @user` — Ping a missing member with a dramatic notice")
+    if _feat("feature_temp_vc"):
+        core_cmds.append("`/temp_vc name: capacity:` — Create a temporary voice channel (self-destructs in 30 min or when empty)")
     if _feat("feature_audit"):
         core_cmds.append("`/audit @user` — Mod: audit a user's messages against server rules")
     if _feat("feature_mod_tldr"):
@@ -1497,8 +1569,8 @@ async def help_slash(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Mention Q&A",
         value=(
-            "`@AstRobot <question>` — Ask me anything. I will answer factually first, then be sarcastic about it.\n"
-            "Works for news, scores, how-tos — or just to hear me judge your question."
+            "`@Navi <question>` — Ask me anything. I will answer factually first, then judge you for asking.\n"
+            "Works for news, scores, how-tos — I guided a hero through 100 dungeons, I can handle your questions."
         ),
         inline=False,
     )
@@ -1525,9 +1597,9 @@ async def help_slash(interaction: discord.Interaction) -> None:
     if _feat("feature_welcome"):
         passive_lines.append("**New member joins** → Welcome message + fresh astrology reading")
     if _feat("feature_vibe_check"):
-        passive_lines.append("**Chat heats up** → AstRobot intervenes with a sarcastic calming message")
+        passive_lines.append("**Chat heats up** → Navi intervenes with a sarcastic calming message (she's done this in Hyrule too)")
     if _feat("feature_link_summary"):
-        passive_lines.append("**React 📰 on a link** → AstRobot scrapes and summarises the article in 3 bullet points")
+        passive_lines.append("**React 📰 on a link** → Navi scrapes and summarises the article in 3 bullet points")
     if _feat("feature_strikes"):
         passive_lines.append("**Severe language** → 3-strike system with automatic jail role at strike 2")
     if passive_lines:
@@ -1544,7 +1616,11 @@ async def help_slash(interaction: discord.Interaction) -> None:
 class AdminGroup(app_commands.Group):
     """Admin controls — visible and usable only by the bot owner."""
     def __init__(self):
-        super().__init__(name="admin", description="AstRobot owner configuration controls")
+        super().__init__(
+            name="admin",
+            description="Navi owner configuration controls",
+            default_member_permissions=discord.Permissions(administrator=True),
+        )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Primary guard: hardcoded owner ID from .env (fast, no API call)
@@ -1577,14 +1653,14 @@ class AdminGroup(app_commands.Group):
         _set_feature("master_killswitch", new_state)
         if new_state:
             await interaction.response.send_message(
-                "☠️ **Master Kill Switch: ON.** AstRobot is now completely silent. "
-                "Only you can wake it up with `/admin killswitch` again.",
+                "☠️ **Master Kill Switch: ON.** Navi is now completely silent. Even fairies go offline. "
+                "Only you can wake me up with `/admin killswitch` again.",
                 ephemeral=True,
             )
             logger.warning("MASTER KILL SWITCH ACTIVATED by %s", interaction.user.display_name)
         else:
             await interaction.response.send_message(
-                "✅ **Master Kill Switch: OFF.** AstRobot is back alive. Kidilam.",
+                "✅ **Master Kill Switch: OFF.** Navi is back. Hey! Listen! Navi is back. Kidilam.",
                 ephemeral=True,
             )
             logger.info("Master kill switch deactivated by %s", interaction.user.display_name)
@@ -1603,6 +1679,7 @@ class AdminGroup(app_commands.Group):
         app_commands.Choice(name="Passive Curse Replies", value="feature_curse_replies"),
         app_commands.Choice(name="Boli Points Tracking", value="feature_boli_points"),
         app_commands.Choice(name="Welcome Messages", value="feature_welcome"),
+        app_commands.Choice(name="Temp VC Generator (/temp_vc)", value="feature_temp_vc"),
     ])
     async def toggle_feature(
         self, interaction: discord.Interaction,
@@ -1650,7 +1727,7 @@ class AdminGroup(app_commands.Group):
     @app_commands.command(name="config_view", description="View all active feature flags, probabilities, and cooldowns")
     async def config_view(self, interaction: discord.Interaction) -> None:
         configs = get_all_configs(db_conn)
-        embed = discord.Embed(title="⚙️ AstRobot Configuration", color=discord.Color.dark_grey())
+        embed = discord.Embed(title="⚙️ Navi Configuration", color=discord.Color.dark_grey())
 
         # API mode
         embed.add_field(
@@ -1856,6 +1933,143 @@ tree.add_command(ShopGroup())
 
 
 # ---------------------------------------------------------------------------
+# Temporary Voice Channels
+# ---------------------------------------------------------------------------
+
+_TEMP_VC_DURATION = 1800  # seconds (30 minutes)
+
+# Tracks channel_id -> asyncio.Task so the voice-state handler can cancel early.
+_temp_vc_registry: dict[int, asyncio.Task] = {}
+
+
+async def _temp_vc_expire(channel: discord.VoiceChannel, delay: int) -> None:
+    """Sleep delay seconds then delete the voice channel if it still exists."""
+    await asyncio.sleep(delay)
+    try:
+        await channel.delete(reason="Temp VC expired after 30 minutes.")
+        logger.info("Temp VC '%s' auto-deleted after timer expiry.", channel.name)
+    except discord.NotFound:
+        logger.debug("Temp VC '%s' was already deleted before timer fired.", channel.name)
+    except Exception as exc:
+        logger.warning("Could not delete temp VC '%s': %s", channel.name, exc)
+    finally:
+        _temp_vc_registry.pop(channel.id, None)
+
+
+@tree.command(
+    name="temp_vc",
+    description="Create a temporary voice channel that self-destructs after 30 minutes",
+)
+@app_commands.describe(
+    name="Name for the voice channel",
+    capacity="Max users allowed (2–99)",
+)
+async def temp_vc_slash(
+    interaction: discord.Interaction,
+    name: str,
+    capacity: app_commands.Range[int, 2, 99],
+) -> None:
+    if not _feat("feature_temp_vc"):
+        await interaction.response.send_message(
+            "Temp VC creation is currently disabled. Ask a mod to enable it. Chumma wait mone.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command only works inside a server.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    # Place the VC in the same category as the invoking channel when possible.
+    category: discord.CategoryChannel | None = None
+    if isinstance(interaction.channel, discord.abc.GuildChannel):
+        category = interaction.channel.category
+    if category is None:
+        category = discord.utils.get(guild.categories, name="Temp VCs")
+
+    # Roles with move_members or manage_channels already bypass user limits in
+    # Discord natively; adding an explicit connect overwrite makes the intent
+    # visible in the channel settings as well.
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(connect=True),
+    }
+    for role in guild.roles:
+        if role.managed:
+            continue
+        if role.permissions.manage_channels or role.permissions.move_members:
+            overwrites[role] = discord.PermissionOverwrite(connect=True)
+
+    try:
+        vc = await guild.create_voice_channel(
+            name=name,
+            category=category,
+            user_limit=capacity,
+            overwrites=overwrites,
+            reason=f"Temp VC requested by {interaction.user.display_name}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "Aiyo, I don't have permission to create voice channels here. "
+            "Ask a mod to grant me **Manage Channels**.",
+            ephemeral=True,
+        )
+        return
+    except Exception as exc:
+        logger.error("Failed to create temp VC: %s", exc)
+        await interaction.followup.send(
+            "Something went wrong while creating the voice channel. Shokam situation.",
+            ephemeral=True,
+        )
+        return
+
+    task = asyncio.create_task(_temp_vc_expire(vc, _TEMP_VC_DURATION))
+    _temp_vc_registry[vc.id] = task
+
+    await interaction.followup.send(
+        f"🎙️ Voice channel **{vc.name}** created with a limit of **{capacity}** users.\n"
+        f"The stars grant you 30 minutes. Use them wisely."
+    )
+    logger.info(
+        "Temp VC '%s' (id=%d, limit=%d) created by %s.",
+        vc.name, vc.id, capacity, interaction.user.display_name,
+    )
+
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState,
+) -> None:
+    """Delete a temp VC early when it becomes completely empty."""
+    if before.channel is None or before.channel.id not in _temp_vc_registry:
+        return
+
+    channel = before.channel
+    remaining = [m for m in channel.members if not m.bot]
+    if remaining:
+        return
+
+    # All users gone — cancel the 30-minute timer and delete now.
+    task = _temp_vc_registry.pop(channel.id, None)
+    if task:
+        task.cancel()
+
+    try:
+        await channel.delete(reason="Temp VC emptied before the 30-minute timer.")
+        logger.info("Temp VC '%s' deleted early (channel empty).", channel.name)
+    except discord.NotFound:
+        pass
+    except Exception as exc:
+        logger.warning("Could not early-delete temp VC '%s': %s", channel.name, exc)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1871,7 +2085,7 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     logger.info(
-        "Starting AstRobot V2... Free key: %s | Paid key: %s | Free tier mode: %s",
+        "Starting Navi... Free key: %s | Paid key: %s | Free tier mode: %s",
         "✓" if FREE_API_KEY else "✗",
         "✓" if PAID_API_KEY else "✗",
         FREE_TIER_MODE,

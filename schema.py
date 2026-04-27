@@ -1,4 +1,4 @@
-# schema.py - DuckDB schema management for AstRobot V2
+# schema.py - DuckDB schema management for Navi (disco_bot)
 # Creates and manages all tables. Call init_db() at bot startup.
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Callable, TypeVar
 import duckdb
 import os
 
-logger = logging.getLogger("astrobot.schema")
+logger = logging.getLogger("navi.schema")
 
 _T = TypeVar("_T")
 

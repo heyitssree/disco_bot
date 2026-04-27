@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 
-logger = logging.getLogger("astrobot.glossary")
+logger = logging.getLogger("navi.glossary")
 
 # ---------------------------------------------------------------------------
 # Rashi (Star Signs) — Trivandrum-flavoured
@@ -41,7 +41,7 @@ _WMO_CODE_MAP: dict[range | int, str] = {
     65: "heavy rain, stay inside and eat Pazham Pori",
     71: "light snowfall",   # virtually impossible in TVM but handled
     80: "rain showers, Chalai Market flooding possible",
-    95: "thunderstorm, AstRobot advises staying home",
+    95: "thunderstorm, Navi advises staying home",
     99: "severe thunderstorm, full shokam situation",
 }
 

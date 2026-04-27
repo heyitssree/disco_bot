@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import duckdb
 from google import genai
 
-logger = logging.getLogger("astrobot.gemini")
+logger = logging.getLogger("navi.gemini")
 
 _CIRCUIT_FAILURE_THRESHOLD = 3
 _CIRCUIT_OPEN_DURATION_MINUTES = 30
@@ -28,7 +28,7 @@ class GeminiService:
     ) -> None:
         if not free_api_key and not paid_api_key:
             raise ValueError(
-                "AstRobot needs at least one Gemini API key. "
+                "Navi needs at least one Gemini API key. "
                 "Set GEMINI_API_KEY_FREE or GEMINI_API_KEY_PAID in .env"
             )
 

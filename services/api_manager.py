@@ -10,7 +10,7 @@ import duckdb
 from schema import get_cached_prediction
 from services.gemini_service import GeminiService
 
-logger = logging.getLogger("astrobot.api_manager")
+logger = logging.getLogger("navi.api_manager")
 
 _DEFAULT_RPM_LIMIT = 10
 _WINDOW_SECONDS = 60
@@ -60,7 +60,7 @@ class ApiManager:
         cache_type: str,
         name: str,
         curse_used: str | None = None,
-        fallback_message: str = "AstRobot-nte lamp went off. KSEB current problem. Try again mone.",
+        fallback_message: str = "Navi-nte glow went off. KSEB took the current. Even fairies need electricity mone. Try again.",
     ) -> tuple[str, bool]:
         """Get a Gemini response, respecting rate limits and circuit state.
 
@@ -129,7 +129,7 @@ class ApiManager:
         self,
         cache_type: str,
         name: str,
-        fallback_message: str = "AstRobot-nte lamp went off. KSEB current problem. Try again mone.",
+        fallback_message: str = "Navi-nte glow went off. KSEB took the current. Even fairies need electricity mone. Try again.",
         curse_used: str | None = None,
     ) -> tuple[str, bool]:
         """Serve directly from DuckDB cache pool without touching Gemini API at all.
