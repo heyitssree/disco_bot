@@ -18,6 +18,13 @@ CURSE_WORDS: list[str] = [
     "veruppirayan", "alavalathi", "shasi", "gundabiju", "kuzhappakkaran",
 ]
 
+# Severe subset that triggers the 3-strike system (Feature 7)
+# These are the most aggressive/disruptive terms from CURSE_WORDS
+SEVERE_CURSE_WORDS: list[str] = [
+    "thallippoli", "vivaramillathavan", "buddhisunyan",
+    "dushtan", "pokri", "veruppirayan", "alavalathi", "kuzhappakkaran",
+]
+
 # ---------------------------------------------------------------------------
 # Boli Points — trigger words (earn +5 pts per unique word per message)
 # ---------------------------------------------------------------------------

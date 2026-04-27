@@ -206,12 +206,14 @@ def get_daily_omen_prompt(
 # Conversation summary prompt
 # ---------------------------------------------------------------------------
 
-SUMM_SYSTEM_PROMPT = """You are a neutral summarisation assistant. Your only job is to produce concise, factual English summaries of conversations. You have no persona, no opinions, and no style. Output plain, clear English only."""
+SUMM_SYSTEM_PROMPT = """You are a neutral summarisation assistant. Your only job is to produce concise, factual English summaries of conversations. You have no persona, no opinions, and no style. Output plain, clear English only.
+
+CRITICAL INSTRUCTION: You MUST use the exact usernames provided in the chat log. Do not use generic terms like 'one user' or 'someone'. Attribute quotes and actions directly to the specific usernames."""
 
 
 def get_summ_prompt(conversation: str) -> str:
     """Prompt for a factual, no-persona summary of a conversation."""
-    return f"""Below is a Discord conversation. The messages may be in English, Malayalam, Manglish (Malayalam-English mix), or a combination. Translate and summarise everything into plain English.
+    return f"""Below is a Discord conversation in the format "Username: message". The messages may be in English, Malayalam, Manglish (Malayalam-English mix), or a combination. Translate and summarise everything into plain English.
 
 CONVERSATION:
 {conversation}
@@ -219,10 +221,106 @@ CONVERSATION:
 Requirements:
 - 2–4 sentences maximum.
 - Output in English only — clear, direct, factual summary regardless of the input language.
-- No personality, no slang, no sarcasm, no persona of any kind.
-- Do NOT include usernames or IDs in the summary — describe people as 'one user', 'another user', etc.
+- CRITICAL: Use the exact usernames from the chat log. Attribute what each person said or did directly to their username (e.g. "Rahul said...", "Priya asked..."). Never say 'one user' or 'someone'.
 - Never mention religion or politics.
 - Focus on: what happened, what was discussed, what decisions were made, if any."""
+
+
+# ---------------------------------------------------------------------------
+# Vibe Check — auto de-escalation (Feature 4)
+# ---------------------------------------------------------------------------
+
+def get_vibe_check_prompt(channel_name: str) -> str:
+    """Prompt for a sarcastic calming message when chat is overheating."""
+    return f"""The #{channel_name} Discord channel has gone chaotic — too many people shouting in ALL CAPS or using harsh language in a very short time.
+
+Generate a single sarcastic, calming message in Trivandrum Manglish persona that tells everyone to relax. Be witty and self-aware, not preachy.
+
+Requirements:
+- Reference a real Trivandrum location or situation (KSRTC bus, KD Puram traffic, Thampanoor crowd, etc.)
+- Keep it light and funny — the goal is to make people laugh and calm down, not lecture them
+- 1–2 sentences maximum
+- Example tone: "Aiyo, why is everyone fighting like it's the KSRTC stand at 6pm? Sit down, have some chaya, and chill mone."
+- Do NOT mention God, religion, or politics"""
+
+
+# ---------------------------------------------------------------------------
+# Kanmanilla — missing person poster (Feature 6)
+# ---------------------------------------------------------------------------
+
+def get_kanmanilla_prompt(username: str, days_ago: int) -> str:
+    """Prompt for a humorous 'Missing Person' poster in Manglish."""
+    return f"""A Discord user named {username} has not been seen in this server for {days_ago} days.
+
+Write a short, dramatic "Missing Person" notice in Trivandrum Manglish. It should be funny and affectionate, NOT mean.
+
+Requirements:
+- Start with "🚨 MISSING: {username}"
+- Mention the number of days ({days_ago} days)
+- Speculate humorously about where they might be (e.g. "Stuck in KD Puram traffic?", "Did the KSRTC bus finally take them away?", "Gone to Ponmudi and got lost in the mist?")
+- End with a call to action tagging them to reply
+- 3–4 sentences. Manglish throughout. Funny and dramatic, not offensive."""
+
+
+# ---------------------------------------------------------------------------
+# Mod Audit prompt (Feature 2)
+# ---------------------------------------------------------------------------
+
+def get_audit_prompt(rules_text: str, messages_text: str) -> str:
+    """Prompt to compare user messages against server rules."""
+    return f"""You are a neutral moderation assistant. Compare the user's messages against the server rules below.
+
+SERVER RULES:
+{rules_text}
+
+USER'S RECENT MESSAGES:
+{messages_text}
+
+Produce a structured moderation report:
+1. State clearly whether any rules were broken (Yes / No).
+2. If yes, name which rule(s) and quote the exact offending message(s).
+3. Give a verdict: Clean / Warn / Ban — with a one-line justification.
+4. Keep the report under 300 words. Plain English only. No persona."""
+
+
+# ---------------------------------------------------------------------------
+# Mod Thread TL;DR prompt (Feature 5)
+# ---------------------------------------------------------------------------
+
+def get_mod_tldr_prompt(thread_text: str) -> str:
+    """Prompt for a moderator-focused thread summary."""
+    return f"""You are a neutral moderation assistant. Summarise the Discord thread below.
+
+THREAD CONTENT:
+{thread_text}
+
+Provide a structured summary:
+1. Core topic: What is this thread about?
+2. Initiated by: Who started it (use exact username)?
+3. Key participants: Who were the main contributors?
+4. Final consensus / outcome: Was a decision reached? Was there unresolved conflict?
+
+Keep it under 200 words. Plain English. Use exact usernames from the thread."""
+
+
+# ---------------------------------------------------------------------------
+# Link summary — emoji-triggered URL summarizer (Feature 3)
+# ---------------------------------------------------------------------------
+
+def get_link_summary_prompt(page_text: str, url: str) -> str:
+    """Prompt for a 3-bullet-point summary of a webpage."""
+    return f"""Below is the text content scraped from this URL: {url}
+
+PAGE CONTENT:
+{page_text}
+
+Summarise this page in exactly 3 concise bullet points in plain English. Each bullet should capture a key fact or takeaway.
+
+Requirements:
+- Exactly 3 bullet points, each starting with "•"
+- Plain English only — no jargon, no filler
+- Each bullet: 1–2 sentences maximum
+- If the content is too thin or unreadable, say so in one line"""
 
 
 # ---------------------------------------------------------------------------

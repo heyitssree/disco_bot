@@ -3,3 +3,5 @@ google-genai
 python-dotenv
 duckdb
 requests
+aiohttp
+beautifulsoup4

@@ -195,12 +195,32 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'WEATHER_ALERT_TIME');
     """)
     # Feature on/off flags (1 = enabled, 0 = disabled)
-    for flag in ("feature_kochi_replies", "feature_curse_replies", "feature_boli_points", "feature_welcome"):
+    for flag in (
+        "feature_kochi_replies", "feature_curse_replies", "feature_boli_points",
+        "feature_welcome", "feature_astro", "feature_vibe_check", "feature_kanmanilla",
+        "feature_audit", "feature_mod_tldr", "feature_link_summary", "feature_strikes",
+    ):
         conn.execute(f"""
             INSERT INTO bot_config (key, value_int)
             SELECT '{flag}', 1
             WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = '{flag}');
         """)
+    # Master kill switch — default OFF (0 = bot is alive)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_int)
+        SELECT 'master_killswitch', 0
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'master_killswitch');
+    """)
+
+    # Emoji for link-summary reaction (Feature 3)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_str)
+        SELECT 'link_summary_emoji', '📰'
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'link_summary_emoji');
+    """)
+
+    # Safe ALTER TABLE migrations — add new columns to existing tables if absent
+    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS strikes INTEGER DEFAULT 0")
 
     conn.commit()
 
@@ -513,6 +533,15 @@ def get_config_str(conn: duckdb.DuckDBPyConnection, key: str, default: str = "")
     row = conn.execute("SELECT value_str FROM bot_config WHERE key = ?", [key]).fetchone()
     return str(row[0]) if row and row[0] is not None else default
 
+def set_config_str(conn: duckdb.DuckDBPyConnection, key: str, value: str) -> None:
+    _db_write(lambda: (
+        conn.execute(
+            "INSERT INTO bot_config (key, value_str) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value_str = excluded.value_str",
+            [key, value],
+        ),
+        conn.commit(),
+    ))
+
 def get_all_configs(conn: duckdb.DuckDBPyConnection) -> dict:
     rows = conn.execute("SELECT key, value_str, value_float, value_int FROM bot_config").fetchall()
     config = {}
@@ -525,6 +554,37 @@ def get_all_configs(conn: duckdb.DuckDBPyConnection) -> dict:
         else:
             config[key] = r[1]
     return config
+
+
+# ---------------------------------------------------------------------------
+# Strike system (Feature 7)
+# ---------------------------------------------------------------------------
+
+def get_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+    """Return the current strike count for a user (0 if not found)."""
+    row = conn.execute(
+        "SELECT strikes FROM user_stats WHERE user_id = ?", [user_id]
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def increment_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+    """Increment strikes by 1 and return the new count."""
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE user_stats SET strikes = strikes + 1 WHERE user_id = ?", [user_id]
+        ),
+        conn.commit(),
+    ))
+    return get_user_strikes(conn, user_id)
+
+
+def reset_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> None:
+    """Reset a user's strikes to 0."""
+    _db_write(lambda: (
+        conn.execute("UPDATE user_stats SET strikes = 0 WHERE user_id = ?", [user_id]),
+        conn.commit(),
+    ))
 
 
 # ---------------------------------------------------------------------------

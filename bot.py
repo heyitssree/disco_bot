@@ -7,6 +7,7 @@ import os
 import random
 import re
 import asyncio
+from collections import deque
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -32,6 +33,7 @@ from schema import (
     get_config_str,
     set_config_float,
     set_config_int,
+    set_config_str,
     get_all_configs,
     get_todays_user_prediction,
     get_level_from_points,
@@ -39,6 +41,9 @@ from schema import (
     has_active_perk,
     grant_perk,
     get_perk_expiry,
+    get_user_strikes,
+    increment_user_strikes,
+    reset_user_strikes,
     DB_PATH,
 )
 from glossary import RASHIS
@@ -49,11 +54,17 @@ from prompts import (
     get_qa_prompt,
     get_summ_prompt,
     SUMM_SYSTEM_PROMPT,
+    get_vibe_check_prompt,
+    get_kanmanilla_prompt,
+    get_link_summary_prompt,
+    get_audit_prompt,
+    get_mod_tldr_prompt,
     FALLBACK_MESSAGE,
     WELCOME_MESSAGES,
 )
 from curses import (
     CURSE_WORDS,
+    SEVERE_CURSE_WORDS,
     get_random_curse,
     get_random_doomed_prediction,
     get_random_curse_back,
@@ -92,6 +103,8 @@ FREE_API_KEY = os.getenv("GEMINI_API_KEY_FREE")
 PAID_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY")
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 GENERAL_CHANNEL = os.getenv("GENERAL_CHANNEL", "general")
+MOD_CHANNEL_NAME = os.getenv("MOD_CHANNEL_NAME", "mod-log")
+JAIL_ROLE_NAME = os.getenv("JAIL_ROLE_NAME", "Thampanoor Jail")
 
 # Bot owner's Discord user ID — MUST match the owner of the bot application.
 # Set OWNER_ID in .env so no other user can ever invoke /admin commands.
@@ -126,6 +139,144 @@ def get_user_minute_count(user_id: int, increment: bool = True) -> int:
     return len(_user_usage[user_id])
 
 # ---------------------------------------------------------------------------
+# Vibe Check — lightweight in-memory channel tracker (Feature 4)
+# ---------------------------------------------------------------------------
+
+_VIBE_WINDOW_SECONDS = 15
+_VIBE_MSG_THRESHOLD = 10
+_VIBE_CAPS_RATIO = 0.30
+
+# channel_id -> deque of (timestamp, content) tuples
+_channel_msg_tracker: dict[int, deque] = {}
+# channel_id -> timestamp of last vibe-check fire (to avoid spam)
+_vibe_last_fired: dict[int, datetime] = {}
+_VIBE_COOLDOWN_SECONDS = 60  # don't fire again within 60s for the same channel
+
+
+def _is_heated_message(content: str) -> bool:
+    """Return True if the message is all-caps or contains a severe curse word."""
+    lower = content.lower()
+    is_allcaps = len(content) > 3 and content == content.upper() and content.strip().isalpha() is False and any(c.isalpha() for c in content)
+    has_severe = any(re.search(rf"\b{re.escape(w)}\b", lower) for w in SEVERE_CURSE_WORDS)
+    return is_allcaps or has_severe
+
+
+async def _check_vibe(message: discord.Message) -> None:
+    """Track message and fire vibe-check calming message if chat overheats."""
+    channel_id = message.channel.id
+    now = datetime.now(timezone.utc)
+
+    # Cooldown guard — don't fire twice in 60s per channel
+    last = _vibe_last_fired.get(channel_id)
+    if last and (now - last).total_seconds() < _VIBE_COOLDOWN_SECONDS:
+        return
+
+    # Maintain rolling deque for this channel
+    tracker = _channel_msg_tracker.setdefault(channel_id, deque())
+    tracker.append((now, message.content))
+
+    # Purge messages older than the window
+    cutoff = now.timestamp() - _VIBE_WINDOW_SECONDS
+    while tracker and tracker[0][0].timestamp() < cutoff:
+        tracker.popleft()
+
+    if len(tracker) < _VIBE_MSG_THRESHOLD:
+        return
+
+    heated = sum(1 for _, c in tracker if _is_heated_message(c))
+    if heated / len(tracker) < _VIBE_CAPS_RATIO:
+        return
+
+    # Threshold met — fire vibe check
+    _vibe_last_fired[channel_id] = now
+    tracker.clear()
+
+    channel_name = getattr(message.channel, "name", "this channel")
+    system_prompt = get_time_aware_system_prompt(db_conn)
+    user_prompt = get_vibe_check_prompt(channel_name)
+
+    reply, _ = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: api_mgr.call(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            cache_type="qa",
+            name="VibeCheck",
+            fallback_message="Aiyo, everyone chill please. This is not KSRTC Thampanoor — no need to fight like this mone.",
+        ),
+    )
+    await message.channel.send(reply)
+    logger.info("Vibe check fired in #%s", channel_name)
+
+
+# ---------------------------------------------------------------------------
+# Strike system helpers (Feature 7)
+# ---------------------------------------------------------------------------
+
+_JAIL_TIMEOUT_MINUTES = 5
+
+
+async def _handle_strike(member: discord.Member, channel: discord.abc.Messageable) -> None:
+    """Increment strike counter and apply the appropriate penalty."""
+    new_strikes = increment_user_strikes(db_conn, member.id)
+
+    if new_strikes == 1:
+        await channel.send(
+            f"Eda {member.mention}, that's Strike 1. Watch your language mone. "
+            f"Two more and AstRobot will personally arrange your cosmic punishment at Thampanoor."
+        )
+        logger.info("Strike 1 issued to %s", member.display_name)
+
+    elif new_strikes == 2:
+        await channel.send(
+            f"Aiyo {member.mention}, Strike 2! You have been sent to **Thampanoor Jail** for {_JAIL_TIMEOUT_MINUTES} minutes. "
+            f"Sit quietly and reflect on your vocabulary choices."
+        )
+        # Assign jail role if it exists on the guild
+        if isinstance(channel, discord.TextChannel):
+            jail_role = discord.utils.get(channel.guild.roles, name=JAIL_ROLE_NAME)
+            if jail_role:
+                try:
+                    await member.add_roles(jail_role, reason="AstRobot Strike 2 — Thampanoor Jail")
+                    asyncio.create_task(_release_from_jail(member, jail_role, _JAIL_TIMEOUT_MINUTES * 60))
+                except discord.Forbidden:
+                    logger.warning("Missing permissions to assign jail role to %s", member.display_name)
+        logger.info("Strike 2 — %s jailed for %d min", member.display_name, _JAIL_TIMEOUT_MINUTES)
+
+    elif new_strikes >= 3:
+        reset_user_strikes(db_conn, member.id)
+        # Alert mod channel
+        mod_ch = None
+        if isinstance(channel, discord.TextChannel):
+            mod_ch = discord.utils.get(channel.guild.text_channels, name=MOD_CHANNEL_NAME)
+        if mod_ch:
+            await mod_ch.send(
+                f"🚨 **Mod Alert:** {member.mention} just hit **3 strikes**. "
+                f"Time to consider the ban hammer. Their strikes have been reset to 0."
+            )
+        await channel.send(
+            f"🚨 {member.mention}, that's **3 strikes**. Mod team has been notified. Shokam situation mone."
+        )
+        logger.info("Strike 3 alert sent for %s — strikes reset", member.display_name)
+
+
+async def _release_from_jail(member: discord.Member, role: discord.Role, delay_seconds: int) -> None:
+    """Remove jail role after delay_seconds."""
+    await asyncio.sleep(delay_seconds)
+    try:
+        await member.remove_roles(role, reason="AstRobot jail sentence served")
+        logger.info("Released %s from Thampanoor Jail", member.display_name)
+    except Exception as exc:
+        logger.warning("Could not remove jail role from %s: %s", member.display_name, exc)
+
+
+def _contains_severe_curse(text: str) -> bool:
+    """Return True if text contains any SEVERE_CURSE_WORDS."""
+    lower = text.lower()
+    return any(re.search(rf"\b{re.escape(w)}\b", lower) for w in SEVERE_CURSE_WORDS)
+
+
+# ---------------------------------------------------------------------------
 # Discord client setup
 # ---------------------------------------------------------------------------
 
@@ -142,6 +293,49 @@ db_conn = None          # duckdb.DuckDBPyConnection
 gemini_svc = None       # GeminiService
 api_mgr = None          # ApiManager
 _BOT_START_TIME = datetime.now(timezone.utc)
+
+# ---------------------------------------------------------------------------
+# In-memory feature toggle cache (Feature 8)
+# Loaded at startup; updated immediately on every /admin toggle command.
+# Avoids a DB read on every message/interaction.
+# ---------------------------------------------------------------------------
+
+_FEATURE_DEFAULTS: dict[str, int] = {
+    "master_killswitch":    0,
+    "feature_astro":        1,
+    "feature_vibe_check":   1,
+    "feature_kanmanilla":   1,
+    "feature_audit":        1,
+    "feature_mod_tldr":     1,
+    "feature_link_summary": 1,
+    "feature_strikes":      1,
+    "feature_kochi_replies": 1,
+    "feature_curse_replies": 1,
+    "feature_boli_points":  1,
+    "feature_welcome":      1,
+}
+
+# Populated in on_ready() after db_conn is available
+_feature_cache: dict[str, int] = dict(_FEATURE_DEFAULTS)
+
+
+def _feat(key: str) -> bool:
+    """Return True if the feature is enabled in the in-memory cache."""
+    return bool(_feature_cache.get(key, _FEATURE_DEFAULTS.get(key, 1)))
+
+
+def _load_feature_cache() -> None:
+    """Reload all toggle values from DB into the in-memory cache."""
+    global _feature_cache
+    for key, default in _FEATURE_DEFAULTS.items():
+        _feature_cache[key] = get_config_int(db_conn, key, default)
+    logger.info("Feature toggle cache loaded: %s", _feature_cache)
+
+
+def _set_feature(key: str, value: int) -> None:
+    """Persist a feature toggle to DB and update in-memory cache atomically."""
+    set_config_int(db_conn, key, value)
+    _feature_cache[key] = value
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -360,6 +554,9 @@ async def on_ready() -> None:
         free_tier_mode=FREE_TIER_MODE,
     )
 
+    # Load feature toggles into memory cache
+    _load_feature_cache()
+
     await tree.sync()
     logger.info("Slash commands synced. AstRobot V2 is live.")
 
@@ -406,6 +603,10 @@ async def on_member_join(member: discord.Member) -> None:
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
+    # Master kill switch — ignore everything (except owner text commands)
+    if _feat("master_killswitch"):
+        return
+
     # Ignore bots and self
     if message.author.bot or message.author.id == bot.user.id:
         return
@@ -429,6 +630,10 @@ async def on_message(message: discord.Message) -> None:
 
     # Upsert user record on every message (lightweight)
     upsert_user(db_conn, message.author.id, message.author.display_name)
+
+    # ---- Vibe Check: lightweight heat tracker — no API cost unless triggered ----
+    if _feat("feature_vibe_check"):
+        await _check_vibe(message)
 
     # ---- Boli Points: local slang triggers ----
     triggered_words = contains_boli_trigger(message.content) if get_config_int(db_conn, "feature_boli_points", 1) else []
@@ -555,6 +760,11 @@ async def on_message(message: discord.Message) -> None:
         await message.reply(final_reply)
         return
 
+    # ---- Strike check: severe curse words ----
+    if _feat("feature_strikes") and _contains_severe_curse(message.content):
+        if isinstance(message.author, discord.Member):
+            await _handle_strike(message.author, message.channel)
+
     # ---- Passive curse word reply ----
     curse_chance = get_config_float(db_conn, "curse_reply_chance", 0.25)
     _curse_matched, curse_used = contains_curse_word(message.content)
@@ -597,6 +807,112 @@ async def on_message(message: discord.Message) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Emoji-triggered link summarizer (Feature 3)
+# ---------------------------------------------------------------------------
+
+_URL_RE = re.compile(r"https?://[^\s]+")
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    """Summarise a linked article when a user reacts with the configured emoji."""
+    if payload.user_id == bot.user.id:
+        return
+
+    if not _feat("feature_link_summary"):
+        return
+
+    summary_emoji = get_config_str(db_conn, "link_summary_emoji", "📰")
+    if str(payload.emoji) != summary_emoji:
+        return
+
+    channel = bot.get_channel(payload.channel_id)
+    if channel is None:
+        return
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except discord.NotFound:
+        return
+
+    urls = _URL_RE.findall(message.content)
+    if not urls:
+        return
+
+    url = urls[0]
+
+    try:
+        import aiohttp
+        from bs4 import BeautifulSoup
+
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": "Mozilla/5.0 AstRobot/2.0 link-summariser"}
+        ) as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    await message.reply(f"Aiyo, couldn't fetch that link (HTTP {resp.status}). Shokam.")
+                    return
+                html = await resp.text(errors="replace")
+
+        soup = BeautifulSoup(html, "html.parser")
+        paragraphs = [p.get_text(separator=" ", strip=True) for p in soup.find_all("p")]
+        page_text = " ".join(paragraphs)[:4000]  # cap to avoid token overrun
+
+        if not page_text.strip():
+            await message.reply("Eda, that page has no readable text. Maybe a paywall or JS-only site. Chumma.")
+            return
+
+        user_prompt = get_link_summary_prompt(page_text, url)
+        system_prompt = get_time_aware_system_prompt(db_conn)
+
+        summary, _ = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: api_mgr.call(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                cache_type="qa",
+                name="LinkSummary",
+                fallback_message="AstRobot-nte lamp went off. KSEB current problem. Try again mone.",
+            ),
+        )
+        await message.reply(f"📰 **Link Summary:**\n{summary}")
+        logger.info("Link summary sent for %s", url)
+
+    except Exception as exc:
+        logger.warning("Link summary failed for %s: %s", url, exc)
+        await message.reply("Aiyo, something went wrong while reading that link. KSEB-style failure.")
+
+
+# ---------------------------------------------------------------------------
+# Global interaction check — Master Kill Switch (Feature 8)
+# ---------------------------------------------------------------------------
+
+@tree.interaction_check
+async def _global_killswitch_check(interaction: discord.Interaction) -> bool:
+    """Block all slash commands when master_killswitch is ON.
+
+    Exception: the bot owner can always use /admin killswitch to revive the bot.
+    """
+    if not _feat("master_killswitch"):
+        return True  # bot is alive — allow all interactions
+
+    # Bot is dead — only let the owner through, and only for /admin commands
+    is_owner = (OWNER_ID and interaction.user.id == OWNER_ID)
+    if not is_owner:
+        app_info = await bot.application_info()
+        is_owner = interaction.user.id == app_info.owner.id
+
+    if is_owner and interaction.command and interaction.command.qualified_name.startswith("admin"):
+        return True
+
+    await interaction.response.send_message(
+        "AstRobot is currently in sleep mode. Only the owner can wake it up. Chumma wait mone.",
+        ephemeral=True,
+    )
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Slash Commands
 # ---------------------------------------------------------------------------
 
@@ -605,6 +921,12 @@ async def astro_slash(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
 ) -> None:
+    if not _feat("feature_astro"):
+        await interaction.response.send_message(
+            "Astro predictions are currently disabled. Chumma wait mone.", ephemeral=True
+        )
+        return
+
     # Bot-loop protection: curse whoever tries to feed a bot into us
     if user is not None and user.bot:
         bot_loop_curses = [
@@ -768,16 +1090,16 @@ async def summ_slash(
         )
         return
 
-    # Strip bot messages, commands (starting with /), and mention IDs
+    # Strip bot messages, commands (starting with /), and mention IDs — keep username prefix
     _mention_re = re.compile(r"<@!?\d+>|<#\d+>|<@&\d+>")
     lines: list[str] = []
     for msg in raw_messages:
         if msg.author.bot:
             continue
-        text = _mention_re.sub("[someone]", msg.content).strip()
+        text = _mention_re.sub("[mentioned-user]", msg.content).strip()
         if not text or text.startswith("/"):
             continue
-        lines.append(text)
+        lines.append(f"{msg.author.display_name}: {text}")
 
     if not lines:
         await interaction.followup.send(
@@ -809,6 +1131,194 @@ async def summ_slash(
         f"📜 **Chat Summary — last {len(lines)} messages{filter_note}:**\n{summary}",
         ephemeral=not public,
     )
+
+
+@tree.command(name="kanmanilla", description="Ping a missing member with a dramatic Missing Person notice")
+@app_commands.describe(user="The member you're looking for")
+async def kanmanilla_slash(interaction: discord.Interaction, user: discord.Member) -> None:
+    if not _feat("feature_kanmanilla"):
+        await interaction.response.send_message(
+            "Kanmanilla feature is currently disabled.", ephemeral=True
+        )
+        return
+
+    if user.bot:
+        await interaction.response.send_message(
+            "Eda, bots don't go missing — they just get turned off. Chumma po.", ephemeral=True
+        )
+        return
+
+    profile = get_user_profile(db_conn, user.id)
+    if not profile:
+        await interaction.response.send_message(
+            f"Eda, {user.mention} hasn't even properly registered with AstRobot yet. Cannot make missing poster for a stranger.",
+            ephemeral=True,
+        )
+        return
+
+    last_seen = profile.get("last_seen")
+    if last_seen is None:
+        days_ago = 999
+    else:
+        # DuckDB may return timezone-naive timestamps
+        if hasattr(last_seen, "tzinfo") and last_seen.tzinfo is not None:
+            now = datetime.now(timezone.utc)
+        else:
+            now = datetime.now()
+        days_ago = max(0, (now - last_seen).days)
+
+    if days_ago < 3:
+        await interaction.response.send_message(
+            f"Eda, {user.mention} was just here. Chumma pinging people.",
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    system_prompt = get_time_aware_system_prompt(db_conn)
+    user_prompt = get_kanmanilla_prompt(user.display_name, days_ago)
+
+    poster, _ = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: api_mgr.call(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            cache_type="qa",
+            name="KanmanillaRequest",
+            fallback_message=f"🚨 MISSING: {user.display_name}. Last seen {days_ago} days ago. {user.mention}, are you still alive or did you get stuck in KD Puram traffic? Reply here.",
+        ),
+    )
+    await interaction.followup.send(f"{poster}\n{user.mention}")
+    logger.info("Kanmanilla posted for %s (last seen %d days ago)", user.display_name, days_ago)
+
+
+@tree.command(name="audit", description="Audit a user's messages against server rules (Mods only)")
+@app_commands.describe(
+    user="The member to audit",
+    channel="Channel to fetch messages from (defaults to current channel)",
+)
+@app_commands.default_permissions(manage_messages=True)
+async def audit_slash(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    if not _feat("feature_audit"):
+        await interaction.response.send_message("Audit feature is currently disabled.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # Find rules channel dynamically
+    rules_ch = discord.utils.find(
+        lambda c: "rule" in c.name.lower(),
+        interaction.guild.text_channels,
+    ) if interaction.guild else None
+
+    rules_text = "No rules channel found on this server."
+    if rules_ch:
+        try:
+            rule_msgs: list[str] = []
+            async for msg in rules_ch.history(limit=50):
+                if msg.content.strip():
+                    rule_msgs.append(msg.content.strip())
+            if rule_msgs:
+                rules_text = "\n".join(reversed(rule_msgs))
+        except discord.Forbidden:
+            rules_text = "(Could not read rules channel — missing permissions)"
+
+    # Fetch user messages
+    target_ch = channel or interaction.channel
+    user_lines: list[str] = []
+    try:
+        async for msg in target_ch.history(limit=200):
+            if msg.author.id == user.id and msg.content.strip():
+                user_lines.append(f"[{msg.created_at.strftime('%H:%M')}] {msg.author.display_name}: {msg.content.strip()}")
+            if len(user_lines) >= 100:
+                break
+    except discord.Forbidden:
+        await interaction.followup.send("Cannot read that channel — missing permissions.", ephemeral=True)
+        return
+
+    if not user_lines:
+        await interaction.followup.send(
+            f"No messages found from **{user.display_name}** in that channel.", ephemeral=True
+        )
+        return
+
+    messages_text = "\n".join(reversed(user_lines))
+    user_prompt = get_audit_prompt(rules_text, messages_text)
+    system_prompt = "You are a neutral moderation assistant. Be objective and precise."
+
+    report, _ = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: api_mgr.call(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            cache_type="qa",
+            name="AuditRequest",
+            fallback_message="Audit failed — Gemini is unavailable. Check logs.",
+        ),
+    )
+
+    await interaction.followup.send(
+        f"**🔍 Audit Report — {user.display_name}** (from #{target_ch.name})\n\n{report}",
+        ephemeral=True,
+    )
+    logger.info("Audit run by %s for %s in #%s", interaction.user.display_name, user.display_name, target_ch.name)
+
+
+@tree.command(name="mod_tldr", description="Summarise the current thread for moderators (Mods only)")
+@app_commands.default_permissions(manage_messages=True)
+async def mod_tldr_slash(interaction: discord.Interaction) -> None:
+    if not _feat("feature_mod_tldr"):
+        await interaction.response.send_message("Mod TL;DR feature is currently disabled.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message(
+            "Eda, this command only works inside a thread. Go into the thread first, mone.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    thread: discord.Thread = interaction.channel
+    lines: list[str] = []
+    _mention_re = re.compile(r"<@!?\d+>|<#\d+>|<@&\d+>")
+
+    async for msg in thread.history(limit=500, oldest_first=True):
+        if msg.author.bot:
+            continue
+        text = _mention_re.sub("[user]", msg.content).strip()
+        if text and not text.startswith("/"):
+            lines.append(f"{msg.author.display_name}: {text}")
+
+    if not lines:
+        await interaction.followup.send("This thread has no readable messages to summarise.", ephemeral=True)
+        return
+
+    thread_text = "\n".join(lines)
+    user_prompt = get_mod_tldr_prompt(thread_text)
+    system_prompt = "You are a neutral moderation assistant. Be concise and factual. Use exact usernames."
+
+    summary, _ = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: api_mgr.call(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            cache_type="qa",
+            name="ModTldrRequest",
+            fallback_message="Thread summary failed — Gemini is unavailable.",
+        ),
+    )
+
+    await interaction.followup.send(
+        f"📋 **Thread TL;DR — #{thread.name}**\n\n{summary}",
+        ephemeral=True,
+    )
+    logger.info("mod_tldr run by %s in thread #%s", interaction.user.display_name, thread.name)
 
 
 @tree.command(name="health", description="AstRobot system health (owner only)")
@@ -943,38 +1453,42 @@ async def health_slash(interaction: discord.Interaction) -> None:
 
 @tree.command(name="help", description="Learn how to interact with AstRobot")
 async def help_slash(interaction: discord.Interaction) -> None:
-    """Show the help menu for AstRobot."""
+    """Show the help menu — only lists features that are currently enabled."""
     embed = discord.Embed(
         title="AstRobot V2 — Help & Features",
         description="Ancient astrologer from Thirontharam. Speaks Manglish. Judges you constantly. Here is what I can do:",
         color=discord.Color.dark_purple(),
     )
 
-    # Slash commands
-    embed.add_field(
-        name="Slash Commands",
-        value=(
-            "`/astro` — Get a dramatic Manglish astrology prediction (rate-limited per minute)\n"
-            "`/astro user:@someone` — Get a prediction for someone else\n"
-            "`/rank` — Top 10 Boli Points leaderboard\n"
-            "`/mypoints` — Your Rashi, Boli Points, level, and title\n"
-            "`/summ` — Factual English summary of recent chat (optional: `public:True` to show to everyone)\n"
-            "`/shop view` — Browse the Boli Marketplace\n"
-            "`/shop buy` — Spend Boli Points on perks (Curse Protection, Custom Rashi)\n"
-            "`/help` — This menu"
-        ),
-        inline=False,
-    )
+    # Core always-on commands
+    core_cmds = [
+        "`/rank` — Top 10 Boli Points leaderboard",
+        "`/mypoints` — Your Rashi, Boli Points, level, and title",
+        "`/summ` — Factual English summary of recent chat",
+        "`/shop view` / `/shop buy` — Boli Marketplace",
+        "`/help` — This menu",
+    ]
+    if _feat("feature_astro"):
+        core_cmds.insert(0, "`/astro` — Get a dramatic Manglish astrology prediction (rate-limited per minute)")
+        core_cmds.insert(1, "`/astro user:@someone` — Get a prediction for someone else")
+    if _feat("feature_kanmanilla"):
+        core_cmds.append("`/kanmanilla @user` — Ping a missing member with a dramatic notice")
+    if _feat("feature_audit"):
+        core_cmds.append("`/audit @user` — Mod: audit a user's messages against server rules")
+    if _feat("feature_mod_tldr"):
+        core_cmds.append("`/mod_tldr` — Mod: summarise the current thread")
+    embed.add_field(name="Slash Commands", value="\n".join(core_cmds), inline=False)
 
-    # Text triggers
-    embed.add_field(
-        name="Text Commands (type in chat)",
-        value=(
-            "`astro` — Same as `/astro`, triggers a full prediction\n"
-            "`astro @user` — Instantly curse or roast someone (10% chance it bounces back on you)"
-        ),
-        inline=False,
-    )
+    # Text triggers (only if astro enabled)
+    if _feat("feature_astro"):
+        embed.add_field(
+            name="Text Commands (type in chat)",
+            value=(
+                "`astro` — Same as `/astro`, triggers a full prediction\n"
+                "`astro @user` — Instantly curse or roast someone (10% chance it bounces back on you)"
+            ),
+            inline=False,
+        )
 
     # Mention QA
     embed.add_field(
@@ -987,27 +1501,34 @@ async def help_slash(interaction: discord.Interaction) -> None:
     )
 
     # Boli Points
-    embed.add_field(
-        name="Boli Points",
-        value=(
-            "Earn points by using Trivandrum slang naturally in chat:\n"
-            "*kidilam, shokam, pillacha, chumma, mone, kili poyi, vishayam, thirontharam, boli, paal payasam...*\n"
-            "+5 pts per unique trigger word per message · +2 pts per `/astro` call\n"
-            "Level up from Tourist → Thampanoor Regular → Chalai Veteran → Cosmic Sage of Thirontharam"
-        ),
-        inline=False,
-    )
+    if _feat("feature_boli_points"):
+        embed.add_field(
+            name="Boli Points",
+            value=(
+                "Earn points by using Trivandrum slang naturally in chat:\n"
+                "*kidilam, shokam, pillacha, chumma, mone, kili poyi, vishayam, thirontharam, boli, paal payasam...*\n"
+                "+5 pts per unique trigger word per message · +2 pts per `/astro` call\n"
+                "Level up from Tourist → Thampanoor Regular → Chalai Veteran → Cosmic Sage of Thirontharam"
+            ),
+            inline=False,
+        )
 
     # Passive reactions
-    embed.add_field(
-        name="Passive Reactions (automatic)",
-        value=(
-            "**Kochi slang** (*machane, machi, adipoli...*) → Condescending reply from a true Trivandrumite\n"
-            "**Curse words** → 25% chance the cosmos punishes you with a dramatic doom prediction\n"
-            "**New member joins** → Welcome message + fresh astrology reading"
-        ),
-        inline=False,
-    )
+    passive_lines: list[str] = []
+    if _feat("feature_kochi_replies"):
+        passive_lines.append("**Kochi slang** (*machane, machi, adipoli...*) → Condescending reply from a true Trivandrumite")
+    if _feat("feature_curse_replies"):
+        passive_lines.append("**Curse words** → 25% chance the cosmos punishes you with a dramatic doom prediction")
+    if _feat("feature_welcome"):
+        passive_lines.append("**New member joins** → Welcome message + fresh astrology reading")
+    if _feat("feature_vibe_check"):
+        passive_lines.append("**Chat heats up** → AstRobot intervenes with a sarcastic calming message")
+    if _feat("feature_link_summary"):
+        passive_lines.append("**React 📰 on a link** → AstRobot scrapes and summarises the article in 3 bullet points")
+    if _feat("feature_strikes"):
+        passive_lines.append("**Severe language** → 3-strike system with automatic jail role at strike 2")
+    if passive_lines:
+        embed.add_field(name="Passive Reactions (automatic)", value="\n".join(passive_lines), inline=False)
 
     embed.set_footer(text="All responses powered by Gemini · Local knowledge from 85 curated Trivandrum entries")
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -1047,9 +1568,34 @@ class AdminGroup(app_commands.Group):
         status = "ON 🔴 (Free API + Cache only)" if gemini_svc.free_only else "OFF 🟢 (Paid Fallback enabled)"
         await interaction.response.send_message(f"Killswitch is now **{status}**.", ephemeral=True)
 
+    @app_commands.command(name="killswitch", description="Toggle the master kill switch — completely silences the bot")
+    async def master_killswitch_cmd(self, interaction: discord.Interaction) -> None:
+        new_state = 0 if _feat("master_killswitch") else 1
+        _set_feature("master_killswitch", new_state)
+        if new_state:
+            await interaction.response.send_message(
+                "☠️ **Master Kill Switch: ON.** AstRobot is now completely silent. "
+                "Only you can wake it up with `/admin killswitch` again.",
+                ephemeral=True,
+            )
+            logger.warning("MASTER KILL SWITCH ACTIVATED by %s", interaction.user.display_name)
+        else:
+            await interaction.response.send_message(
+                "✅ **Master Kill Switch: OFF.** AstRobot is back alive. Kidilam.",
+                ephemeral=True,
+            )
+            logger.info("Master kill switch deactivated by %s", interaction.user.display_name)
+
     @app_commands.command(name="toggle_feature", description="Enable or disable a bot feature")
     @app_commands.describe(feature="Feature to toggle", enabled="Turn it on (True) or off (False)")
     @app_commands.choices(feature=[
+        app_commands.Choice(name="Astro Predictions", value="feature_astro"),
+        app_commands.Choice(name="Vibe Check (auto de-escalation)", value="feature_vibe_check"),
+        app_commands.Choice(name="Kanmanilla (missing person)", value="feature_kanmanilla"),
+        app_commands.Choice(name="Mod Audit (/audit)", value="feature_audit"),
+        app_commands.Choice(name="Mod TL;DR (/mod_tldr)", value="feature_mod_tldr"),
+        app_commands.Choice(name="Link Summary (emoji reaction)", value="feature_link_summary"),
+        app_commands.Choice(name="3-Strike System", value="feature_strikes"),
         app_commands.Choice(name="Kochi Slang Detection", value="feature_kochi_replies"),
         app_commands.Choice(name="Passive Curse Replies", value="feature_curse_replies"),
         app_commands.Choice(name="Boli Points Tracking", value="feature_boli_points"),
@@ -1060,7 +1606,7 @@ class AdminGroup(app_commands.Group):
         feature: str,
         enabled: bool,
     ) -> None:
-        set_config_int(db_conn, feature, 1 if enabled else 0)
+        _set_feature(feature, 1 if enabled else 0)
         label = feature.replace("feature_", "").replace("_", " ").title()
         state = "ENABLED ✅" if enabled else "DISABLED ❌"
         await interaction.response.send_message(
@@ -1087,6 +1633,15 @@ class AdminGroup(app_commands.Group):
         label = feature.replace("_", " ").title()
         await interaction.response.send_message(
             f"**{label}** set to **{value:.0%}**.", ephemeral=True
+        )
+
+    @app_commands.command(name="set_summary_emoji", description="Set the emoji that triggers link summarisation (default: 📰)")
+    @app_commands.describe(emoji="The emoji to use for link summary reactions")
+    async def set_summary_emoji(self, interaction: discord.Interaction, emoji: str) -> None:
+        set_config_str(db_conn, "link_summary_emoji", emoji.strip())
+        await interaction.response.send_message(
+            f"Link summary emoji set to **{emoji.strip()}**. React with it on any message containing a URL to get a summary.",
+            ephemeral=True,
         )
 
     @app_commands.command(name="config_view", description="View all active feature flags, probabilities, and cooldowns")
@@ -1134,6 +1689,28 @@ class AdminGroup(app_commands.Group):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 tree.add_command(AdminGroup())
+
+
+@tree.command(name="strike", description="Issue a manual strike to a user (Moderators only)")
+@app_commands.describe(user="The member to strike", reason="Why you're issuing the strike")
+@app_commands.default_permissions(manage_messages=True)
+async def strike_slash(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    reason: str = "Manual mod action",
+) -> None:
+    if user.bot:
+        await interaction.response.send_message("Eda, you can't strike a bot. Chumma po.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await _handle_strike(user, interaction.channel)
+    current = get_user_strikes(db_conn, user.id)
+    await interaction.followup.send(
+        f"Strike issued to **{user.display_name}**. Reason: *{reason}*. "
+        f"They now have **{current} strike(s)**.",
+        ephemeral=True,
+    )
+    logger.info("Manual strike issued to %s by %s — reason: %s", user.display_name, interaction.user.display_name, reason)
 
 
 # ---------------------------------------------------------------------------
