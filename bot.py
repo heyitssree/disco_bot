@@ -45,6 +45,7 @@ from schema import (
     increment_user_strikes,
     reset_user_strikes,
     reset_all_strikes,
+    set_user_points,
     DB_PATH,
 )
 from glossary import RASHIS
@@ -542,6 +543,17 @@ async def on_ready() -> None:
 
     await tree.sync()
     logger.info("Slash commands synced. Navi is live. Hey! Listen!")
+
+
+@bot.event
+async def on_close() -> None:
+    """Close the DB connection cleanly so DuckDB flushes the WAL on shutdown."""
+    if db_conn is not None:
+        try:
+            db_conn.close()
+            logger.info("DuckDB connection closed cleanly.")
+        except Exception as exc:
+            logger.warning("Error closing DuckDB on shutdown: %s", exc)
 
 
 # MODA_INTROS, BOT_SELF_CURSE_REPLIES, BOT_LOOP_CURSE_REPLIES imported from prompts.py
@@ -1651,6 +1663,17 @@ class AdminGroup(app_commands.Group):
             f"Link summary emoji set to **{emoji.strip()}**. React with it on any message containing a URL to get a summary.",
             ephemeral=True,
         )
+
+    @app_commands.command(name="set_points", description="Manually set Boli Points for a user (for data restore)")
+    @app_commands.describe(user="The member to update", points="Boli Points to set", readings="Prediction count to set", rashi="Rashi to assign (optional)")
+    async def set_points_cmd(self, interaction: discord.Interaction, user: discord.Member, points: int, readings: int = 0, rashi: str | None = None) -> None:
+        set_user_points(db_conn, user.id, user.display_name, points, prediction_count=readings, rashi=rashi)
+        rashi_str = f" · Rashi: {rashi}" if rashi else ""
+        await interaction.response.send_message(
+            f"✅ **{user.display_name}** → 🍮 **{points} Boli Points** · {readings} readings{rashi_str}",
+            ephemeral=True,
+        )
+        logger.info("Manual point restore: %s → %d pts, %d readings", user.display_name, points, readings)
 
     @app_commands.command(name="reset_all_strikes", description="Reset every user's strike count to 0")
     async def reset_all_strikes_cmd(self, interaction: discord.Interaction) -> None:

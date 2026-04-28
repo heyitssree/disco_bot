@@ -31,12 +31,20 @@ def _db_write(fn: Callable[[], _T]) -> _T:
     """Execute a DuckDB write callable with exponential backoff on lock errors.
 
     Retries up to _DB_RETRY_ATTEMPTS times (0.1s, 0.2s, 0.4s, 0.8s, 1.6s).
+    Checkpoints after every successful write so data is always in the main .db
+    file and never only in the WAL — prevents data loss on unclean shutdown.
     Re-raises the last exception if all attempts fail.
     """
     last_exc: Exception | None = None
     for attempt in range(_DB_RETRY_ATTEMPTS):
         try:
-            return fn()
+            result = fn()
+            try:
+                # Force WAL → main DB flush after every write
+                _conn_ref and _conn_ref.checkpoint()
+            except Exception:
+                pass
+            return result
         except Exception as exc:
             msg = str(exc).lower()
             if "database is locked" not in msg and "conflicting lock" not in msg:
@@ -48,6 +56,9 @@ def _db_write(fn: Callable[[], _T]) -> _T:
             )
             time.sleep(delay)
     raise last_exc  # type: ignore[misc]
+
+
+_conn_ref: "duckdb.DuckDBPyConnection | None" = None
 
 
 _db_path_env = os.getenv("DB_PATH")
@@ -62,8 +73,10 @@ def init_db() -> duckdb.DuckDBPyConnection:
 
     Returns an open connection that should be reused for the bot's lifetime.
     """
+    global _conn_ref
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = duckdb.connect(str(DB_PATH))
+    _conn_ref = conn
     _create_tables(conn)
     logger.info("DuckDB initialised at %s", DB_PATH)
     return conn
@@ -585,6 +598,24 @@ def reset_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> None:
         conn.execute("UPDATE user_stats SET strikes = 0 WHERE user_id = ?", [user_id]),
         conn.commit(),
     ))
+
+
+def set_user_points(conn: duckdb.DuckDBPyConnection, user_id: int, username: str, points: int, prediction_count: int = 0, rashi: str | None = None) -> None:
+    """Upsert a user's Boli Points directly — used for manual data restore."""
+    existing = get_user_profile(conn, user_id)
+    def _write() -> None:
+        if existing is None:
+            conn.execute(
+                "INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count) VALUES (?, ?, ?, ?, current_timestamp, ?)",
+                [user_id, username, rashi, points, prediction_count],
+            )
+        else:
+            conn.execute(
+                "UPDATE user_stats SET boli_points=?, prediction_count=?, username=?, rashi=COALESCE(?, rashi) WHERE user_id=?",
+                [points, prediction_count, username, rashi, user_id],
+            )
+        conn.commit()
+    _db_write(_write)
 
 
 def reset_all_strikes(conn: duckdb.DuckDBPyConnection) -> int:
