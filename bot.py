@@ -1158,23 +1158,15 @@ async def kanmanilla_slash(interaction: discord.Interaction, user: discord.Membe
         return
 
     profile = get_user_profile(db_conn, user.id)
-    if not profile:
-        await interaction.response.send_message(
-            f"{user.mention} has no profile yet — never used the bot.",
-            ephemeral=True,
-        )
-        return
 
-    last_seen = profile.get("last_seen")
-    if last_seen is None:
-        days_ago = 999
-    else:
-        # DuckDB may return timezone-naive timestamps
-        if hasattr(last_seen, "tzinfo") and last_seen.tzinfo is not None:
-            now = datetime.now(timezone.utc)
-        else:
-            now = datetime.now()
+    last_seen = profile.get("last_seen") if profile else None
+    if last_seen is not None:
+        now = datetime.now(timezone.utc) if (hasattr(last_seen, "tzinfo") and last_seen.tzinfo is not None) else datetime.now()
         days_ago = max(0, (now - last_seen).days)
+    elif user.joined_at is not None:
+        days_ago = max(0, (datetime.now(timezone.utc) - user.joined_at).days)
+    else:
+        days_ago = 999
 
     if days_ago < 3:
         await interaction.response.send_message(
@@ -1745,14 +1737,14 @@ async def strike_slash(
 _SHOP_ITEMS: dict[str, dict] = {
     "curse_protection": {
         "name": "Curse Protection",
-        "cost": 100,
+        "cost": 20,
         "description": "100% reversal of proxy curses for 24 hours. Anyone who tries `navi @you` gets it back.",
         "emoji": "🛡️",
         "duration_hours": 24,
     },
     "custom_rashi": {
         "name": "Customize Rashi",
-        "cost": 50,
+        "cost": 40,
         "description": "Pick your own Rashi from the cosmic menu. Your destiny, your choice. For now.",
         "emoji": "🌟",
         "duration_hours": 0,  # permanent until next purchase
