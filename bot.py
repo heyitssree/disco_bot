@@ -763,12 +763,7 @@ async def on_message(message: discord.Message) -> None:
 
         def _send_compliment(target: discord.Member | discord.User) -> tuple[str, int]:
             compliment = get_random_compliment()
-            word, meaning, tier, pts = compliment["word"], compliment["meaning"], compliment["tier"], compliment["points"]
-            reply = (
-                f"{word} {target.mention}! ✨\n"
-                f"*({meaning} — {tier}, +{pts} Boli Points)*"
-            )
-            return reply, pts
+            return f"{compliment['word']} {target.mention}", compliment["points"]
 
         # "chunk @mention" → compliment the mentioned user
         if message.mentions:
@@ -1550,7 +1545,8 @@ async def help_slash(interaction: discord.Interaction) -> None:
             name="Text Commands (type in chat)",
             value=(
                 "`navi` — Same as `/navi`, triggers a full prediction\n"
-                "`navi @user` — Curse or roast someone (10% chance it bounces back on you)"
+                "`navi @user` — Curse or roast someone (10% chance it bounces back on you)\n"
+                "`chunk @user` — Compliment someone with Trivandrum slang (awards them Boli Points)"
             ),
             inline=False,
         )
