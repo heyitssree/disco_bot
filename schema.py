@@ -197,7 +197,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
     # Feature on/off flags (1 = enabled, 0 = disabled)
     for flag in (
         "feature_kochi_replies", "feature_curse_replies", "feature_boli_points",
-        "feature_welcome", "feature_astro", "feature_vibe_check", "feature_kanmanilla",
+        "feature_welcome", "feature_navi", "feature_vibe_check", "feature_kanmanilla",
         "feature_audit", "feature_mod_tldr", "feature_link_summary", "feature_strikes",
     ):
         conn.execute(f"""

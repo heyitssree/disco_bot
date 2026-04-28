@@ -49,11 +49,12 @@ from schema import (
 from glossary import RASHIS
 from prompts import (
     get_time_aware_system_prompt,
-    get_astro_prompt,
+    get_navi_prompt,
     get_curse_prompt,
     get_qa_prompt,
     get_summ_prompt,
     SUMM_SYSTEM_PROMPT,
+    LINK_SUMMARY_SYSTEM_PROMPT,
     get_vibe_check_prompt,
     get_kanmanilla_prompt,
     get_link_summary_prompt,
@@ -61,6 +62,12 @@ from prompts import (
     get_mod_tldr_prompt,
     FALLBACK_MESSAGE,
     WELCOME_MESSAGES,
+    MODA_INTROS,
+    BOT_SELF_CURSE_REPLIES,
+    BOT_LOOP_CURSE_REPLIES,
+    SPAM_WRAPPERS,
+    LEVEL_UP_MESSAGES,
+    LINK_USERNAME,
 )
 from curses import (
     CURSE_WORDS,
@@ -121,7 +128,7 @@ _RATE_WINDOW_SECONDS = 60
 
 
 def get_user_minute_count(user_id: int, increment: bool = True) -> int:
-    """Return how many times user has used /astro in the last 60 seconds.
+    """Return how many times user has used /navi in the last 60 seconds.
 
     If increment=True, also records this usage (call ONCE per invocation).
     Returns the count AFTER incrementing.
@@ -192,7 +199,7 @@ async def _check_vibe(message: discord.Message) -> None:
     tracker.clear()
 
     channel_name = getattr(message.channel, "name", "this channel")
-    system_prompt = get_time_aware_system_prompt(db_conn)
+    system_prompt = get_time_aware_system_prompt(db_conn, username=None)  # no persona for vibe check
     user_prompt = get_vibe_check_prompt(channel_name)
 
     reply, _ = await asyncio.get_running_loop().run_in_executor(
@@ -202,7 +209,7 @@ async def _check_vibe(message: discord.Message) -> None:
             system_prompt=system_prompt,
             cache_type="qa",
             name="VibeCheck",
-            fallback_message="Hey! Listen! Everyone chill please. Navi has seen Ganon's army and this server is somehow louder. Sit down mone.",
+            fallback_message="Everyone take a breath. Whatever's happening in here, it can wait.",
         ),
     )
     await message.channel.send(reply)
@@ -222,15 +229,13 @@ async def _handle_strike(member: discord.Member, channel: discord.abc.Messageabl
 
     if new_strikes == 1:
         await channel.send(
-            f"Hey! {member.mention}, listen! That's Strike 1. Watch your language mone. "
-            f"Two more and Navi will personally guide you straight into Thampanoor traffic with no return."
+            f"{member.mention} — Strike 1. Watch the language. Two more and you're in timeout."
         )
         logger.info("Strike 1 issued to %s", member.display_name)
 
     elif new_strikes == 2:
         await channel.send(
-            f"Aiyo {member.mention}, Strike 2! You have been sent to **Thampanoor Jail** for {_JAIL_TIMEOUT_MINUTES} minutes. "
-            f"Sit quietly and reflect on your vocabulary choices."
+            f"{member.mention} — Strike 2. You've been sent to **Timeout** for {_JAIL_TIMEOUT_MINUTES} minutes. Use the time wisely."
         )
         # Assign jail role if it exists on the guild
         if isinstance(channel, discord.TextChannel):
@@ -255,7 +260,7 @@ async def _handle_strike(member: discord.Member, channel: discord.abc.Messageabl
                 f"Time to consider the ban hammer. Their strikes have been reset to 0."
             )
         await channel.send(
-            f"🚨 {member.mention}, that's **3 strikes**. Mod team has been notified. Shokam situation mone."
+            f"🚨 {member.mention} — **3 strikes**. Mod team has been notified. Strikes reset to 0."
         )
         logger.info("Strike 3 alert sent for %s — strikes reset", member.display_name)
 
@@ -305,7 +310,7 @@ class _NaviTree(app_commands.CommandTree):
             return True
 
         await interaction.response.send_message(
-            "Navi is currently in sleep mode. Even fairies need rest. Only the owner can wake me up. Chumma wait mone.",
+            "Bot is currently disabled. Only the owner can re-enable it.",
             ephemeral=True,
         )
         return False
@@ -330,7 +335,7 @@ _BOT_START_TIME = datetime.now(timezone.utc)
 
 _FEATURE_DEFAULTS: dict[str, int] = {
     "master_killswitch":    0,
-    "feature_astro":        1,
+    "feature_navi":         1,
     "feature_vibe_check":   1,
     "feature_kanmanilla":   1,
     "feature_audit":        1,
@@ -387,15 +392,7 @@ def _personalise(template: str, name: str, curse: str | None = None) -> str:
 
 
 
-_SPAM_WRAPPERS = [
-    "Mone, I told you already — {prediction}",
-    "Still asking? Shokam. {prediction}",
-    "Aiyo, same question again? The stars already decided — {prediction}",
-    "Eda, the planets haven't changed since 5 minutes ago. {prediction}",
-    "Chumma asking again is it? Fine. {prediction}",
-    "I only have one doom per customer, mone. {prediction}",
-    "You think fate changes every 5 minutes? {prediction}",
-]
+# SPAM_WRAPPERS imported from prompts.py
 
 _LEVEL_TITLES: list[tuple[int, str]] = [
     (0,  "Tourist"),
@@ -408,16 +405,7 @@ _LEVEL_TITLES: list[tuple[int, str]] = [
     (91, "The Chosen One"),
 ]
 
-_LEVEL_UP_MESSAGES: list[str] = [
-    "Aiyo {user}! Level **{level}** achieved! The stars have taken note. Reluctantly.",
-    "Eda {user}, Level **{level}** unlocked! Your Thirontharam energy is growing. Still not enough to beat KD Puram traffic, but still.",
-    "{user} has reached Level **{level}**! Even the thattukada pillacha is impressed. Slightly.",
-    "Oola! {user} is now Level **{level}**! The cosmos updated your file. Long overdue, honestly.",
-    "Shokam to everyone else — {user} just hit Level **{level}**! The universe is watching. And judging the rest.",
-    "{user} Level **{level}** achieved! Navi acknowledges your slang dedication. Even Link was not this committed. Chumma. Keep going.",
-    "Aiyo {user}, Level **{level}**! Even the Ponmudi mist parted briefly to recognise this moment. Kidilam.",
-    "Eda {user}, you are now Level **{level}**! Indian Coffee House Thampanoor will serve you slightly faster now.",
-]
+# LEVEL_UP_MESSAGES imported from prompts.py
 
 
 def get_level_title(level: int) -> str:
@@ -448,7 +436,7 @@ async def _maybe_announce_levelup(
 
     # Tier crossing: append a witty title unlock line
     if new_title != old_title:
-        flavour = random.choice(_LEVEL_UP_MESSAGES).format(user=mention, level=new_level)
+        flavour = random.choice(LEVEL_UP_MESSAGES).format(user=mention, level=new_level)
         msg = (
             f"🔥 **Level Up!** {mention} reached **Level {new_level}**! "
             f"Earned title: [**{new_title}**]. Keep the boli flowing!\n"
@@ -463,7 +451,7 @@ def _format_cached_spam_reply(cached: str, name: str) -> str:
     wrap it in a varied snarky spam-reply message."""
     # Remove leading opener like "Eda Link," / "Aiyo Link," (case-insensitive)
     stripped = re.sub(
-        rf"^(Eda|Aiyo|Oola|Shokam)\s+{re.escape(name)}\s*[,.]?\s*",
+        rf"^(Hey|Oh|Eda|Aiyo)\s+{re.escape(name)}\s*[,!.]?\s*",
         "",
         cached,
         flags=re.IGNORECASE,
@@ -472,7 +460,7 @@ def _format_cached_spam_reply(cached: str, name: str) -> str:
     if stripped:
         stripped = stripped[0].upper() + stripped[1:]
     prediction_text = stripped or cached  # fall back to full text if strip failed
-    wrapper = random.choice(_SPAM_WRAPPERS)
+    wrapper = random.choice(SPAM_WRAPPERS)
     return wrapper.format(prediction=prediction_text)
 
 
@@ -480,8 +468,8 @@ def _format_cached_spam_reply(cached: str, name: str) -> str:
 # Core prediction logic
 # ---------------------------------------------------------------------------
 
-async def get_astro_prediction(user_id: int, name: str, usage_count: int = 1) -> str:
-    """Get an astrology prediction.
+async def get_navi_prediction(user_id: int, name: str, usage_count: int = 1) -> str:
+    """Get a Navi prediction.
 
     Routing by usage_count within the current minute:
       1st call  → normal flow (50% daily cache reuse, otherwise Gemini)
@@ -508,7 +496,7 @@ async def get_astro_prediction(user_id: int, name: str, usage_count: int = 1) ->
         cached_pool, _ = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: api_mgr.call_cache_only(
-                cache_type="astro", name=name, fallback_message=FALLBACK_MESSAGE
+                cache_type="navi", name=name, fallback_message=FALLBACK_MESSAGE
             ),
         )
         await asyncio.sleep(random.uniform(1.5, 3.0))
@@ -531,15 +519,15 @@ async def get_astro_prediction(user_id: int, name: str, usage_count: int = 1) ->
 
     # ---- Gemini call ----
     past_predictions = get_last_n_predictions(db_conn, user_id, n=3)
-    system_prompt = get_time_aware_system_prompt(db_conn)
-    user_prompt = get_astro_prompt(name, rashi=rashi, past_predictions=past_predictions)
+    system_prompt = get_time_aware_system_prompt(db_conn, username=name)
+    user_prompt = get_navi_prompt(name, rashi=rashi, past_predictions=past_predictions)
 
     result, from_cache = await asyncio.get_running_loop().run_in_executor(
         None,
         lambda: api_mgr.call(
             prompt=user_prompt,
             system_prompt=system_prompt,
-            cache_type="astro",
+            cache_type="navi",
             name=name,
             fallback_message=FALLBACK_MESSAGE,
         ),
@@ -547,7 +535,7 @@ async def get_astro_prediction(user_id: int, name: str, usage_count: int = 1) ->
 
     if not from_cache and result != FALLBACK_MESSAGE:
         template = _templatize(result, name)
-        save_prediction(db_conn, "astro", template, user_id=user_id, original_prompt=user_prompt)
+        save_prediction(db_conn, "navi", template, user_id=user_id, original_prompt=user_prompt)
         save_user_prediction(db_conn, user_id, result)
         increment_prediction_count(db_conn, user_id)
 
@@ -590,21 +578,12 @@ async def on_ready() -> None:
     logger.info("Slash commands synced. Navi is live. Hey! Listen!")
 
 
-_MODA_INTROS: list[str] = [
-    "If you have any questions, ask Moda. He is the moderator here. He will pretend to know the answer.",
-    "Moda is our moderator. Treat him with respect. He earned it by doing absolutely nothing special.",
-    "The server moderator Moda will guide you. Or he will just stare at the screen and nod. Same thing.",
-    "Moda is the boss here — in the sense that he has a badge. Whether he uses it wisely is another vishayam entirely.",
-    "Our moderator Moda is very capable. At least that is what he tells himself every morning.",
-    "If lost, contact Moda. He is the moderator. He will send you in the wrong direction with full confidence.",
-    "Moda runs this server. In the same way KSRTC runs on time — technically yes, practically no.",
-    "The one called Moda will moderate you. What that means, even the stars are not sure. But he has the role.",
-]
+# MODA_INTROS, BOT_SELF_CURSE_REPLIES, BOT_LOOP_CURSE_REPLIES imported from prompts.py
 
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    """Welcome new member with a single combined message and fresh astrology prediction."""
+    """Welcome new member after a 1-minute delay — short, funny, always includes Moda intro."""
     channel = (
         discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
         or discord.utils.get(member.guild.text_channels, name="general")
@@ -620,14 +599,19 @@ async def on_member_join(member: discord.Member) -> None:
         logger.info("Welcome messages disabled — skipping for %s", member.display_name)
         return
 
-    async with channel.typing():
-        prediction = await get_astro_prediction(member.id, member.display_name)
+    # 1-minute delay before posting (non-blocking)
+    await asyncio.sleep(60)
+
+    # Re-check the member is still in the guild after the delay
+    if member.guild.get_member(member.id) is None:
+        logger.info("Member %s left before welcome message was sent.", member.display_name)
+        return
 
     welcome_line = random.choice(WELCOME_MESSAGES).format(user=member.mention)
-    moda_line = f"\n{random.choice(_MODA_INTROS)}" if random.random() < 0.40 else ""
-    await channel.send(f"{welcome_line}{moda_line}\n{prediction}")
+    moda_line = random.choice(MODA_INTROS)
+    await channel.send(f"{welcome_line} {moda_line}")
 
-    logger.info("Welcomed new member %s with prediction in #%s", member.display_name, channel.name)
+    logger.info("Welcomed new member %s in #%s", member.display_name, channel.name)
 
 
 @bot.event
@@ -653,10 +637,10 @@ async def on_message(message: discord.Message) -> None:
     content_lower = message.content.strip().lower()
 
     # ---- Admin toggle ----
-    if content_lower in ("astro syros stop", "astro syros start"):
+    if content_lower in ("navi syros stop", "navi syros start"):
         app_info = await bot.application_info()
         if message.author.id == app_info.owner.id:
-            gemini_svc.free_only = content_lower == "astro syros stop"
+            gemini_svc.free_only = content_lower == "navi syros stop"
             status = "now running in Free-Only Mode (will fallback to cache if free key fails)." if gemini_svc.free_only else "Gemini Paid Tier is back online."
             await message.reply(f"Ok owner, {status}")
         return
@@ -700,8 +684,12 @@ async def on_message(message: discord.Message) -> None:
             .strip()
         )
         if content_without_ping and not contains_curse_word(message.content)[0]:
-            system_prompt = get_time_aware_system_prompt(db_conn)
-            user_prompt = get_qa_prompt(message.author.display_name, content_without_ping)
+            system_prompt = get_time_aware_system_prompt(db_conn, username=message.author.display_name)
+            user_prompt = get_qa_prompt(
+                message.author.display_name,
+                content_without_ping,
+                is_link=(message.author.display_name == LINK_USERNAME),
+            )
 
             async def _do_qa_call() -> str:
                 await asyncio.sleep(random.uniform(1.0, 2.0))
@@ -727,27 +715,20 @@ async def on_message(message: discord.Message) -> None:
         # Always return after a mention — never double-trigger slang detection
         return
 
-    # ---- Legacy prefix "astro" command ----
-    if message.content.lower().startswith("astro"):
+    # ---- Legacy prefix "navi" command ----
+    if message.content.lower().startswith("navi"):
 
-        # "astro @username" → curse/roast the mentioned user (instant, no API)
+        # "navi @username" → curse/roast the mentioned user (instant, no API)
         if message.mentions:
             target = message.mentions[0]
             # Don't curse the bot itself
             if target.id == bot.user.id:
-                await message.reply("Eda, you think I can curse myself? Oola idea.")
+                await message.reply(random.choice(BOT_SELF_CURSE_REPLIES))
                 return
 
             # Bot-loop protection: if someone is trying to curse another bot
             if target.bot:
-                bot_curses = [
-                    f"Aiyo {message.author.mention}, you are trying to make me fight other bots? What is this Thampanoor nonsense.",
-                    f"Vayadi {message.author.mention}, trying to start a bot war in this server? The stars curse your WiFi for this.",
-                    f"{message.author.mention} Eda, that is a bot. You think bots have feelings? Even I have more feelings than this plan.",
-                    f"Shokam {message.author.mention}. Trying to proxy-curse a bot? Go outside. Touch some grass near Shanghumugham.",
-                    f"Oola {message.author.mention}, nice try. The universe sees you. And it is judging you very hard right now.",
-                ]
-                await message.reply(random.choice(bot_curses))
+                await message.reply(f"{message.author.mention} {random.choice(BOT_LOOP_CURSE_REPLIES)}")
                 return
 
             curse_word = get_random_curse()
@@ -765,17 +746,17 @@ async def on_message(message: discord.Message) -> None:
             if random.random() < reversal_chance:
                 curse_reply = f"Eda {message.author.mention}, you tried to curse {target.display_name}, but the stars reversed it. {curse_word}!"
                 await message.reply(curse_reply)
-                log_curse(db_conn, message.author.id, message.author.display_name, "proxy_astro_reverse")
+                log_curse(db_conn, message.author.id, message.author.display_name, "proxy_navi_reverse")
                 logger.info("Proxy curse reversed! %s tried to curse %s but got cursed instead.", message.author.display_name, target.display_name)
                 return
 
             curse_reply = f"{curse_word} {target.mention}"
             await message.reply(curse_reply)
-            log_curse(db_conn, target.id, target.display_name, "proxy_astro")
+            log_curse(db_conn, target.id, target.display_name, "proxy_navi")
             logger.info("%s cursed %s via prefix command", message.author.display_name, target.display_name)
             return
 
-        # "astro" with no mention → full prediction for the sender
+        # "navi" with no mention → full prediction for the sender
         target = message.author
         display_name = target.display_name
         mention_str = target.mention
@@ -785,9 +766,9 @@ async def on_message(message: discord.Message) -> None:
 
         if FREE_TIER_MODE:
             async with message.channel.typing():
-                prediction = await get_astro_prediction(target.id, display_name, usage_count=usage_count)
+                prediction = await get_navi_prediction(target.id, display_name, usage_count=usage_count)
         else:
-            prediction = await get_astro_prediction(target.id, display_name, usage_count=usage_count)
+            prediction = await get_navi_prediction(target.id, display_name, usage_count=usage_count)
 
         final_reply = prediction.replace(display_name, mention_str)
         await message.reply(final_reply)
@@ -804,12 +785,12 @@ async def on_message(message: discord.Message) -> None:
     if get_config_int(db_conn, "feature_curse_replies", 1) and _curse_matched and random.random() < curse_chance:
         username = message.author.display_name
         user_id = message.author.id
-        curse_used = curse_used or "oola"
+        curse_used = curse_used or "that"
 
         log_curse(db_conn, user_id, username, curse_used)
         update_boli_points(db_conn, user_id, 1)  # +1 Boli pt for curse event
 
-        system_prompt = get_time_aware_system_prompt(db_conn)
+        system_prompt = get_time_aware_system_prompt(db_conn, username=username)
         user_prompt = get_curse_prompt(username, curse_used)
 
         async with message.channel.typing():
@@ -949,7 +930,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
             ) as resp:
                 if resp.status != 200:
                     await message.reply(
-                        f"Aiyo, couldn't fetch that link (HTTP {resp.status}). Shokam."
+                        f"Couldn't fetch that link (HTTP {resp.status}). Try again later."
                     )
                     return
                 html = await resp.text(errors="replace")
@@ -958,22 +939,20 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
         if not page_text.strip():
             await message.reply(
-                "Eda, that page has no readable text. "
-                "Maybe a paywall or JS-only site. Chumma."
+                "That page has no readable text — probably a paywall or JS-only site."
             )
             return
 
         user_prompt = get_link_summary_prompt(page_text, url)
-        system_prompt = get_time_aware_system_prompt(db_conn)
 
         summary, _ = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: api_mgr.call(
                 prompt=user_prompt,
-                system_prompt=system_prompt,
+                system_prompt=LINK_SUMMARY_SYSTEM_PROMPT,
                 cache_type="qa",
                 name="LinkSummary",
-                fallback_message="Navi-nte glow went off. KSEB took the current. Even fairies need electricity mone. Try again.",
+                fallback_message=FALLBACK_MESSAGE,
             ),
         )
         await message.reply(f"📰 **Link Summary:**\n{summary}")
@@ -981,34 +960,29 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
 
     except Exception as exc:
         logger.warning("Link summary failed for %s: %s", url, exc)
-        await message.reply("Aiyo, something went wrong while reading that link. KSEB-style failure — even Navi's glow couldn't help.")
+        await message.reply("Something went wrong reading that link. Try again.")
 
 
 # ---------------------------------------------------------------------------
 # Slash Commands
 # ---------------------------------------------------------------------------
 
-@tree.command(name="astro", description="Get a dramatic Manglish astrology prediction")
-async def astro_slash(
+@tree.command(name="navi", description="Get a Navi prediction")
+async def navi_slash(
     interaction: discord.Interaction,
     user: discord.Member | None = None,
 ) -> None:
-    if not _feat("feature_astro"):
+    if not _feat("feature_navi"):
         await interaction.response.send_message(
-            "Astro predictions are currently disabled. Chumma wait mone.", ephemeral=True
+            "Navi predictions are currently disabled.", ephemeral=True
         )
         return
 
-    # Bot-loop protection: curse whoever tries to feed a bot into us
+    # Bot-loop protection: reject attempts to get predictions for other bots
     if user is not None and user.bot:
-        bot_loop_curses = [
-            f"Aiyo {interaction.user.mention}, you are trying to make me talk to another bot? What is this Thampanoor robot conference.",
-            f"Eda {interaction.user.mention}, that is a bot. You think bots need cosmic readings? Go touch some grass near Padmanabhaswamy.",
-            f"{interaction.user.mention} Shokam. Trying to start a bot loop in this server? The stars curse your internet speed for this nonsense.",
-            f"Vayadi {interaction.user.mention}, a bot asking for a bot's horoscope? Even Rahu cannot predict this level of stupidity.",
-            f"Oola {interaction.user.mention}, nice try. Bot into bot into bot — I know exactly what you are doing. The universe sees and judges very hard.",
-        ]
-        await interaction.response.send_message(random.choice(bot_loop_curses))
+        await interaction.response.send_message(
+            f"{interaction.user.mention} {random.choice(BOT_LOOP_CURSE_REPLIES)}"
+        )
         return
 
     # Record usage and get per-minute count BEFORE checking cache
@@ -1037,16 +1011,16 @@ async def astro_slash(
     await interaction.response.defer(thinking=True)
     await asyncio.sleep(random.uniform(1.0, 2.0))
 
-    prediction = await get_astro_prediction(target.id, display_name, usage_count=usage_count)
+    prediction = await get_navi_prediction(target.id, display_name, usage_count=usage_count)
     final_reply = prediction.replace(display_name, mention_str)
     await interaction.followup.send(final_reply)
 
-    # +2 Boli Points for using /astro (only on first fresh call)
+    # +2 Boli Points for using /navi (only on first fresh call)
     if usage_count == 1:
         profile = get_user_profile(db_conn, interaction.user.id)
         old_pts = profile["boli_points"] if profile else 0
         update_boli_points(db_conn, interaction.user.id, 2)
-        logger.info("%s used /astro → +2 Boli Points", interaction.user.display_name)
+        logger.info("%s used /navi → +2 Boli Points", interaction.user.display_name)
         if interaction.channel:
             await _maybe_announce_levelup(
                 interaction.user.mention, old_pts, old_pts + 2, interaction.channel
@@ -1060,13 +1034,13 @@ async def rank_slash(interaction: discord.Interaction) -> None:
 
     if not leaders:
         await interaction.followup.send(
-            "Eda, nobody has Boli Points yet. Use **/astro** and start earning, mone."
+            "Nobody has Boli Points yet. Use **/navi** and start earning."
         )
         return
 
     embed = discord.Embed(
-        title="🍮 Top Appis — Boli Points Leaderboard",
-        description="The most Thirontharam people in this server, ranked by Navi. Hey! Listen to these legends.",
+        title="🍮 Boli Points Leaderboard",
+        description="Top ranked members by Boli Points.",
         color=discord.Color.gold(),
     )
 
@@ -1082,7 +1056,7 @@ async def rank_slash(interaction: discord.Interaction) -> None:
             inline=False,
         )
 
-    embed.set_footer(text="Earn points by using Trivandrum slang and /astro. Shokam to the rest.")
+    embed.set_footer(text="Earn points by using /navi and Trivandrum slang.")
     await interaction.followup.send(embed=embed)
 
 
@@ -1091,7 +1065,7 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
     profile = get_user_profile(db_conn, interaction.user.id)
     if not profile:
         await interaction.response.send_message(
-            "Eda, you have no profile yet. Use **/astro** first, mone.", ephemeral=True
+            "No profile found. Use **/navi** first to get started.", ephemeral=True
         )
         return
 
@@ -1110,16 +1084,15 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
         bar = "█" * filled + "░" * (10 - filled)
         progress_line = f"📈 `[{bar}]` {progress}/{needed} pts → Level {level + 1}"
     else:
-        progress_line = "🌟 Maximum level reached! Ninte cosmic destiny is sealed, mone."
+        progress_line = "🌟 Maximum level reached!"
 
     await interaction.response.send_message(
-        f"**Your Navi Profile**\n"
+        f"**Your Profile**\n"
         f"🌟 Rashi: **{rashi}**\n"
         f"⚔️ Level: **{level}** — *{title}*\n"
         f"{progress_line}\n"
         f"🍮 Boli Points: **{pts}**\n"
-        f"🔮 Predictions received: **{count}**\n\n"
-        f"*Use Thirontharam slang to earn points and level up. Kidilam!*",
+        f"🔮 Predictions received: **{count}**",
         ephemeral=True,
     )
 
@@ -1216,14 +1189,14 @@ async def kanmanilla_slash(interaction: discord.Interaction, user: discord.Membe
 
     if user.bot:
         await interaction.response.send_message(
-            "Eda, bots don't go missing — they just get turned off. Chumma po.", ephemeral=True
+            "Bots don't go missing — they just get turned off.", ephemeral=True
         )
         return
 
     profile = get_user_profile(db_conn, user.id)
     if not profile:
         await interaction.response.send_message(
-            f"Eda, {user.mention} hasn't even registered with Navi yet. Cannot track what I have never seen. Chumma.",
+            f"{user.mention} has no profile yet — never used the bot.",
             ephemeral=True,
         )
         return
@@ -1241,13 +1214,13 @@ async def kanmanilla_slash(interaction: discord.Interaction, user: discord.Membe
 
     if days_ago < 3:
         await interaction.response.send_message(
-            f"Eda, {user.mention} was just here. Chumma pinging people.",
+            f"{user.mention} was just here recently. Don't ping people for no reason.",
         )
         return
 
     await interaction.response.defer(thinking=True)
 
-    system_prompt = get_time_aware_system_prompt(db_conn)
+    system_prompt = get_time_aware_system_prompt(db_conn, username=None)
     user_prompt = get_kanmanilla_prompt(user.display_name, days_ago)
 
     poster, _ = await asyncio.get_running_loop().run_in_executor(
@@ -1257,7 +1230,7 @@ async def kanmanilla_slash(interaction: discord.Interaction, user: discord.Membe
             system_prompt=system_prompt,
             cache_type="qa",
             name="KanmanillaRequest",
-            fallback_message=f"🚨 MISSING: {user.display_name}. Last seen {days_ago} days ago. {user.mention}, are you still alive or did you get stuck in KD Puram traffic? Reply here.",
+            fallback_message=f"🚨 MISSING: {user.display_name}. Last seen {days_ago} days ago. {user.mention} — are you still out there? Reply here.",
         ),
     )
     await interaction.followup.send(f"{poster}\n{user.mention}")
@@ -1349,7 +1322,7 @@ async def mod_tldr_slash(interaction: discord.Interaction) -> None:
 
     if not isinstance(interaction.channel, discord.Thread):
         await interaction.response.send_message(
-            "Eda, this command only works inside a thread. Go into the thread first, mone.",
+            "This command only works inside a thread. Run it from within the thread.",
             ephemeral=True,
         )
         return
@@ -1399,7 +1372,7 @@ async def health_slash(interaction: discord.Interaction) -> None:
     app_info = await bot.application_info()
     if interaction.user.id != app_info.owner.id:
         await interaction.response.send_message(
-            "Eda, this is for the owner only. Chumma po.", ephemeral=True
+            "This command is owner-only.", ephemeral=True
         )
         return
 
@@ -1541,9 +1514,9 @@ async def help_slash(interaction: discord.Interaction) -> None:
         "`/shop view` / `/shop buy` — Boli Marketplace",
         "`/help` — This menu",
     ]
-    if _feat("feature_astro"):
-        core_cmds.insert(0, "`/astro` — Get a dramatic Manglish astrology prediction (rate-limited per minute)")
-        core_cmds.insert(1, "`/astro user:@someone` — Get a prediction for someone else")
+    if _feat("feature_navi"):
+        core_cmds.insert(0, "`/navi` — Get a Navi prediction (rate-limited per minute)")
+        core_cmds.insert(1, "`/navi user:@someone` — Get a prediction for someone else")
     if _feat("feature_kanmanilla"):
         core_cmds.append("`/kanmanilla @user` — Ping a missing member with a dramatic notice")
     if _feat("feature_temp_vc"):
@@ -1554,13 +1527,13 @@ async def help_slash(interaction: discord.Interaction) -> None:
         core_cmds.append("`/mod_tldr` — Mod: summarise the current thread")
     embed.add_field(name="Slash Commands", value="\n".join(core_cmds), inline=False)
 
-    # Text triggers (only if astro enabled)
-    if _feat("feature_astro"):
+    # Text triggers (only if navi enabled)
+    if _feat("feature_navi"):
         embed.add_field(
             name="Text Commands (type in chat)",
             value=(
-                "`astro` — Same as `/astro`, triggers a full prediction\n"
-                "`astro @user` — Instantly curse or roast someone (10% chance it bounces back on you)"
+                "`navi` — Same as `/navi`, triggers a full prediction\n"
+                "`navi @user` — Curse or roast someone (10% chance it bounces back on you)"
             ),
             inline=False,
         )
@@ -1569,8 +1542,8 @@ async def help_slash(interaction: discord.Interaction) -> None:
     embed.add_field(
         name="Mention Q&A",
         value=(
-            "`@Navi <question>` — Ask me anything. I will answer factually first, then judge you for asking.\n"
-            "Works for news, scores, how-tos — I guided a hero through 100 dungeons, I can handle your questions."
+            "`@Navi <question>` — Ask me anything. Factual answer first, then commentary if warranted.\n"
+            "Works for news, scores, how-tos, general questions."
         ),
         inline=False,
     )
@@ -1582,7 +1555,7 @@ async def help_slash(interaction: discord.Interaction) -> None:
             value=(
                 "Earn points by using Trivandrum slang naturally in chat:\n"
                 "*kidilam, shokam, pillacha, chumma, mone, kili poyi, vishayam, thirontharam, boli, paal payasam...*\n"
-                "+5 pts per unique trigger word per message · +2 pts per `/astro` call\n"
+                "+5 pts per unique trigger word per message · +2 pts per `/navi` call\n"
                 "Level up from Tourist → Thampanoor Regular → Chalai Veteran → Cosmic Sage of Thirontharam"
             ),
             inline=False,
@@ -1595,9 +1568,9 @@ async def help_slash(interaction: discord.Interaction) -> None:
     if _feat("feature_curse_replies"):
         passive_lines.append("**Curse words** → 25% chance the cosmos punishes you with a dramatic doom prediction")
     if _feat("feature_welcome"):
-        passive_lines.append("**New member joins** → Welcome message + fresh astrology reading")
+        passive_lines.append("**New member joins** → Welcome message (1-min delay)")
     if _feat("feature_vibe_check"):
-        passive_lines.append("**Chat heats up** → Navi intervenes with a sarcastic calming message (she's done this in Hyrule too)")
+        passive_lines.append("**Chat heats up** → Navi intervenes with a calming message")
     if _feat("feature_link_summary"):
         passive_lines.append("**React 📰 on a link** → Navi scrapes and summarises the article in 3 bullet points")
     if _feat("feature_strikes"):
@@ -1632,7 +1605,7 @@ class AdminGroup(app_commands.Group):
             return True
         # Deny everyone else — ephemeral so it's not publicly embarrassing
         await interaction.response.send_message(
-            "Eda mone, only my owner can use this. Chumma po.", ephemeral=True
+            "Admin commands are owner-only.", ephemeral=True
         )
         return False
 
@@ -1653,14 +1626,13 @@ class AdminGroup(app_commands.Group):
         _set_feature("master_killswitch", new_state)
         if new_state:
             await interaction.response.send_message(
-                "☠️ **Master Kill Switch: ON.** Navi is now completely silent. Even fairies go offline. "
-                "Only you can wake me up with `/admin killswitch` again.",
+                "☠️ **Master Kill Switch: ON.** Bot is now silent. Use `/admin killswitch` to re-enable.",
                 ephemeral=True,
             )
             logger.warning("MASTER KILL SWITCH ACTIVATED by %s", interaction.user.display_name)
         else:
             await interaction.response.send_message(
-                "✅ **Master Kill Switch: OFF.** Navi is back. Hey! Listen! Navi is back. Kidilam.",
+                "✅ **Master Kill Switch: OFF.** Bot is back online.",
                 ephemeral=True,
             )
             logger.info("Master kill switch deactivated by %s", interaction.user.display_name)
@@ -1668,7 +1640,7 @@ class AdminGroup(app_commands.Group):
     @app_commands.command(name="toggle_feature", description="Enable or disable a bot feature")
     @app_commands.describe(feature="Feature to toggle", enabled="Turn it on (True) or off (False)")
     @app_commands.choices(feature=[
-        app_commands.Choice(name="Astro Predictions", value="feature_astro"),
+        app_commands.Choice(name="Navi Predictions", value="feature_navi"),
         app_commands.Choice(name="Vibe Check (auto de-escalation)", value="feature_vibe_check"),
         app_commands.Choice(name="Kanmanilla (missing person)", value="feature_kanmanilla"),
         app_commands.Choice(name="Mod Audit (/audit)", value="feature_audit"),
@@ -1696,7 +1668,7 @@ class AdminGroup(app_commands.Group):
     @app_commands.command(name="set_chance", description="Set the probability (0.0–1.0) for a specific reaction")
     @app_commands.describe(feature="Which probability to adjust", value="New value between 0.0 and 1.0")
     @app_commands.choices(feature=[
-        app_commands.Choice(name="Cache Reuse (astro)", value="cache_reuse_chance"),
+        app_commands.Choice(name="Cache Reuse (navi)", value="cache_reuse_chance"),
         app_commands.Choice(name="Kochi Slang Reply", value="kochi_reply_chance"),
         app_commands.Choice(name="Passive Curse Reply", value="curse_reply_chance"),
         app_commands.Choice(name="Curse Reversal (owner target)", value="reversal_chance_owner"),
@@ -1780,7 +1752,7 @@ async def strike_slash(
     reason: str = "Manual mod action",
 ) -> None:
     if user.bot:
-        await interaction.response.send_message("Eda, you can't strike a bot. Chumma po.", ephemeral=True)
+        await interaction.response.send_message("You can't strike a bot.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     await _handle_strike(user, interaction.channel)
@@ -1801,7 +1773,7 @@ _SHOP_ITEMS: dict[str, dict] = {
     "curse_protection": {
         "name": "Curse Protection",
         "cost": 100,
-        "description": "100% reversal of proxy curses for 24 hours. Anyone who tries `astro @you` gets it back.",
+        "description": "100% reversal of proxy curses for 24 hours. Anyone who tries `navi @you` gets it back.",
         "emoji": "🛡️",
         "duration_hours": 24,
     },
@@ -1844,7 +1816,7 @@ class ShopGroup(app_commands.Group):
                 inline=False,
             )
 
-        embed.set_footer(text="Earn Boli Points by using Trivandrum slang and /astro. Shokam to those who can't afford it.")
+        embed.set_footer(text="Earn Boli Points by using /navi and Trivandrum slang.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="buy", description="Purchase an item from the Boli Marketplace")
@@ -1860,14 +1832,14 @@ class ShopGroup(app_commands.Group):
         rashi_choice: str | None = None,
     ) -> None:
         if item not in _SHOP_ITEMS:
-            await interaction.response.send_message("Eda, that item doesn't exist. Chumma po.", ephemeral=True)
+            await interaction.response.send_message("That item doesn't exist.", ephemeral=True)
             return
 
         shop_item = _SHOP_ITEMS[item]
         profile = get_user_profile(db_conn, interaction.user.id)
         if not profile:
             await interaction.response.send_message(
-                "Eda, you have no profile yet. Use /astro first to get started.", ephemeral=True
+                "No profile found. Use /navi first to get started.", ephemeral=True
             )
             return
 
@@ -1876,8 +1848,7 @@ class ShopGroup(app_commands.Group):
 
         if pts < cost:
             await interaction.response.send_message(
-                f"Aiyo {interaction.user.mention}, not enough Boli Points. "
-                f"You have 🍮 **{pts}** but need **{cost}**. Earn more by using Trivandrum slang. Shokam.",
+                f"Not enough Boli Points. You have 🍮 **{pts}** but need **{cost}**.",
                 ephemeral=True,
             )
             return
@@ -1889,9 +1860,9 @@ class ShopGroup(app_commands.Group):
             expiry = get_perk_expiry(db_conn, interaction.user.id, "curse_protection")
             ts = f"<t:{int(expiry.timestamp())}:f>" if expiry else "24 hours"
             await interaction.response.send_message(
-                f"🛡️ **Curse Protection activated!** {interaction.user.mention}, you are now protected until {ts}. "
-                f"Anyone who tries `astro @{interaction.user.display_name}` will have the curse reversed onto them. "
-                f"100%. No exceptions. Kidilam.\n🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+                f"🛡️ **Curse Protection activated!** {interaction.user.mention}, you're protected until {ts}. "
+                f"Any proxy curse attempt will be reversed back at the sender.\n"
+                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
                 ephemeral=True,
             )
             logger.info("%s purchased Curse Protection", interaction.user.display_name)
@@ -1913,7 +1884,7 @@ class ShopGroup(app_commands.Group):
             if not matched:
                 rashi_list = ", ".join(RASHIS)
                 await interaction.response.send_message(
-                    f"Aiyo, `{rashi_choice}` is not a valid Rashi. Pick from: {rashi_list}",
+                    f"`{rashi_choice}` is not a valid Rashi. Pick from: {rashi_list}",
                     ephemeral=True,
                 )
                 return
@@ -1921,8 +1892,7 @@ class ShopGroup(app_commands.Group):
             update_boli_points(db_conn, interaction.user.id, -cost)
             upsert_user(db_conn, interaction.user.id, interaction.user.display_name, rashi=matched)
             await interaction.response.send_message(
-                f"🌟 **Rashi updated!** {interaction.user.mention}, your new cosmic sign is **{matched}**. "
-                f"The stars have been bribed accordingly. Chumma accept.\n"
+                f"🌟 **Rashi updated!** {interaction.user.mention}, your sign is now **{matched}**.\n"
                 f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
                 ephemeral=True,
             )
@@ -1971,7 +1941,7 @@ async def temp_vc_slash(
 ) -> None:
     if not _feat("feature_temp_vc"):
         await interaction.response.send_message(
-            "Temp VC creation is currently disabled. Ask a mod to enable it. Chumma wait mone.",
+            "Temp voice channel creation is currently disabled.",
             ephemeral=True,
         )
         return
@@ -2014,15 +1984,14 @@ async def temp_vc_slash(
         )
     except discord.Forbidden:
         await interaction.followup.send(
-            "Aiyo, I don't have permission to create voice channels here. "
-            "Ask a mod to grant me **Manage Channels**.",
+            "I don't have permission to create voice channels. Ask a mod to grant me **Manage Channels**.",
             ephemeral=True,
         )
         return
     except Exception as exc:
         logger.error("Failed to create temp VC: %s", exc)
         await interaction.followup.send(
-            "Something went wrong while creating the voice channel. Shokam situation.",
+            "Something went wrong while creating the voice channel. Try again.",
             ephemeral=True,
         )
         return

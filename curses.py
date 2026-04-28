@@ -49,13 +49,13 @@ KOCHI_SLANG: list[str] = [
 # ---------------------------------------------------------------------------
 
 KOCHI_SLANG_RESPONSES: list[str] = [
-    "Eda {user}, this is Thirontharam. Keep that Kochi talk at Ernakulam South station.",
-    "Aiyo {user}, 'machane'? We don't use that here mone. Say it properly or go back to Marine Drive.",
-    "{user}, Navi detects strong Kochi energy in this message. Even in Hyrule, there were no accents this suspicious.",
-    "Eda {user}, wrong city, wrong slang. Thirontharam vibes only. Chumma adjust cheyyane.",
-    "Aiyo {user}, nee Ernakulam-karan aano? Sit down, have some Boli, and learn to speak properly.",
-    "{user}, the cosmic alignment is disturbed by your Kochi accent. Navi is disappointed but not surprised. Shokam.",
-    "Eda {user}, this slang is from Kochi side only. Here we say things properly. Adjust aakane mone.",
+    "{user}, that's Kochi slang. Wrong city, wrong crowd.",
+    "{user}, Kochi energy detected. This is Trivandrum — adjust accordingly.",
+    "Strong Kochi accent detected from {user}. The server notes it with mild suspicion.",
+    "{user}, that slang doesn't land here. Try again.",
+    "{user}, Kochi called — they want their slang back.",
+    "{user}, that's Ernakulam talk. We do things differently here.",
+    "Kochi slang spotted from {user}. Noted. Unimpressed.",
 ]
 
 # ---------------------------------------------------------------------------
@@ -63,13 +63,13 @@ KOCHI_SLANG_RESPONSES: list[str] = [
 # ---------------------------------------------------------------------------
 
 DOOMED_PREDICTIONS: list[str] = [
-    "Aiyo {user}, the stars heard what you said and now Ponmudi mist will follow you all week. Oola situation.",
-    "Eda {user}, the universe clocked your language and has booked you 45 minutes of KD Puram traffic with zero phone charge. Chumma.",
-    "Aiyo {user}, saying that near Chalai Market? Cosmos says you will lose your wallet AND your dignity this week.",
-    "{user}, Navi did not make this happen — your own words did. Thampanoor bus stand, 2 hours, bus never comes. Shokam.",
-    "Eda {user}, the stars noted your vocabulary. Museum Campus traffic during peak hour is your cosmic punishment. Karma is a KSRTC bus.",
-    "{user}, the universe heard that word and decided: Indian Coffee House, all evening, cutlet sold out. Your doing, not mine. Chumma.",
-    "Aiyo {user}, Chalai Market at night is shokam enough — your words made it worse. Zam Zam ran out of shawarma. Self-inflicted.",
+    "Hey {user}, the universe clocked that word — expect 45 minutes of peak-hour traffic with no phone charge.",
+    "{user}, the cosmos heard you and has scheduled a minor inconvenience: two-hour wait, bus never comes.",
+    "{user}, not great language — the stars have noted it. Wallet and dignity, same week, gone.",
+    "The universe heard that, {user}. Your next cutlet order will be sold out. Self-inflicted.",
+    "{user}, bold word choice. The cosmos has flagged your account. Expect delays.",
+    "Noted, {user}. The universe has booked you a broken umbrella on a rainy day. Your words, your problem.",
+    "{user}, the stars logged that. Something mildly terrible is now pending in your schedule.",
 ]
 
 # ---------------------------------------------------------------------------
@@ -77,11 +77,11 @@ DOOMED_PREDICTIONS: list[str] = [
 # ---------------------------------------------------------------------------
 
 CURSE_BACK_REPLIES: list[str] = [
-    "Aiyo {user}, the cosmos saw what you typed. Ponmudi mist will be your future — unclear and damp.",
-    "Eda {user}, that word? The stars billed it to your account. KSRTC bus at Thampanoor — not moving, like your luck.",
-    "{user}, the universe has a ledger. That word just added one shokam entry. Navi is merely the messenger — hey! listen! she tried to warn you.",
-    "Aiyo {user}, the stars decided — go drink chaya at thattukada and reflect on your word choices. Oola.",
-    "{user}, the cosmos heard that. Ninte future darker than KD Puram at 7pm. Your words, your karma. Shokam.",
+    "{user}, the cosmos saw that. Your next commute will be longer than it should be.",
+    "{user}, the universe has a ledger. That word just added an entry. Good luck out there.",
+    "Noted, {user}. The stars have flagged your account for minor future inconveniences.",
+    "{user}, the cosmos heard that. Something slightly annoying is now pending for you.",
+    "{user}, bold choice of words. The universe took note. Results incoming.",
 ]
 
 # ---------------------------------------------------------------------------
