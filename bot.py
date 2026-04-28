@@ -44,6 +44,7 @@ from schema import (
     get_user_strikes,
     increment_user_strikes,
     reset_user_strikes,
+    reset_all_strikes,
     DB_PATH,
 )
 from glossary import RASHIS
@@ -274,11 +275,6 @@ async def _release_from_jail(member: discord.Member, role: discord.Role, delay_s
     except Exception as exc:
         logger.warning("Could not remove jail role from %s: %s", member.display_name, exc)
 
-
-def _contains_severe_curse(text: str) -> bool:
-    """Return True if text contains any SEVERE_CURSE_WORDS."""
-    lower = text.lower()
-    return any(re.search(rf"\b{re.escape(w)}\b", lower) for w in SEVERE_CURSE_WORDS)
 
 
 # ---------------------------------------------------------------------------
@@ -715,10 +711,10 @@ async def on_message(message: discord.Message) -> None:
         # Always return after a mention — never double-trigger slang detection
         return
 
-    # ---- Legacy prefix "navi" command ----
-    if message.content.lower().startswith("navi"):
+    # ---- Legacy prefix "navi" command — only triggers on the exact word "navi" ----
+    if re.match(r'^navi\b', message.content, re.IGNORECASE):
 
-        # "navi @username" → curse/roast the mentioned user (instant, no API)
+        # "navi @username" → curse/roast the mentioned user (with reversal logic)
         if message.mentions:
             target = message.mentions[0]
             # Don't curse the bot itself
@@ -756,28 +752,26 @@ async def on_message(message: discord.Message) -> None:
             logger.info("%s cursed %s via prefix command", message.author.display_name, target.display_name)
             return
 
-        # "navi" with no mention → full prediction for the sender
+        # "navi" as a reply to someone → curse the person whose message was replied to
+        if message.reference:
+            resolved = message.reference.resolved or message.reference.cached_message
+            if isinstance(resolved, discord.Message) and not resolved.author.bot:
+                target = resolved.author
+                curse_word = get_random_curse()
+                curse_reply = f"{curse_word} {target.mention}"
+                await message.reply(curse_reply)
+                log_curse(db_conn, target.id, target.display_name, "proxy_navi_reply")
+                logger.info("%s cursed %s via navi reply", message.author.display_name, target.display_name)
+                return
+
+        # "navi" with no mention and no reply → curse the sender
         target = message.author
-        display_name = target.display_name
-        mention_str = target.mention
-
-        # Record usage and get count for tiered cache routing
-        usage_count = get_user_minute_count(target.id, increment=True)
-
-        if FREE_TIER_MODE:
-            async with message.channel.typing():
-                prediction = await get_navi_prediction(target.id, display_name, usage_count=usage_count)
-        else:
-            prediction = await get_navi_prediction(target.id, display_name, usage_count=usage_count)
-
-        final_reply = prediction.replace(display_name, mention_str)
-        await message.reply(final_reply)
+        curse_word = get_random_curse()
+        curse_reply = f"{curse_word} {target.mention}"
+        await message.reply(curse_reply)
+        log_curse(db_conn, target.id, target.display_name, "proxy_navi_self")
+        logger.info("%s got self-cursed via navi prefix", target.display_name)
         return
-
-    # ---- Strike check: severe curse words ----
-    if _feat("feature_strikes") and _contains_severe_curse(message.content):
-        if isinstance(message.author, discord.Member):
-            await _handle_strike(message.author, message.channel)
 
     # ---- Passive curse word reply ----
     curse_chance = get_config_float(db_conn, "curse_reply_chance", 0.25)
@@ -1695,6 +1689,15 @@ class AdminGroup(app_commands.Group):
             f"Link summary emoji set to **{emoji.strip()}**. React with it on any message containing a URL to get a summary.",
             ephemeral=True,
         )
+
+    @app_commands.command(name="reset_all_strikes", description="Reset every user's strike count to 0")
+    async def reset_all_strikes_cmd(self, interaction: discord.Interaction) -> None:
+        affected = reset_all_strikes(db_conn)
+        await interaction.response.send_message(
+            f"✅ All strikes cleared. **{affected}** user(s) had their strike count reset to 0.",
+            ephemeral=True,
+        )
+        logger.info("reset_all_strikes executed by %s — %d users affected", interaction.user.display_name, affected)
 
     @app_commands.command(name="config_view", description="View all active feature flags, probabilities, and cooldowns")
     async def config_view(self, interaction: discord.Interaction) -> None:

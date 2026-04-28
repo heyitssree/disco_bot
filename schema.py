@@ -587,6 +587,16 @@ def reset_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> None:
     ))
 
 
+def reset_all_strikes(conn: duckdb.DuckDBPyConnection) -> int:
+    """Reset strikes to 0 for every user. Returns the number of rows affected."""
+    count = conn.execute("SELECT COUNT(*) FROM user_stats WHERE strikes > 0").fetchone()[0]
+    _db_write(lambda: (
+        conn.execute("UPDATE user_stats SET strikes = 0"),
+        conn.commit(),
+    ))
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Local Knowledge seed
 # ---------------------------------------------------------------------------
