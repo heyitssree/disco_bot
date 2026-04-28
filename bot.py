@@ -112,7 +112,6 @@ PAID_API_KEY = os.getenv("GEMINI_API_KEY_PAID") or os.getenv("GEMINI_API_KEY")
 FREE_TIER_MODE = os.getenv("FREE_TIER_MODE", "true").lower() == "true"
 GENERAL_CHANNEL = os.getenv("GENERAL_CHANNEL", "general")
 MOD_CHANNEL_NAME = os.getenv("MOD_CHANNEL_NAME", "mod-log")
-JAIL_ROLE_NAME = os.getenv("JAIL_ROLE_NAME", "Thampanoor Jail")
 
 # Bot owner's Discord user ID — MUST match the owner of the bot application.
 # Set OWNER_ID in .env so no other user can ever invoke /admin commands.
@@ -221,59 +220,30 @@ async def _check_vibe(message: discord.Message) -> None:
 # Strike system helpers (Feature 7)
 # ---------------------------------------------------------------------------
 
-_JAIL_TIMEOUT_MINUTES = 5
-
-
 async def _handle_strike(member: discord.Member, channel: discord.abc.Messageable) -> None:
-    """Increment strike counter and apply the appropriate penalty."""
+    """Increment strike counter and issue a public warning. At 3 strikes, alert the mod channel and reset."""
     new_strikes = increment_user_strikes(db_conn, member.id)
 
     if new_strikes == 1:
-        await channel.send(
-            f"{member.mention} — Strike 1. Watch the language. Two more and you're in timeout."
-        )
+        await channel.send(f"{member.mention} — Strike 1. Two more and the mod team gets notified.")
         logger.info("Strike 1 issued to %s", member.display_name)
 
     elif new_strikes == 2:
-        await channel.send(
-            f"{member.mention} — Strike 2. You've been sent to **Timeout** for {_JAIL_TIMEOUT_MINUTES} minutes. Use the time wisely."
-        )
-        # Assign jail role if it exists on the guild
-        if isinstance(channel, discord.TextChannel):
-            jail_role = discord.utils.get(channel.guild.roles, name=JAIL_ROLE_NAME)
-            if jail_role:
-                try:
-                    await member.add_roles(jail_role, reason="Navi Strike 2 — Thampanoor Jail")
-                    asyncio.create_task(_release_from_jail(member, jail_role, _JAIL_TIMEOUT_MINUTES * 60))
-                except discord.Forbidden:
-                    logger.warning("Missing permissions to assign jail role to %s", member.display_name)
-        logger.info("Strike 2 — %s jailed for %d min", member.display_name, _JAIL_TIMEOUT_MINUTES)
+        await channel.send(f"{member.mention} — Strike 2. One more and this escalates.")
+        logger.info("Strike 2 issued to %s", member.display_name)
 
     elif new_strikes >= 3:
         reset_user_strikes(db_conn, member.id)
-        # Alert mod channel
         mod_ch = None
         if isinstance(channel, discord.TextChannel):
             mod_ch = discord.utils.get(channel.guild.text_channels, name=MOD_CHANNEL_NAME)
         if mod_ch:
             await mod_ch.send(
-                f"🚨 **Mod Alert:** {member.mention} just hit **3 strikes**. "
-                f"Time to consider the ban hammer. Their strikes have been reset to 0."
+                f"🚨 **Mod Alert:** {member.mention} has hit **3 strikes**. "
+                f"Strikes have been reset to 0 — further action is up to the mod team."
             )
-        await channel.send(
-            f"🚨 {member.mention} — **3 strikes**. Mod team has been notified. Strikes reset to 0."
-        )
-        logger.info("Strike 3 alert sent for %s — strikes reset", member.display_name)
-
-
-async def _release_from_jail(member: discord.Member, role: discord.Role, delay_seconds: int) -> None:
-    """Remove jail role after delay_seconds."""
-    await asyncio.sleep(delay_seconds)
-    try:
-        await member.remove_roles(role, reason="Navi jail sentence served")
-        logger.info("Released %s from Thampanoor Jail", member.display_name)
-    except Exception as exc:
-        logger.warning("Could not remove jail role from %s: %s", member.display_name, exc)
+        await channel.send(f"🚨 {member.mention} — 3 strikes. Mod team has been notified.")
+        logger.info("Strike 3 — mod channel alerted for %s, strikes reset", member.display_name)
 
 
 
