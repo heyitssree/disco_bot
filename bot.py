@@ -67,6 +67,8 @@ from prompts import (
     MODA_INTROS,
     BOT_SELF_CURSE_REPLIES,
     BOT_LOOP_CURSE_REPLIES,
+    BOT_SELF_COMPLIMENT_REPLIES,
+    BOT_LOOP_COMPLIMENT_REPLIES,
     SPAM_WRAPPERS,
     LEVEL_UP_MESSAGES,
     LINK_USERNAME,
@@ -75,6 +77,7 @@ from curses import (
     CURSE_WORDS,
     SEVERE_CURSE_WORDS,
     get_random_curse,
+    get_random_compliment,
     get_random_doomed_prediction,
     get_random_curse_back,
     get_random_kochi_response,
@@ -753,6 +756,52 @@ async def on_message(message: discord.Message) -> None:
         await message.reply(curse_reply)
         log_curse(db_conn, target.id, target.display_name, "proxy_navi_self")
         logger.info("%s got self-cursed via navi prefix", target.display_name)
+        return
+
+    # ---- "chunk @user" — compliment command (mirrors navi prefix) ----
+    if re.match(r'^chunk\b', message.content, re.IGNORECASE):
+
+        def _send_compliment(target: discord.Member | discord.User) -> tuple[str, int]:
+            compliment = get_random_compliment()
+            word, meaning, tier, pts = compliment["word"], compliment["meaning"], compliment["tier"], compliment["points"]
+            reply = (
+                f"{word} {target.mention}! ✨\n"
+                f"*({meaning} — {tier}, +{pts} Boli Points)*"
+            )
+            return reply, pts
+
+        # "chunk @mention" → compliment the mentioned user
+        if message.mentions:
+            target = message.mentions[0]
+            if target.id == bot.user.id:
+                await message.reply(random.choice(BOT_SELF_COMPLIMENT_REPLIES))
+                return
+            if target.bot:
+                await message.reply(f"{message.author.mention} {random.choice(BOT_LOOP_COMPLIMENT_REPLIES)}")
+                return
+            reply, pts = _send_compliment(target)
+            update_boli_points(db_conn, target.id, pts)
+            await message.reply(reply)
+            logger.info("%s complimented %s (+%d pts)", message.author.display_name, target.display_name, pts)
+            return
+
+        # "chunk" as reply → compliment the replied-to user
+        if message.reference:
+            resolved = message.reference.resolved or message.reference.cached_message
+            if isinstance(resolved, discord.Message) and not resolved.author.bot:
+                target = resolved.author
+                reply, pts = _send_compliment(target)
+                update_boli_points(db_conn, target.id, pts)
+                await message.reply(reply)
+                logger.info("%s complimented %s via reply (+%d pts)", message.author.display_name, target.display_name, pts)
+                return
+
+        # "chunk" alone → compliment the sender
+        target = message.author
+        reply, pts = _send_compliment(target)
+        update_boli_points(db_conn, target.id, pts)
+        await message.reply(reply)
+        logger.info("%s self-complimented (+%d pts)", target.display_name, pts)
         return
 
     # ---- Passive curse word reply ----

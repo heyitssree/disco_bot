@@ -380,6 +380,24 @@ BOT_LOOP_CURSE_REPLIES: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
+# Compliment command protection replies
+# ---------------------------------------------------------------------------
+
+BOT_SELF_COMPLIMENT_REPLIES: list[str] = [
+    "Compliment myself? I already know I'm iconic.",
+    "I don't need validation. I'm the bot. But appreciated.",
+    "Peak perfection doesn't require compliments. Still, noted.",
+    "I'm already at max hype. But the gesture is understood.",
+]
+
+BOT_LOOP_COMPLIMENT_REPLIES: list[str] = [
+    "I'm not hyping up a bot. Pick a human.",
+    "Bot-to-bot compliments? That's not a thing here.",
+    "Bots don't need hype. Try a real person.",
+    "I only compliment humans. Try again.",
+]
+
+# ---------------------------------------------------------------------------
 # Spam / repeat-use wrappers (when user requests prediction multiple times)
 # ---------------------------------------------------------------------------
 

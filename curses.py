@@ -10,12 +10,12 @@ import random
 # ---------------------------------------------------------------------------
 
 CURSE_WORDS: list[str] = [
-    "pottan", "potti", "mandan", "mandabuddhi", "modan",
-    "vattan", "vatti", "oola", "thallippoli", "vivaramillathavan",
-    "buddhisunyan", "madiyan", "madichi", "vayadi", "kozhi",
-    "kunjamma", "paala", "enapechi", "kanda mrigam", "kochu kalla",
-    "dushtan", "chunk", "loose", "kumpidi", "pokri",
-    "veruppirayan", "alavalathi", "shasi", "gundabiju", "kuzhappakkaran",
+    "pottan", "potti", "mandan", "mandi", "modan",
+    "vattan", "vatti", "oolan", "thallippoli", "vivaramillathavan",
+    "buddhisunyan", "madiyan", "madichi", "vayadi", "kozhi", "girirajankozhi",
+    "kokachi", "vazha", "enampechi", "kaandamrigam", "perum kallan",
+    "dushtan", "convincing star", "loose", "kumbidi", "pokri",
+    "veruppikkal star", "alavalathi", "shasi", "gundabiju", "kuzhappakkaran",
 ]
 
 # Severe subset that triggers the 3-strike system (Feature 7)
@@ -83,6 +83,37 @@ CURSE_BACK_REPLIES: list[str] = [
     "{user}, the cosmos heard that. Something slightly annoying is now pending for you.",
     "{user}, bold choice of words. The universe took note. Results incoming.",
 ]
+
+# ---------------------------------------------------------------------------
+# Compliment tier list (used by "chunk @user" command)
+# ---------------------------------------------------------------------------
+
+COMPLIMENTS: list[dict] = [
+    # Tier 1 — Affectionate & Sweet (5 pts)
+    {"word": "muthe",        "meaning": "pearl / dear",         "tier": "Affectionate & Sweet", "points": 5},
+    {"word": "chakkara",     "meaning": "sugar / sweetheart",   "tier": "Affectionate & Sweet", "points": 5},
+    {"word": "ponnumuthe",   "meaning": "golden pearl",         "tier": "Affectionate & Sweet", "points": 5},
+    {"word": "uyir",         "meaning": "life / my everything", "tier": "Affectionate & Sweet", "points": 5},
+    {"word": "pookie", "meaning": "pookie", "tier": "Adorable & Sweet", "points": 5},
+    # Tier 2 — Friendship (10 pts)
+    {"word": "chunk",        "meaning": "best friend",          "tier": "Friendship",           "points": 10},
+    {"word": "machane",      "meaning": "bro / buddy",          "tier": "Friendship",           "points": 10},
+    {"word": "chankidippi",  "meaning": "heartbeat / bestie",   "tier": "Friendship",           "points": 10},
+    {"word": "aliyan",       "meaning": "bestie / bro",         "tier": "Friendship",           "points": 10},
+    # Tier 3 — Hype & Legend (15 pts)
+    {"word": "puli",         "meaning": "tiger / legend",       "tier": "Hype & Legend",        "points": 15},
+    {"word": "killadi",      "meaning": "master / legend",      "tier": "Hype & Legend",        "points": 15},
+    {"word": "kiduve",       "meaning": "awesome person",       "tier": "Hype & Legend",        "points": 15},
+    {"word": "poli",         "meaning": "fire / awesome",       "tier": "Hype & Legend",        "points": 15},
+    {"word": "mass",         "meaning": "legendary / swag",     "tier": "Hype & Legend",        "points": 15},
+    {"word": "minnal",       "meaning": "lightning / stunning", "tier": "Hype & Legend",        "points": 15},
+]
+
+
+def get_random_compliment() -> dict:
+    """Returns a random compliment dict with word, meaning, tier, and points."""
+    return random.choice(COMPLIMENTS)
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
