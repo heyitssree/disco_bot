@@ -10,28 +10,28 @@ import random
 # ---------------------------------------------------------------------------
 
 CURSE_WORDS: list[dict] = [
-    # Tier 1 — Mild (target loses 5 pts, invoker loses 2 pts)
-    {"word": "madiyan",  "meaning": "lazy",       "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
-    {"word": "kozhi",    "meaning": "flirt",       "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
-    {"word": "vayadi",   "meaning": "chatterbox",  "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
-    {"word": "mandan",   "meaning": "fool",        "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
-    {"word": "pottan",   "meaning": "idiot",       "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
+    # Tier 1 — Low risk, low reward
+    {"word": "madiyan",      "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
+    {"word": "kozhi",        "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
+    {"word": "vayadi",       "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
+    {"word": "mandan",       "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
+    {"word": "pottan",       "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
 
-    # Tier 2 — Moderate (target loses 10 pts, invoker loses 4 pts)
-    {"word": "vattan",   "meaning": "crazy",                  "tier": "Moderate", "points_lost": 5, "multiplier": 2},
-    {"word": "oolan",    "meaning": "useless",                "tier": "Moderate", "points_lost": 5, "multiplier": 2},
-    {"word": "shasi",    "meaning": "clown/embarrassment",    "tier": "Moderate", "points_lost": 5, "multiplier": 2},
-    {"word": "vazha",    "meaning": "useless plant",          "tier": "Moderate", "points_lost": 5, "multiplier": 2},
-    {"word": "kumbidi",  "meaning": "fraud",                  "tier": "Moderate", "points_lost": 5, "multiplier": 2},
-    {"word": "kalippan", "meaning": "worthless person",       "tier": "Moderate", "points_lost": 5, "multiplier": 2},
-    {"word": "durantham", "meaning": "disaster",              "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+    # Tier 2 — Medium risk, medium reward
+    {"word": "vattan",       "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
+    {"word": "oolan",        "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
+    {"word": "shasi",        "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
+    {"word": "vazha",        "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
+    {"word": "kumbidi",      "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
+    {"word": "kalippan",     "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
+    {"word": "durantham",    "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
 
-    # Tier 3 — Severe (target loses 15 pts, invoker loses 6 pts)
-    {"word": "thallippoli",    "meaning": "worthless",      "tier": "Severe", "points_lost": 7, "multiplier": 3},
-    {"word": "perum kallan",   "meaning": "master thief",   "tier": "Severe", "points_lost": 7, "multiplier": 3},
-    {"word": "dushtan",        "meaning": "evil person",    "tier": "Severe", "points_lost": 7, "multiplier": 3},
-    {"word": "kuzhappakkaran", "meaning": "troublemaker",   "tier": "Severe", "points_lost": 7, "multiplier": 3},
-    {"word": "alavalathi",     "meaning": "vagabond/nuisance", "tier": "Severe", "points_lost": 7, "multiplier": 3},
+    # Tier 3 — High risk, high reward
+    {"word": "thallippoli",    "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
+    {"word": "perum kallan",   "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
+    {"word": "dushtan",        "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
+    {"word": "kuzhappakkaran", "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
+    {"word": "alavalathi",     "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
 ]
 
 # Severe subset that triggers the 3-strike system (Feature 7).
@@ -144,27 +144,22 @@ def get_random_compliment() -> dict:
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def get_random_curse_dict() -> dict:
-    """Returns a random curse entry dict (with word, tier, points_lost, multiplier)."""
+def get_random_curse() -> dict:
+    """Returns a random curse entry dict (word, tier, target_damage, invoker_reward, backfire_chance)."""
     return random.choice(CURSE_WORDS)
-
-
-def get_random_curse() -> str:
-    """Returns a random curse word string (for passive detection replies)."""
-    return random.choice(CURSE_WORDS)["word"]
 
 
 def get_random_doomed_prediction(username: str) -> str:
     """Returns a filled doomed prediction template."""
     template = random.choice(DOOMED_PREDICTIONS)
-    curse = get_random_curse()
+    curse = get_random_curse()["word"]
     return template.format(user=username, curse=curse)
 
 
 def get_random_curse_back(username: str) -> str:
     """Returns a filled curse-back template."""
     template = random.choice(CURSE_BACK_REPLIES)
-    curse = get_random_curse()
+    curse = get_random_curse()["word"]
     return template.format(user=username, curse=curse)
 
 

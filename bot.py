@@ -48,6 +48,9 @@ from schema import (
     set_user_points,
     get_daily_action_count,
     increment_daily_action_count,
+    get_extra_actions,
+    decrement_extra_actions,
+    add_extra_actions,
     DB_PATH,
 )
 from glossary import RASHIS
@@ -80,7 +83,6 @@ from curses import (
     CURSE_WORDS,
     SEVERE_CURSE_WORDS,
     get_random_curse,
-    get_random_curse_dict,
     get_random_compliment,
     get_random_doomed_prediction,
     get_random_curse_back,
@@ -757,46 +759,51 @@ async def on_message(message: discord.Message) -> None:
 
             # --- Daily quota check ---
             daily_count = get_daily_action_count(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA:
+            extra_actions = get_extra_actions(db_conn, invoker.id)
+            if daily_count >= _DAILY_QUOTA + extra_actions:
                 update_boli_points(db_conn, invoker.id, -5)
                 over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
                 await message.reply(over_msg)
                 logger.info("%s exceeded daily curse quota — reverse-cursed (-5 pts)", invoker.display_name)
                 return
 
-            curse_dict = get_random_curse_dict()
-            curse_word = curse_dict["word"]
+            # --- Vampiric Karma Gamble ---
+            curse_data = get_random_curse()
+            curse_word = curse_data["word"]
 
-            app_info = await bot.application_info()
-            owner_reversal_chance = get_config_float(db_conn, "reversal_chance_owner", 0.45)
             if has_active_perk(db_conn, target.id, "curse_protection"):
                 reversal_chance = 1.0
-            elif target.id == app_info.owner.id:
-                reversal_chance = owner_reversal_chance
             else:
-                reversal_chance = 0.10
+                reversal_chance = curse_data["backfire_chance"]
 
-            # Passive reversal — does NOT consume daily quota
-            if random.random() < reversal_chance:
-                curse_reply = f"Eda {invoker.mention}, you tried to curse {target.display_name}, but the stars reversed it. {curse_word}!"
-                await message.reply(curse_reply)
-                log_curse(db_conn, invoker.id, invoker.display_name, "proxy_navi_reverse")
-                logger.info("Proxy curse reversed! %s → %s", invoker.display_name, target.display_name)
-                return  # quota not incremented for reversals
-
-            # Apply tiered curse — no mention on target
-            target_loss = curse_dict["points_lost"]
-            invoker_loss = 2 * curse_dict["multiplier"]
-            update_boli_points(db_conn, target.id, -target_loss)
-            update_boli_points(db_conn, invoker.id, -invoker_loss)
             increment_daily_action_count(db_conn, invoker.id)
-            log_curse(db_conn, target.id, target.display_name, curse_word)
-            await message.reply(f"{curse_word} {target.display_name}")
-            logger.info(
-                "%s cursed %s [%s, -%d target, -%d invoker]",
-                invoker.display_name, target.display_name,
-                curse_dict["tier"], target_loss, invoker_loss,
-            )
+            if daily_count >= _DAILY_QUOTA:
+                decrement_extra_actions(db_conn, invoker.id)
+
+            if random.random() < reversal_chance:
+                # Backfire — invoker takes double damage, target unharmed
+                points_lost = curse_data["target_damage"] * 2
+                update_boli_points(db_conn, invoker.id, -points_lost)
+                log_curse(db_conn, invoker.id, invoker.display_name, f"backfire_{curse_word}")
+                await message.reply(
+                    f"The cosmos rejected your negativity, {invoker.display_name}. "
+                    f"The curse bounced back and hit you for {points_lost} points. {curse_word}!"
+                )
+                logger.info(
+                    "Curse backfired on %s [%s, -%d invoker]",
+                    invoker.display_name, curse_data["tier"], points_lost,
+                )
+            else:
+                # Success — target loses, invoker gains
+                update_boli_points(db_conn, target.id, -curse_data["target_damage"])
+                update_boli_points(db_conn, invoker.id, curse_data["invoker_reward"])
+                log_curse(db_conn, target.id, target.display_name, curse_word)
+                await message.reply(f"{curse_word} {target.display_name}")
+                logger.info(
+                    "%s cursed %s [%s, -%d target, +%d invoker]",
+                    invoker.display_name, target.display_name,
+                    curse_data["tier"], curse_data["target_damage"], curse_data["invoker_reward"],
+                )
             return
 
         # "navi" as a reply to someone → curse the replied-to user
@@ -805,33 +812,39 @@ async def on_message(message: discord.Message) -> None:
             if isinstance(resolved, discord.Message) and not resolved.author.bot:
                 target = resolved.author
                 daily_count = get_daily_action_count(db_conn, invoker.id)
-                if daily_count >= _DAILY_QUOTA:
+                extra_actions = get_extra_actions(db_conn, invoker.id)
+                if daily_count >= _DAILY_QUOTA + extra_actions:
                     update_boli_points(db_conn, invoker.id, -5)
                     over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
                     await message.reply(over_msg)
                     return
-                curse_dict = get_random_curse_dict()
-                update_boli_points(db_conn, target.id, -curse_dict["points_lost"])
-                update_boli_points(db_conn, invoker.id, -(2 * curse_dict["multiplier"]))
+                curse_data = get_random_curse()
+                update_boli_points(db_conn, target.id, -curse_data["target_damage"])
+                update_boli_points(db_conn, invoker.id, curse_data["invoker_reward"])
                 increment_daily_action_count(db_conn, invoker.id)
+                if daily_count >= _DAILY_QUOTA:
+                    decrement_extra_actions(db_conn, invoker.id)
                 log_curse(db_conn, target.id, target.display_name, "proxy_navi_reply")
-                await message.reply(f"{curse_dict['word']} {target.display_name}")
+                await message.reply(f"{curse_data['word']} {target.display_name}")
                 logger.info("%s cursed %s via navi reply", invoker.display_name, target.display_name)
                 return
 
         # "navi" with no mention and no reply → self-curse
         target = invoker
         daily_count = get_daily_action_count(db_conn, invoker.id)
-        if daily_count >= _DAILY_QUOTA:
+        extra_actions = get_extra_actions(db_conn, invoker.id)
+        if daily_count >= _DAILY_QUOTA + extra_actions:
             update_boli_points(db_conn, invoker.id, -5)
             over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
             await message.reply(over_msg)
             return
-        curse_dict = get_random_curse_dict()
-        update_boli_points(db_conn, target.id, -curse_dict["points_lost"])
+        curse_data = get_random_curse()
+        update_boli_points(db_conn, target.id, -curse_data["target_damage"])
         increment_daily_action_count(db_conn, invoker.id)
+        if daily_count >= _DAILY_QUOTA:
+            decrement_extra_actions(db_conn, invoker.id)
         log_curse(db_conn, target.id, target.display_name, "proxy_navi_self")
-        await message.reply(f"{curse_dict['word']} {target.display_name}")
+        await message.reply(f"{curse_data['word']} {target.display_name}")
         logger.info("%s got self-cursed via navi prefix", target.display_name)
         return
 
@@ -855,7 +868,8 @@ async def on_message(message: discord.Message) -> None:
                 return
 
             daily_count = get_daily_action_count(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA:
+            extra_actions = get_extra_actions(db_conn, invoker.id)
+            if daily_count >= _DAILY_QUOTA + extra_actions:
                 # Recipient still gets the blessing message, but NO points
                 reply, _ = _bless_target(target, award_points=False)
                 await message.reply(reply)
@@ -869,9 +883,12 @@ async def on_message(message: discord.Message) -> None:
 
             reply, pts = _bless_target(target, award_points=True)
             update_boli_points(db_conn, target.id, pts)
+            update_boli_points(db_conn, invoker.id, 1)
             increment_daily_action_count(db_conn, invoker.id)
+            if daily_count >= _DAILY_QUOTA:
+                decrement_extra_actions(db_conn, invoker.id)
             await message.reply(reply)
-            logger.info("%s blessed %s (+%d pts)", invoker.display_name, target.display_name, pts)
+            logger.info("%s blessed %s (+%d pts, invoker +1 karma)", invoker.display_name, target.display_name, pts)
             return
 
         # "chunk" as reply → bless the replied-to user
@@ -880,7 +897,8 @@ async def on_message(message: discord.Message) -> None:
             if isinstance(resolved, discord.Message) and not resolved.author.bot:
                 target = resolved.author
                 daily_count = get_daily_action_count(db_conn, invoker.id)
-                if daily_count >= _DAILY_QUOTA:
+                extra_actions = get_extra_actions(db_conn, invoker.id)
+                if daily_count >= _DAILY_QUOTA + extra_actions:
                     reply, _ = _bless_target(target, award_points=False)
                     await message.reply(reply)
                     curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
@@ -890,15 +908,19 @@ async def on_message(message: discord.Message) -> None:
                     return
                 reply, pts = _bless_target(target, award_points=True)
                 update_boli_points(db_conn, target.id, pts)
+                update_boli_points(db_conn, invoker.id, 1)
                 increment_daily_action_count(db_conn, invoker.id)
+                if daily_count >= _DAILY_QUOTA:
+                    decrement_extra_actions(db_conn, invoker.id)
                 await message.reply(reply)
-                logger.info("%s blessed %s via reply (+%d pts)", invoker.display_name, target.display_name, pts)
+                logger.info("%s blessed %s via reply (+%d pts, invoker +1 karma)", invoker.display_name, target.display_name, pts)
                 return
 
         # "chunk" alone → self-bless
         target = invoker
         daily_count = get_daily_action_count(db_conn, invoker.id)
-        if daily_count >= _DAILY_QUOTA:
+        extra_actions = get_extra_actions(db_conn, invoker.id)
+        if daily_count >= _DAILY_QUOTA + extra_actions:
             reply, _ = _bless_target(target, award_points=False)
             await message.reply(reply)
             curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
@@ -908,9 +930,12 @@ async def on_message(message: discord.Message) -> None:
             return
         reply, pts = _bless_target(target, award_points=True)
         update_boli_points(db_conn, target.id, pts)
+        update_boli_points(db_conn, invoker.id, 1)
         increment_daily_action_count(db_conn, invoker.id)
+        if daily_count >= _DAILY_QUOTA:
+            decrement_extra_actions(db_conn, invoker.id)
         await message.reply(reply)
-        logger.info("%s self-blessed (+%d pts)", target.display_name, pts)
+        logger.info("%s self-blessed (+%d pts, +1 karma)", target.display_name, pts)
         return
 
     # ---- Passive curse word reply ----
@@ -1942,6 +1967,13 @@ _SHOP_ITEMS: dict[str, dict] = {
         "emoji": "🌟",
         "duration_hours": 0,  # permanent until next purchase
     },
+    "action_refill": {
+        "name": "10x Cosmic Actions Refill",
+        "cost": 30,
+        "description": "Instantly adds 10 extra curses/blessings to your quota. Use them wisely.",
+        "emoji": "🔋",
+        "duration_hours": 0,
+    },
 }
 
 
@@ -1982,6 +2014,7 @@ class ShopGroup(app_commands.Group):
     @app_commands.choices(item=[
         app_commands.Choice(name="🛡️ Curse Protection (20 pts)", value="curse_protection"),
         app_commands.Choice(name="🌟 Customize Rashi (40 pts)", value="custom_rashi"),
+        app_commands.Choice(name="🔋 10x Cosmic Actions Refill (30 pts)", value="action_refill"),
     ])
     async def buy(
         self,
@@ -2055,6 +2088,17 @@ class ShopGroup(app_commands.Group):
                 ephemeral=True,
             )
             logger.info("%s purchased Custom Rashi: %s", interaction.user.display_name, matched)
+
+        # --- Action Refill ---
+        elif item == "action_refill":
+            update_boli_points(db_conn, interaction.user.id, -cost)
+            add_extra_actions(db_conn, interaction.user.id, 10)
+            await interaction.response.send_message(
+                f"🔋 Refill successful! {interaction.user.mention}, you have 10 extra cosmic actions added to your quota. Go cause some chaos.\n"
+                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+                ephemeral=True,
+            )
+            logger.info("%s purchased Action Refill (+10 extra actions)", interaction.user.display_name)
 
 
 tree.add_command(ShopGroup())

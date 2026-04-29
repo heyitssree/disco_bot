@@ -104,7 +104,8 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             rashi           VARCHAR,
             boli_points     INTEGER DEFAULT 0,
             last_seen       TIMESTAMP DEFAULT current_timestamp,
-            prediction_count INTEGER DEFAULT 0
+            prediction_count INTEGER DEFAULT 0,
+            extra_actions   INTEGER DEFAULT 0
         )
     """)
 
@@ -236,6 +237,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS strikes INTEGER DEFAULT 0")
     conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS daily_action_count INTEGER DEFAULT 0")
     conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS last_action_date DATE")
+    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS extra_actions INTEGER DEFAULT 0")
 
     conn.commit()
 
@@ -310,7 +312,8 @@ def get_user_profile(
 ) -> dict | None:
     """Return user profile dict or None if user doesn't exist."""
     row = conn.execute(
-        "SELECT user_id, username, rashi, boli_points, last_seen, prediction_count "
+        "SELECT user_id, username, rashi, boli_points, last_seen, prediction_count, "
+        "daily_action_count, last_action_date, extra_actions "
         "FROM user_stats WHERE user_id = ?",
         [user_id],
     ).fetchone()
@@ -323,6 +326,9 @@ def get_user_profile(
         "boli_points": row[3],
         "last_seen": row[4],
         "prediction_count": row[5],
+        "daily_action_count": row[6],
+        "last_action_date": row[7],
+        "extra_actions": row[8],
     }
 
 
@@ -878,6 +884,36 @@ def increment_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) 
         "SELECT daily_action_count FROM user_stats WHERE user_id = ?", [user_id]
     ).fetchone()
     return int(row[0]) if row and row[0] else 1
+
+
+def get_extra_actions(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+    """Return the number of purchased extra actions remaining for a user."""
+    row = conn.execute(
+        "SELECT extra_actions FROM user_stats WHERE user_id = ?", [user_id]
+    ).fetchone()
+    return int(row[0]) if row and row[0] else 0
+
+
+def decrement_extra_actions(conn: duckdb.DuckDBPyConnection, user_id: int) -> None:
+    """Consume one extra action token, flooring at 0."""
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE user_stats SET extra_actions = GREATEST(extra_actions - 1, 0) WHERE user_id = ?",
+            [user_id],
+        ),
+        conn.commit(),
+    ))
+
+
+def add_extra_actions(conn: duckdb.DuckDBPyConnection, user_id: int, amount: int) -> None:
+    """Add purchased extra action tokens to a user's balance."""
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE user_stats SET extra_actions = extra_actions + ? WHERE user_id = ?",
+            [amount, user_id],
+        ),
+        conn.commit(),
+    ))
 
 
 # ---------------------------------------------------------------------------
