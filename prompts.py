@@ -380,17 +380,29 @@ WELCOME_MESSAGES: list[str] = [
     "Welcome {user}. The server was fine before you arrived. Let's see if it stays that way.",
     "Hey {user}! You found us. Points for persistence, at least.",
     "{user} has entered. The rest of us have been here longer and learned nothing useful.",
+    "Look who decided to show up. Welcome to the chaos, {user}.",
+    "Door's open, {user}. Wipe your feet and find a seat.",
 ]
 
-# Moda introduction — always appended to the welcome message
+# Moda introduction — always appended to the welcome message for verified members
 MODA_INTROS: list[str] = [
-    "If you have questions, ask Moda — he's the moderator. He'll pretend to know the answer.",
-    "Our moderator Moda will help you. Results may vary.",
-    "Moda runs this server. In theory.",
-    "Ask Moda if you get lost. He'll send you in the wrong direction with full confidence.",
-    "Moda is the boss here — in the sense that he has a badge. What he does with it is anyone's guess.",
-    "Got questions? Moda's the moderator. He's very busy doing moderator things, probably.",
-    "Moda moderates this server. He takes the role very seriously. Approximately.",
+    "If you have questions, ask Moda — assuming he's not currently distracted by a fresh batch of Kuzhalappam.",
+    "Moda is the moderator here. You can usually bribe him with a packet of crispy Kuzhalappam if you break a minor rule.",
+    "Got questions? Moda's the boss. He's probably out hunting for Kuzhalappam right now, but leave a message.",
+    "Moda moderates this server. He takes the role very seriously, but he takes his daily Kuzhalappam intake even more seriously.",
+    "Our moderator Moda will help you. Unless he's on a Kuzhalappam run, in which case you are entirely on your own.",
+    "Ask Moda if you get lost. Just don't touch his Kuzhalappam stash, or you'll get banned.",
+    "Moda runs this server. He's powered entirely by caffeine and an unhealthy amount of Kuzhalappam.",
+]
+
+# Welcome messages for pending (unverified) members — no Moda intro
+PENDING_WELCOME_MESSAGES: list[str] = [
+    "Welcome to the waiting room, {user}. Verify your phone number to unlock the chat and join the chaos.",
+    "Hey {user}! You made it to the door. Now verify your phone number so we can actually hear you.",
+    "{user} is peering through the window. Complete your phone verification to step inside!",
+    "Look who's here! {user}, you're officially in 'pending' purgatory. Verify that mobile number to break free.",
+    "Welcome {user}! The bouncer needs to see your verified phone number before you can start typing.",
+    "{user} has joined, but they're muted by the cosmos. Link a phone number to your account to speak!",
 ]
 
 # ---------------------------------------------------------------------------

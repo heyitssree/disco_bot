@@ -67,6 +67,7 @@ from prompts import (
     FALLBACK_MESSAGES,
     WELCOME_MESSAGES,
     MODA_INTROS,
+    PENDING_WELCOME_MESSAGES,
     BOT_SELF_CURSE_REPLIES,
     BOT_LOOP_CURSE_REPLIES,
     BOT_SELF_COMPLIMENT_REPLIES,
@@ -600,7 +601,7 @@ async def on_close() -> None:
 
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
-    """Welcome new member after a 1-minute delay — short, funny, always includes Moda intro."""
+    """Welcome new member after a 1-minute delay, routing on verification status."""
     channel = (
         discord.utils.get(member.guild.text_channels, name=GENERAL_CHANNEL)
         or discord.utils.get(member.guild.text_channels, name="general")
@@ -619,16 +620,24 @@ async def on_member_join(member: discord.Member) -> None:
     # 1-minute delay before posting (non-blocking)
     await asyncio.sleep(60)
 
-    # Re-check the member is still in the guild after the delay
-    if member.guild.get_member(member.id) is None:
+    # Re-fetch the member so we get the most current state (pending flag, still in guild, etc.)
+    try:
+        current_member = await member.guild.fetch_member(member.id)
+    except discord.NotFound:
         logger.info("Member %s left before welcome message was sent.", member.display_name)
         return
 
-    welcome_line = random.choice(WELCOME_MESSAGES).format(user=member.mention)
-    moda_line = random.choice(MODA_INTROS)
-    await channel.send(f"{welcome_line} {moda_line}")
-
-    logger.info("Welcomed new member %s in #%s", member.display_name, channel.name)
+    if current_member.pending:
+        # User hasn't verified phone number / accepted screening rules yet
+        welcome_line = random.choice(PENDING_WELCOME_MESSAGES).format(user=current_member.mention)
+        await channel.send(welcome_line)
+        logger.info("Sent pending/verify reminder to %s in #%s", current_member.display_name, channel.name)
+    else:
+        # Fully verified — standard welcome + Moda intro
+        welcome_line = random.choice(WELCOME_MESSAGES).format(user=current_member.mention)
+        moda_line = random.choice(MODA_INTROS)
+        await channel.send(f"{welcome_line} {moda_line}")
+        logger.info("Welcomed verified member %s in #%s", current_member.display_name, channel.name)
 
 
 @bot.event
