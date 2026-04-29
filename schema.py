@@ -39,11 +39,6 @@ def _db_write(fn: Callable[[], _T]) -> _T:
     for attempt in range(_DB_RETRY_ATTEMPTS):
         try:
             result = fn()
-            try:
-                # Force WAL → main DB flush after every write
-                _conn_ref and _conn_ref.checkpoint()
-            except Exception:
-                pass
             return result
         except Exception as exc:
             msg = str(exc).lower()

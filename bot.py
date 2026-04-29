@@ -303,6 +303,9 @@ gemini_svc = None       # GeminiService
 api_mgr = None          # ApiManager
 _BOT_START_TIME = datetime.now(timezone.utc)
 
+# In-memory set of user IDs seen this session — avoids upsert_user on every message
+_seen_users: set[int] = set()
+
 # ---------------------------------------------------------------------------
 # In-memory feature toggle cache (Feature 8)
 # Loaded at startup; updated immediately on every /admin toggle command.
@@ -673,8 +676,10 @@ async def on_message(message: discord.Message) -> None:
             await message.reply(f"Ok owner, {status}")
         return
 
-    # Upsert user record on every message (lightweight)
-    upsert_user(db_conn, message.author.id, message.author.display_name)
+    # Upsert user record only on first message per session (in-memory cache to avoid DB write on every message)
+    if message.author.id not in _seen_users:
+        upsert_user(db_conn, message.author.id, message.author.display_name)
+        _seen_users.add(message.author.id)
 
     # ---- Vibe Check: lightweight heat tracker — no API cost unless triggered ----
     if _feat("feature_vibe_check"):
@@ -760,7 +765,7 @@ async def on_message(message: discord.Message) -> None:
             # --- Daily quota check ---
             daily_count = get_daily_action_count(db_conn, invoker.id)
             extra_actions = get_extra_actions(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA + extra_actions:
+            if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
                 update_boli_points(db_conn, invoker.id, -5)
                 over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
                 await message.reply(over_msg)
@@ -774,13 +779,13 @@ async def on_message(message: discord.Message) -> None:
             # Check if target has curse protection
             target_protected = has_active_perk(db_conn, target.id, "curse_protection")
 
-            if not target_protected:
-                reversal_chance = curse_data["backfire_chance"]
+            if target_protected:
+                reversal_chance = 1.0  # Protected targets always bounce the curse back
             else:
-                reversal_chance = 0.0  # No backfire for protected targets
+                reversal_chance = curse_data["backfire_chance"]
 
-            increment_daily_action_count(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA:
+            daily_count = increment_daily_action_count(db_conn, invoker.id)
+            if daily_count > _DAILY_QUOTA:
                 decrement_extra_actions(db_conn, invoker.id)
 
             if random.random() < reversal_chance:
@@ -788,10 +793,17 @@ async def on_message(message: discord.Message) -> None:
                 points_lost = curse_data["target_damage"] * 2
                 update_boli_points(db_conn, invoker.id, -points_lost)
                 log_curse(db_conn, invoker.id, invoker.display_name, f"backfire_{curse_word}")
-                await message.reply(
-                    f"The cosmos rejected your negativity, {invoker.display_name}. "
-                    f"The curse bounced back and hit you for {points_lost} points. {curse_word}!"
-                )
+                if target_protected:
+                    await message.reply(
+                        f"The cosmos rejected your negativity, {invoker.display_name}. "
+                        f"{target.display_name} is protected by a Shop Perk. "
+                        f"The curse bounced back and hit you for {points_lost} points. {curse_word}!"
+                    )
+                else:
+                    await message.reply(
+                        f"The cosmos rejected your negativity, {invoker.display_name}. "
+                        f"The curse bounced back and hit you for {points_lost} points. {curse_word}!"
+                    )
                 logger.info(
                     "Curse backfired on %s [%s, -%d invoker]",
                     invoker.display_name, curse_data["tier"], points_lost,
@@ -819,7 +831,7 @@ async def on_message(message: discord.Message) -> None:
                 target = resolved.author
                 daily_count = get_daily_action_count(db_conn, invoker.id)
                 extra_actions = get_extra_actions(db_conn, invoker.id)
-                if daily_count >= _DAILY_QUOTA + extra_actions:
+                if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
                     update_boli_points(db_conn, invoker.id, -5)
                     over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
                     await message.reply(over_msg)
@@ -827,8 +839,8 @@ async def on_message(message: discord.Message) -> None:
                 curse_data = get_random_curse()
                 update_boli_points(db_conn, target.id, -curse_data["target_damage"])
                 update_boli_points(db_conn, invoker.id, curse_data["invoker_reward"])
-                increment_daily_action_count(db_conn, invoker.id)
-                if daily_count >= _DAILY_QUOTA:
+                daily_count = increment_daily_action_count(db_conn, invoker.id)
+                if daily_count > _DAILY_QUOTA:
                     decrement_extra_actions(db_conn, invoker.id)
                 log_curse(db_conn, target.id, target.display_name, "proxy_navi_reply")
                 await message.reply(f"{curse_data['word']} {target.display_name}")
@@ -839,15 +851,15 @@ async def on_message(message: discord.Message) -> None:
         target = invoker
         daily_count = get_daily_action_count(db_conn, invoker.id)
         extra_actions = get_extra_actions(db_conn, invoker.id)
-        if daily_count >= _DAILY_QUOTA + extra_actions:
+        if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
             update_boli_points(db_conn, invoker.id, -5)
             over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
             await message.reply(over_msg)
             return
         curse_data = get_random_curse()
         update_boli_points(db_conn, target.id, -curse_data["target_damage"])
-        increment_daily_action_count(db_conn, invoker.id)
-        if daily_count >= _DAILY_QUOTA:
+        daily_count = increment_daily_action_count(db_conn, invoker.id)
+        if daily_count > _DAILY_QUOTA:
             decrement_extra_actions(db_conn, invoker.id)
         log_curse(db_conn, target.id, target.display_name, "proxy_navi_self")
         await message.reply(f"{curse_data['word']} {target.display_name}")
@@ -875,7 +887,7 @@ async def on_message(message: discord.Message) -> None:
 
             daily_count = get_daily_action_count(db_conn, invoker.id)
             extra_actions = get_extra_actions(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA + extra_actions:
+            if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
                 # Recipient still gets the blessing message, but NO points
                 reply, _ = _bless_target(target, award_points=False)
                 await message.reply(reply)
@@ -890,8 +902,8 @@ async def on_message(message: discord.Message) -> None:
             reply, pts = _bless_target(target, award_points=True)
             update_boli_points(db_conn, target.id, pts)
             update_boli_points(db_conn, invoker.id, 1)
-            increment_daily_action_count(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA:
+            daily_count = increment_daily_action_count(db_conn, invoker.id)
+            if daily_count > _DAILY_QUOTA:
                 decrement_extra_actions(db_conn, invoker.id)
             await message.reply(reply)
             logger.info("%s blessed %s (+%d pts, invoker +1 karma)", invoker.display_name, target.display_name, pts)
@@ -904,7 +916,7 @@ async def on_message(message: discord.Message) -> None:
                 target = resolved.author
                 daily_count = get_daily_action_count(db_conn, invoker.id)
                 extra_actions = get_extra_actions(db_conn, invoker.id)
-                if daily_count >= _DAILY_QUOTA + extra_actions:
+                if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
                     reply, _ = _bless_target(target, award_points=False)
                     await message.reply(reply)
                     curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
@@ -915,8 +927,8 @@ async def on_message(message: discord.Message) -> None:
                 reply, pts = _bless_target(target, award_points=True)
                 update_boli_points(db_conn, target.id, pts)
                 update_boli_points(db_conn, invoker.id, 1)
-                increment_daily_action_count(db_conn, invoker.id)
-                if daily_count >= _DAILY_QUOTA:
+                daily_count = increment_daily_action_count(db_conn, invoker.id)
+                if daily_count > _DAILY_QUOTA:
                     decrement_extra_actions(db_conn, invoker.id)
                 await message.reply(reply)
                 logger.info("%s blessed %s via reply (+%d pts, invoker +1 karma)", invoker.display_name, target.display_name, pts)
@@ -926,7 +938,7 @@ async def on_message(message: discord.Message) -> None:
         target = invoker
         daily_count = get_daily_action_count(db_conn, invoker.id)
         extra_actions = get_extra_actions(db_conn, invoker.id)
-        if daily_count >= _DAILY_QUOTA + extra_actions:
+        if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
             reply, _ = _bless_target(target, award_points=False)
             await message.reply(reply)
             curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
@@ -937,8 +949,8 @@ async def on_message(message: discord.Message) -> None:
         reply, pts = _bless_target(target, award_points=True)
         update_boli_points(db_conn, target.id, pts)
         update_boli_points(db_conn, invoker.id, 1)
-        increment_daily_action_count(db_conn, invoker.id)
-        if daily_count >= _DAILY_QUOTA:
+        daily_count = increment_daily_action_count(db_conn, invoker.id)
+        if daily_count > _DAILY_QUOTA:
             decrement_extra_actions(db_conn, invoker.id)
         await message.reply(reply)
         logger.info("%s self-blessed (+%d pts, +1 karma)", target.display_name, pts)
@@ -1538,7 +1550,8 @@ async def mod_tldr_slash(interaction: discord.Interaction) -> None:
 @app_commands.default_permissions(administrator=True)
 async def health_slash(interaction: discord.Interaction) -> None:
     app_info = await bot.application_info()
-    if interaction.user.id != app_info.owner.id:
+    is_owner = bool(OWNER_ID and interaction.user.id == OWNER_ID) or interaction.user.id == app_info.owner.id
+    if not is_owner:
         await interaction.response.send_message(
             "This command is owner-only.", ephemeral=True
         )
@@ -1876,6 +1889,39 @@ class AdminGroup(app_commands.Group):
         )
         logger.info("Manual point restore: %s → %d pts, %d readings", user.display_name, points, readings)
 
+    @app_commands.command(name="adjust_points", description="Add or subtract Boli Points for a user")
+    @app_commands.describe(
+        user="The member to adjust points for",
+        operation="Add or subtract points",
+        amount="How many points (1–10000)",
+    )
+    @app_commands.choices(operation=[
+        app_commands.Choice(name="Add", value="add"),
+        app_commands.Choice(name="Subtract", value="subtract"),
+    ])
+    async def adjust_points_cmd(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        operation: str,
+        amount: app_commands.Range[int, 1, 10000],
+    ) -> None:
+        delta = amount if operation == "add" else -amount
+        profile = get_user_profile(db_conn, user.id)
+        old_pts = profile["boli_points"] if profile else 0
+        update_boli_points(db_conn, user.id, delta)
+        new_pts = old_pts + delta
+        sign = f"+{amount}" if operation == "add" else f"-{amount}"
+        await interaction.response.send_message(
+            f"✅ **{user.display_name}**: {sign} Boli Points → now 🍮 **{new_pts}** pts",
+            ephemeral=True,
+        )
+        logger.info(
+            "Manual point adjustment: %s %s%d pts (was %d, now %d) by %s",
+            user.display_name, "+" if operation == "add" else "-", amount,
+            old_pts, new_pts, interaction.user.display_name,
+        )
+
     @app_commands.command(name="reset_all_strikes", description="Reset every user's strike count to 0")
     async def reset_all_strikes_cmd(self, interaction: discord.Interaction) -> None:
         affected = reset_all_strikes(db_conn)
@@ -2005,7 +2051,8 @@ class ShopGroup(app_commands.Group):
             if item_id == "curse_protection":
                 expiry = get_perk_expiry(db_conn, interaction.user.id, "curse_protection")
                 if expiry:
-                    active_note = f"\n*(Active until <t:{int(expiry.timestamp())}:t>)*"
+                    expiry_utc = expiry.replace(tzinfo=timezone.utc)
+                    active_note = f"\n*(Active until <t:{int(expiry_utc.timestamp())}:t>)*"
             embed.add_field(
                 name=f"{item['emoji']} {item['name']} — 🍮 {item['cost']} pts {can_afford}",
                 value=f"{item['description']}{active_note}",
@@ -2055,7 +2102,8 @@ class ShopGroup(app_commands.Group):
             update_boli_points(db_conn, interaction.user.id, -cost)
             grant_perk(db_conn, interaction.user.id, "curse_protection", duration_hours=24)
             expiry = get_perk_expiry(db_conn, interaction.user.id, "curse_protection")
-            ts = f"<t:{int(expiry.timestamp())}:f>" if expiry else "24 hours"
+            expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
+            ts = f"<t:{int(expiry_utc.timestamp())}:f>" if expiry_utc else "24 hours"
             await interaction.response.send_message(
                 f"🛡️ **Curse Protection activated!** {interaction.user.mention}, you're protected until {ts}. "
                 f"Any proxy curse attempt will be reversed back at the sender.\n"
