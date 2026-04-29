@@ -9,20 +9,35 @@ import random
 # Curse word trigger list (case-insensitive matching in bot.py)
 # ---------------------------------------------------------------------------
 
-CURSE_WORDS: list[str] = [
-    "pottan", "potti", "mandan", "mandi", "modan",
-    "vattan", "vatti", "oolan", "thallippoli", "vivaramillathavan",
-    "buddhisunyan", "madiyan", "madichi", "vayadi", "kozhi", "girirajankozhi",
-    "kokachi", "vazha", "enampechi", "kaandamrigam", "perum kallan",
-    "dushtan", "convincing star", "loose", "kumbidi", "pokri",
-    "veruppikkal star", "alavalathi", "shasi", "gundabiju", "kuzhappakkaran",
+CURSE_WORDS: list[dict] = [
+    # Tier 1 — Mild (target loses 5 pts, invoker loses 2 pts)
+    {"word": "madiyan",  "meaning": "lazy",       "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
+    {"word": "kozhi",    "meaning": "flirt",       "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
+    {"word": "vayadi",   "meaning": "chatterbox",  "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
+    {"word": "mandan",   "meaning": "fool",        "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
+    {"word": "pottan",   "meaning": "idiot",       "tier": "Mild",     "points_lost": 3,  "multiplier": 1},
+
+    # Tier 2 — Moderate (target loses 10 pts, invoker loses 4 pts)
+    {"word": "vattan",   "meaning": "crazy",                  "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+    {"word": "oolan",    "meaning": "useless",                "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+    {"word": "shasi",    "meaning": "clown/embarrassment",    "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+    {"word": "vazha",    "meaning": "useless plant",          "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+    {"word": "kumbidi",  "meaning": "fraud",                  "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+    {"word": "kalippan", "meaning": "worthless person",       "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+    {"word": "durantham", "meaning": "disaster",              "tier": "Moderate", "points_lost": 5, "multiplier": 2},
+
+    # Tier 3 — Severe (target loses 15 pts, invoker loses 6 pts)
+    {"word": "thallippoli",    "meaning": "worthless",      "tier": "Severe", "points_lost": 7, "multiplier": 3},
+    {"word": "perum kallan",   "meaning": "master thief",   "tier": "Severe", "points_lost": 7, "multiplier": 3},
+    {"word": "dushtan",        "meaning": "evil person",    "tier": "Severe", "points_lost": 7, "multiplier": 3},
+    {"word": "kuzhappakkaran", "meaning": "troublemaker",   "tier": "Severe", "points_lost": 7, "multiplier": 3},
+    {"word": "alavalathi",     "meaning": "vagabond/nuisance", "tier": "Severe", "points_lost": 7, "multiplier": 3},
 ]
 
-# Severe subset that triggers the 3-strike system (Feature 7)
-# These are the most aggressive/disruptive terms from CURSE_WORDS
+# Severe subset that triggers the 3-strike system (Feature 7).
+# Derived from Tier 3 entries in CURSE_WORDS (flat list of words for fast matching).
 SEVERE_CURSE_WORDS: list[str] = [
-    "thallippoli", "vivaramillathavan", "buddhisunyan",
-    "dushtan", "pokri", "veruppirayan", "alavalathi", "kuzhappakkaran",
+    cw["word"] for cw in CURSE_WORDS if cw["tier"] == "Severe"
 ]
 
 # ---------------------------------------------------------------------------
@@ -94,11 +109,12 @@ COMPLIMENTS: list[dict] = [
     {"word": "chakkara",     "meaning": "sugar / sweetheart",   "tier": "Affectionate & Sweet", "points": 5},
     {"word": "ponnumuthe",   "meaning": "golden pearl",         "tier": "Affectionate & Sweet", "points": 5},
     {"word": "uyir",         "meaning": "life / my everything", "tier": "Affectionate & Sweet", "points": 5},
+    {"word": "vavakutty",   "meaning": "darling / dear one",   "tier": "Affectionate & Sweet", "points": 5},
     {"word": "pookie", "meaning": "pookie", "tier": "Adorable & Sweet", "points": 5},
     # Tier 2 — Friendship (10 pts)
     {"word": "chunk",        "meaning": "best friend",          "tier": "Friendship",           "points": 10},
     {"word": "machane",      "meaning": "bro / buddy",          "tier": "Friendship",           "points": 10},
-    {"word": "chankidippi",  "meaning": "heartbeat / bestie",   "tier": "Friendship",           "points": 10},
+    {"word": "chankidippu",  "meaning": "heartbeat / bestie",   "tier": "Friendship",           "points": 10},
     {"word": "aliyan",       "meaning": "bestie / bro",         "tier": "Friendship",           "points": 10},
     # Tier 3 — Hype & Legend (15 pts)
     {"word": "puli",         "meaning": "tiger / legend",       "tier": "Hype & Legend",        "points": 15},
@@ -107,6 +123,15 @@ COMPLIMENTS: list[dict] = [
     {"word": "poli",         "meaning": "fire / awesome",       "tier": "Hype & Legend",        "points": 15},
     {"word": "mass",         "meaning": "legendary / swag",     "tier": "Hype & Legend",        "points": 15},
     {"word": "minnal",       "meaning": "lightning / stunning", "tier": "Hype & Legend",        "points": 15},
+    {"word": "chakkaramuthu", "meaning": "sweetest",             "tier": "Hype & Legend",        "points": 15},
+    # Tier 4 — Respect (15 pts)
+    {"word": "karanavar",   "meaning": "wise elder",  "tier": "Respect",    "points": 15},
+    {"word": "tharavadi",   "meaning": "noble",        "tier": "Respect",    "points": 15},
+    {"word": "kalakki",     "meaning": "rockstar",     "tier": "Hype & Legend", "points": 15},
+    # Friendship extras
+    {"word": "muthalali",   "meaning": "boss",         "tier": "Friendship", "points": 10},
+    # Affectionate extras
+    {"word": "minnaram",    "meaning": "shining light","tier": "Affectionate & Sweet", "points": 5},
 ]
 
 
@@ -119,9 +144,14 @@ def get_random_compliment() -> dict:
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def get_random_curse() -> str:
-    """Returns a random curse word from the list."""
+def get_random_curse_dict() -> dict:
+    """Returns a random curse entry dict (with word, tier, points_lost, multiplier)."""
     return random.choice(CURSE_WORDS)
+
+
+def get_random_curse() -> str:
+    """Returns a random curse word string (for passive detection replies)."""
+    return random.choice(CURSE_WORDS)["word"]
 
 
 def get_random_doomed_prediction(username: str) -> str:
@@ -150,7 +180,8 @@ def contains_curse_word(text: str) -> tuple[bool, str | None]:
     Uses \\b so e.g. 'mandarin' will not match 'mandan'.
     """
     lower = text.lower()
-    for word in CURSE_WORDS:
+    for entry in CURSE_WORDS:
+        word = entry["word"]
         if re.search(rf"\b{re.escape(word)}\b", lower):
             return True, word
     return False, None

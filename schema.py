@@ -234,6 +234,8 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
 
     # Safe ALTER TABLE migrations — add new columns to existing tables if absent
     conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS strikes INTEGER DEFAULT 0")
+    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS daily_action_count INTEGER DEFAULT 0")
+    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS last_action_date DATE")
 
     conn.commit()
 
@@ -836,6 +838,46 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     )[0]
 
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Daily action quota (curses + blessings combined, 15/day)
+# ---------------------------------------------------------------------------
+
+def get_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+    """Return today's combined curse/bless action count. Returns 0 if the record is from a previous day."""
+    row = conn.execute(
+        "SELECT daily_action_count, last_action_date FROM user_stats WHERE user_id = ?",
+        [user_id],
+    ).fetchone()
+    if not row:
+        return 0
+    count, last_date = row
+    if last_date != date.today():
+        return 0
+    return int(count) if count else 0
+
+
+def increment_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+    """Increment daily action count (resetting to 1 if it's a new day). Returns new count."""
+    today = date.today()
+    _db_write(lambda: (
+        conn.execute(
+            """
+            UPDATE user_stats
+            SET
+                daily_action_count = CASE WHEN last_action_date = ? THEN daily_action_count + 1 ELSE 1 END,
+                last_action_date = ?
+            WHERE user_id = ?
+            """,
+            [today, today, user_id],
+        ),
+        conn.commit(),
+    ))
+    row = conn.execute(
+        "SELECT daily_action_count FROM user_stats WHERE user_id = ?", [user_id]
+    ).fetchone()
+    return int(row[0]) if row and row[0] else 1
 
 
 # ---------------------------------------------------------------------------

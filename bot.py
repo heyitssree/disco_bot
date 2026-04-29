@@ -46,6 +46,8 @@ from schema import (
     reset_user_strikes,
     reset_all_strikes,
     set_user_points,
+    get_daily_action_count,
+    increment_daily_action_count,
     DB_PATH,
 )
 from glossary import RASHIS
@@ -62,7 +64,7 @@ from prompts import (
     get_link_summary_prompt,
     get_audit_prompt,
     get_mod_tldr_prompt,
-    FALLBACK_MESSAGE,
+    FALLBACK_MESSAGES,
     WELCOME_MESSAGES,
     MODA_INTROS,
     BOT_SELF_CURSE_REPLIES,
@@ -77,6 +79,7 @@ from curses import (
     CURSE_WORDS,
     SEVERE_CURSE_WORDS,
     get_random_curse,
+    get_random_curse_dict,
     get_random_compliment,
     get_random_doomed_prediction,
     get_random_curse_back,
@@ -364,26 +367,59 @@ def _personalise(template: str, name: str, curse: str | None = None) -> str:
 
 # SPAM_WRAPPERS imported from prompts.py
 
-_LEVEL_TITLES: list[tuple[int, str]] = [
-    (0,  "Tourist"),
-    (6,  "Thampanoor Regular"),
-    (11, "Chalai Veteran"),
-    (21, "Kowdiar Insider"),
-    (36, "Thirontharam Native"),
-    (51, "Neyyattinkara Gopan"),
-    (71, "Cosmic Sage of Thirontharam"),
-    (91, "The Chosen One"),
-]
+_LEVEL_TITLES: dict[int, str] = {
+    0:   "Tourist",
+    5:   "Chalai Wanderer",
+    10:  "Thampanoor Regular",
+    15:  "Auto Stand VIP",
+    20:  "Palayam Negotiator",
+    25:  "Kowdiar Cruiser",
+    30:  "Chaya Kada Analyst",
+    35:  "Technopark Hustler",
+    40:  "KSRTC Minnal Survivor",
+    45:  "Ponmudi Rider",
+    50:  "Secretariat Insider",
+    55:  "Putharikandam Orator",
+    60:  "Padmanabhaswamy Guard",
+    65:  "East Fort Navigator",
+    70:  "Varkala Drifter",
+    75:  "Museum Campus Walker",
+    80:  "Trivandrum Oracle",
+    85:  "The Southern Sage",
+    90:  "Ananthapuri Legend",
+    95:  "Cosmic Malayali",
+    100: "The Chosen One",
+}
 
 # LEVEL_UP_MESSAGES imported from prompts.py
 
 
 def get_level_title(level: int) -> str:
-    title = _LEVEL_TITLES[0][1]
-    for threshold, name in _LEVEL_TITLES:
+    """Return the highest title whose threshold is <= level."""
+    title = _LEVEL_TITLES[0]
+    for threshold in sorted(_LEVEL_TITLES):
         if level >= threshold:
-            title = name
+            title = _LEVEL_TITLES[threshold]
     return title
+
+
+_DAILY_QUOTA = 15  # combined curse + bless actions per day
+
+_OVER_QUOTA_CURSE_MESSAGES: list[str] = [
+    "The universe is tired of your curses, {invoker}. You've been reverse-cursed for overindulgence. (-5 pts)",
+    "15 curses a day is the cosmic limit, {invoker}. The excess comes straight back on you. (-5 pts)",
+    "Quota exceeded, {invoker}. The cosmos doesn't appreciate the overtime — curse redirected. (-5 pts)",
+    "Too many curses from {invoker} today. The universe is sending one back as a reminder. (-5 pts)",
+    "{invoker}, even the stars have limits. You've been billed for the extra curse. (-5 pts)",
+]
+
+_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES: list[str] = [
+    "{invoker}, you've burned through your daily quota. Even blessings have a limit — the cosmos fines you for the excess.",
+    "Over the {quota}/day limit, {invoker}. The universe curses you for pushing it.",
+    "{invoker} tried to bless one too many people today. The stars respond with a curse of their own.",
+    "Daily action quota exceeded, {invoker}. The cosmos sends its regards — in curse form.",
+    "{quota} actions per day, {invoker}. You hit the wall — the universe takes note. And points.",
+]
 
 
 async def _maybe_announce_levelup(
@@ -466,7 +502,7 @@ async def get_navi_prediction(user_id: int, name: str, usage_count: int = 1) -> 
         cached_pool, _ = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: api_mgr.call_cache_only(
-                cache_type="navi", name=name, fallback_message=FALLBACK_MESSAGE
+                cache_type="navi", name=name, fallback_message=random.choice(FALLBACK_MESSAGES)
             ),
         )
         await asyncio.sleep(random.uniform(1.5, 3.0))
@@ -499,11 +535,11 @@ async def get_navi_prediction(user_id: int, name: str, usage_count: int = 1) -> 
             system_prompt=system_prompt,
             cache_type="navi",
             name=name,
-            fallback_message=FALLBACK_MESSAGE,
+            fallback_message=random.choice(FALLBACK_MESSAGES),
         ),
     )
 
-    if not from_cache and result != FALLBACK_MESSAGE:
+    if not from_cache and result not in FALLBACK_MESSAGES:
         template = _templatize(result, name)
         save_prediction(db_conn, "navi", template, user_id=user_id, original_prompt=user_prompt)
         save_user_prediction(db_conn, user_id, result)
@@ -681,7 +717,7 @@ async def on_message(message: discord.Message) -> None:
                         system_prompt=system_prompt,
                         cache_type="qa",
                         name=message.author.display_name,
-                        fallback_message=FALLBACK_MESSAGE,
+                        fallback_message=random.choice(FALLBACK_MESSAGES),
                     ),
                 )
                 return reply
@@ -698,105 +734,174 @@ async def on_message(message: discord.Message) -> None:
 
     # ---- Legacy prefix "navi" command — only triggers on the exact word "navi" ----
     if re.match(r'^navi\b', message.content, re.IGNORECASE):
+        invoker = message.author
 
-        # "navi @username" → curse/roast the mentioned user (with reversal logic)
+        # "navi @username" → curse the mentioned user (tiered points, quota-tracked)
         if message.mentions:
             target = message.mentions[0]
-            # Don't curse the bot itself
             if target.id == bot.user.id:
                 await message.reply(random.choice(BOT_SELF_CURSE_REPLIES))
                 return
-
-            # Bot-loop protection: if someone is trying to curse another bot
             if target.bot:
-                await message.reply(f"{message.author.mention} {random.choice(BOT_LOOP_CURSE_REPLIES)}")
+                await message.reply(f"{invoker.mention} {random.choice(BOT_LOOP_CURSE_REPLIES)}")
                 return
 
-            curse_word = get_random_curse()
+            # --- Daily quota check ---
+            daily_count = get_daily_action_count(db_conn, invoker.id)
+            if daily_count >= _DAILY_QUOTA:
+                update_boli_points(db_conn, invoker.id, -5)
+                over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
+                await message.reply(over_msg)
+                logger.info("%s exceeded daily curse quota — reverse-cursed (-5 pts)", invoker.display_name)
+                return
+
+            curse_dict = get_random_curse_dict()
+            curse_word = curse_dict["word"]
 
             app_info = await bot.application_info()
             owner_reversal_chance = get_config_float(db_conn, "reversal_chance_owner", 0.45)
             if has_active_perk(db_conn, target.id, "curse_protection"):
-                reversal_chance = 1.0  # 100% reversal while protected
+                reversal_chance = 1.0
             elif target.id == app_info.owner.id:
                 reversal_chance = owner_reversal_chance
             else:
                 reversal_chance = 0.10
 
-            # Chance to reverse the curse back onto the person who sent it
+            # Passive reversal — does NOT consume daily quota
             if random.random() < reversal_chance:
-                curse_reply = f"Eda {message.author.mention}, you tried to curse {target.display_name}, but the stars reversed it. {curse_word}!"
+                curse_reply = f"Eda {invoker.mention}, you tried to curse {target.display_name}, but the stars reversed it. {curse_word}!"
                 await message.reply(curse_reply)
-                log_curse(db_conn, message.author.id, message.author.display_name, "proxy_navi_reverse")
-                logger.info("Proxy curse reversed! %s tried to curse %s but got cursed instead.", message.author.display_name, target.display_name)
-                return
+                log_curse(db_conn, invoker.id, invoker.display_name, "proxy_navi_reverse")
+                logger.info("Proxy curse reversed! %s → %s", invoker.display_name, target.display_name)
+                return  # quota not incremented for reversals
 
-            curse_reply = f"{curse_word} {target.mention}"
-            await message.reply(curse_reply)
-            log_curse(db_conn, target.id, target.display_name, "proxy_navi")
-            logger.info("%s cursed %s via prefix command", message.author.display_name, target.display_name)
+            # Apply tiered curse — no mention on target
+            target_loss = curse_dict["points_lost"]
+            invoker_loss = 2 * curse_dict["multiplier"]
+            update_boli_points(db_conn, target.id, -target_loss)
+            update_boli_points(db_conn, invoker.id, -invoker_loss)
+            increment_daily_action_count(db_conn, invoker.id)
+            log_curse(db_conn, target.id, target.display_name, curse_word)
+            await message.reply(f"{curse_word} {target.display_name}")
+            logger.info(
+                "%s cursed %s [%s, -%d target, -%d invoker]",
+                invoker.display_name, target.display_name,
+                curse_dict["tier"], target_loss, invoker_loss,
+            )
             return
 
-        # "navi" as a reply to someone → curse the person whose message was replied to
+        # "navi" as a reply to someone → curse the replied-to user
         if message.reference:
             resolved = message.reference.resolved or message.reference.cached_message
             if isinstance(resolved, discord.Message) and not resolved.author.bot:
                 target = resolved.author
-                curse_word = get_random_curse()
-                curse_reply = f"{curse_word} {target.mention}"
-                await message.reply(curse_reply)
+                daily_count = get_daily_action_count(db_conn, invoker.id)
+                if daily_count >= _DAILY_QUOTA:
+                    update_boli_points(db_conn, invoker.id, -5)
+                    over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
+                    await message.reply(over_msg)
+                    return
+                curse_dict = get_random_curse_dict()
+                update_boli_points(db_conn, target.id, -curse_dict["points_lost"])
+                update_boli_points(db_conn, invoker.id, -(2 * curse_dict["multiplier"]))
+                increment_daily_action_count(db_conn, invoker.id)
                 log_curse(db_conn, target.id, target.display_name, "proxy_navi_reply")
-                logger.info("%s cursed %s via navi reply", message.author.display_name, target.display_name)
+                await message.reply(f"{curse_dict['word']} {target.display_name}")
+                logger.info("%s cursed %s via navi reply", invoker.display_name, target.display_name)
                 return
 
-        # "navi" with no mention and no reply → curse the sender
-        target = message.author
-        curse_word = get_random_curse()
-        curse_reply = f"{curse_word} {target.mention}"
-        await message.reply(curse_reply)
+        # "navi" with no mention and no reply → self-curse
+        target = invoker
+        daily_count = get_daily_action_count(db_conn, invoker.id)
+        if daily_count >= _DAILY_QUOTA:
+            update_boli_points(db_conn, invoker.id, -5)
+            over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
+            await message.reply(over_msg)
+            return
+        curse_dict = get_random_curse_dict()
+        update_boli_points(db_conn, target.id, -curse_dict["points_lost"])
+        increment_daily_action_count(db_conn, invoker.id)
         log_curse(db_conn, target.id, target.display_name, "proxy_navi_self")
+        await message.reply(f"{curse_dict['word']} {target.display_name}")
         logger.info("%s got self-cursed via navi prefix", target.display_name)
         return
 
-    # ---- "chunk @user" — compliment command (mirrors navi prefix) ----
+    # ---- "chunk @user" — bless command (quota-tracked, no target mention) ----
     if re.match(r'^chunk\b', message.content, re.IGNORECASE):
+        invoker = message.author
 
-        def _send_compliment(target: discord.Member | discord.User) -> tuple[str, int]:
+        def _bless_target(target: discord.Member | discord.User, award_points: bool) -> tuple[str, int]:
             compliment = get_random_compliment()
-            return f"{compliment['word']} {target.mention}", compliment["points"]
+            pts = compliment["points"] if award_points else 0
+            return f"{compliment['word']} {target.display_name}", pts  # display_name, not mention
 
-        # "chunk @mention" → compliment the mentioned user
+        # "chunk @mention" → bless the mentioned user
         if message.mentions:
             target = message.mentions[0]
             if target.id == bot.user.id:
                 await message.reply(random.choice(BOT_SELF_COMPLIMENT_REPLIES))
                 return
             if target.bot:
-                await message.reply(f"{message.author.mention} {random.choice(BOT_LOOP_COMPLIMENT_REPLIES)}")
+                await message.reply(f"{invoker.mention} {random.choice(BOT_LOOP_COMPLIMENT_REPLIES)}")
                 return
-            reply, pts = _send_compliment(target)
+
+            daily_count = get_daily_action_count(db_conn, invoker.id)
+            if daily_count >= _DAILY_QUOTA:
+                # Recipient still gets the blessing message, but NO points
+                reply, _ = _bless_target(target, award_points=False)
+                await message.reply(reply)
+                # Invoker gets cursed by bot for exceeding quota
+                curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
+                    invoker=invoker.display_name, quota=_DAILY_QUOTA
+                )
+                await message.channel.send(curse_msg)
+                logger.info("%s exceeded daily bless quota — no points awarded, invoker cursed", invoker.display_name)
+                return
+
+            reply, pts = _bless_target(target, award_points=True)
             update_boli_points(db_conn, target.id, pts)
+            increment_daily_action_count(db_conn, invoker.id)
             await message.reply(reply)
-            logger.info("%s complimented %s (+%d pts)", message.author.display_name, target.display_name, pts)
+            logger.info("%s blessed %s (+%d pts)", invoker.display_name, target.display_name, pts)
             return
 
-        # "chunk" as reply → compliment the replied-to user
+        # "chunk" as reply → bless the replied-to user
         if message.reference:
             resolved = message.reference.resolved or message.reference.cached_message
             if isinstance(resolved, discord.Message) and not resolved.author.bot:
                 target = resolved.author
-                reply, pts = _send_compliment(target)
+                daily_count = get_daily_action_count(db_conn, invoker.id)
+                if daily_count >= _DAILY_QUOTA:
+                    reply, _ = _bless_target(target, award_points=False)
+                    await message.reply(reply)
+                    curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
+                        invoker=invoker.display_name, quota=_DAILY_QUOTA
+                    )
+                    await message.channel.send(curse_msg)
+                    return
+                reply, pts = _bless_target(target, award_points=True)
                 update_boli_points(db_conn, target.id, pts)
+                increment_daily_action_count(db_conn, invoker.id)
                 await message.reply(reply)
-                logger.info("%s complimented %s via reply (+%d pts)", message.author.display_name, target.display_name, pts)
+                logger.info("%s blessed %s via reply (+%d pts)", invoker.display_name, target.display_name, pts)
                 return
 
-        # "chunk" alone → compliment the sender
-        target = message.author
-        reply, pts = _send_compliment(target)
+        # "chunk" alone → self-bless
+        target = invoker
+        daily_count = get_daily_action_count(db_conn, invoker.id)
+        if daily_count >= _DAILY_QUOTA:
+            reply, _ = _bless_target(target, award_points=False)
+            await message.reply(reply)
+            curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
+                invoker=invoker.display_name, quota=_DAILY_QUOTA
+            )
+            await message.channel.send(curse_msg)
+            return
+        reply, pts = _bless_target(target, award_points=True)
         update_boli_points(db_conn, target.id, pts)
+        increment_daily_action_count(db_conn, invoker.id)
         await message.reply(reply)
-        logger.info("%s self-complimented (+%d pts)", target.display_name, pts)
+        logger.info("%s self-blessed (+%d pts)", target.display_name, pts)
         return
 
     # ---- Passive curse word reply ----
@@ -823,11 +928,11 @@ async def on_message(message: discord.Message) -> None:
                     cache_type="curse",
                     name=username,
                     curse_used=curse_used,
-                    fallback_message=FALLBACK_MESSAGE,
+                    fallback_message=random.choice(FALLBACK_MESSAGES),
                 ),
             )
 
-        if reply == FALLBACK_MESSAGE:
+        if reply in FALLBACK_MESSAGES:
             reply = (
                 get_random_doomed_prediction(username)
                 if random.random() < 0.5
@@ -972,7 +1077,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
                 system_prompt=LINK_SUMMARY_SYSTEM_PROMPT,
                 cache_type="qa",
                 name="LinkSummary",
-                fallback_message=FALLBACK_MESSAGE,
+                fallback_message=random.choice(FALLBACK_MESSAGES),
             ),
         )
         await message.reply(f"📰 **Link Summary:**\n{summary}")
@@ -1183,7 +1288,7 @@ async def summ_slash(
             system_prompt=SUMM_SYSTEM_PROMPT,
             cache_type="qa",
             name="SummaryRequest",
-            fallback_message=FALLBACK_MESSAGE,
+            fallback_message=random.choice(FALLBACK_MESSAGES),
         ),
     )
 
@@ -1213,24 +1318,35 @@ async def kanmanilla_slash(interaction: discord.Interaction, user: discord.Membe
         )
         return
 
-    profile = get_user_profile(db_conn, user.id)
+    # Defer early — channel history search can take a moment
+    await interaction.response.defer(thinking=True)
 
-    last_seen = profile.get("last_seen") if profile else None
-    if last_seen is not None:
-        now = datetime.now(timezone.utc) if (hasattr(last_seen, "tzinfo") and last_seen.tzinfo is not None) else datetime.now()
-        days_ago = max(0, (now - last_seen).days)
+    # Search all readable text channels for the user's most recent message
+    last_message_time: datetime | None = None
+    for ch in interaction.guild.text_channels:
+        try:
+            async for msg in ch.history(limit=50):
+                if msg.author.id == user.id:
+                    msg_time = msg.created_at if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
+                    if last_message_time is None or msg_time > last_message_time:
+                        last_message_time = msg_time
+                    break  # only the most recent message per channel matters
+        except (discord.Forbidden, discord.HTTPException):
+            continue
+
+    now = datetime.now(timezone.utc)
+    if last_message_time is not None:
+        days_ago = max(0, (now - last_message_time).days)
     elif user.joined_at is not None:
-        days_ago = max(0, (datetime.now(timezone.utc) - user.joined_at).days)
+        days_ago = max(0, (now - user.joined_at).days)
     else:
         days_ago = 999
 
-    if days_ago < 3:
-        await interaction.response.send_message(
-            f"{user.mention} was just here recently. Don't ping people for no reason.",
+    if days_ago < 2:
+        await interaction.followup.send(
+            f"{user.display_name} was just here recently. Don't ping people for no reason.",
         )
         return
-
-    await interaction.response.defer(thinking=True)
 
     system_prompt = get_time_aware_system_prompt(db_conn, username=None)
     user_prompt = get_kanmanilla_prompt(user.display_name, days_ago)
@@ -1855,8 +1971,8 @@ class ShopGroup(app_commands.Group):
     @app_commands.command(name="buy", description="Purchase an item from the Boli Marketplace")
     @app_commands.describe(item="Which item to buy", rashi_choice="Your chosen Rashi (only for custom_rashi)")
     @app_commands.choices(item=[
-        app_commands.Choice(name="🛡️ Curse Protection (100 pts)", value="curse_protection"),
-        app_commands.Choice(name="🌟 Customize Rashi (50 pts)", value="custom_rashi"),
+        app_commands.Choice(name="🛡️ Curse Protection (20 pts)", value="curse_protection"),
+        app_commands.Choice(name="🌟 Customize Rashi (40 pts)", value="custom_rashi"),
     ])
     async def buy(
         self,
