@@ -771,10 +771,13 @@ async def on_message(message: discord.Message) -> None:
             curse_data = get_random_curse()
             curse_word = curse_data["word"]
 
-            if has_active_perk(db_conn, target.id, "curse_protection"):
-                reversal_chance = 1.0
-            else:
+            # Check if target has curse protection
+            target_protected = has_active_perk(db_conn, target.id, "curse_protection")
+
+            if not target_protected:
                 reversal_chance = curse_data["backfire_chance"]
+            else:
+                reversal_chance = 0.0  # No backfire for protected targets
 
             increment_daily_action_count(db_conn, invoker.id)
             if daily_count >= _DAILY_QUOTA:
@@ -794,15 +797,18 @@ async def on_message(message: discord.Message) -> None:
                     invoker.display_name, curse_data["tier"], points_lost,
                 )
             else:
-                # Success — target loses, invoker gains
-                update_boli_points(db_conn, target.id, -curse_data["target_damage"])
+                # Curse lands — but protected targets take no damage
+                if not target_protected:
+                    update_boli_points(db_conn, target.id, -curse_data["target_damage"])
                 update_boli_points(db_conn, invoker.id, curse_data["invoker_reward"])
                 log_curse(db_conn, target.id, target.display_name, curse_word)
                 await message.reply(f"{curse_word} {target.display_name}")
                 logger.info(
-                    "%s cursed %s [%s, -%d target, +%d invoker]",
+                    "%s cursed %s [%s, %s-%d target, +%d invoker]",
                     invoker.display_name, target.display_name,
-                    curse_data["tier"], curse_data["target_damage"], curse_data["invoker_reward"],
+                    curse_data["tier"], "protected, no " if target_protected else "-",
+                    curse_data["target_damage"],
+                    curse_data["invoker_reward"],
                 )
             return
 
