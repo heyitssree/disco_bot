@@ -176,9 +176,13 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE IF NOT EXISTS app_emojis (
             emoji_id    VARCHAR PRIMARY KEY,
             name        VARCHAR NOT NULL,
-            last_used   TIMESTAMP DEFAULT current_timestamp
+            last_used   TIMESTAMP DEFAULT current_timestamp,
+            original_id VARCHAR,
+            animated    BOOLEAN DEFAULT FALSE
         )
     """)
+    conn.execute("ALTER TABLE app_emojis ADD COLUMN IF NOT EXISTS original_id VARCHAR")
+    conn.execute("ALTER TABLE app_emojis ADD COLUMN IF NOT EXISTS animated BOOLEAN DEFAULT FALSE")
 
     # Insert default config if empty
     conn.execute("""
@@ -398,17 +402,24 @@ def increment_prediction_count(
 def get_leaderboard(
     conn: duckdb.DuckDBPyConnection,
     limit: int = 10,
+    offset: int = 0,
 ) -> list[dict]:
-    """Return top N users sorted by Boli Points."""
+    """Return users sorted by Boli Points, with optional pagination offset."""
     rows = conn.execute(
         "SELECT username, rashi, boli_points, prediction_count "
-        "FROM user_stats ORDER BY boli_points DESC LIMIT ?",
-        [limit],
+        "FROM user_stats ORDER BY boli_points DESC LIMIT ? OFFSET ?",
+        [limit, offset],
     ).fetchall()
     return [
         {"username": r[0], "rashi": r[1], "boli_points": r[2], "prediction_count": r[3]}
         for r in rows
     ]
+
+
+def count_leaderboard_entries(conn: duckdb.DuckDBPyConnection) -> int:
+    """Return total number of users with a stats record."""
+    row = conn.execute("SELECT COUNT(*) FROM user_stats").fetchone()
+    return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1010,19 +1021,26 @@ def save_app_emoji(
     conn: duckdb.DuckDBPyConnection,
     emoji_id: str,
     name: str,
+    original_id: str | None = None,
+    animated: bool = False,
 ) -> None:
     """Insert or replace an application emoji record with last_used = now."""
     def _write() -> None:
+        conn.execute("DELETE FROM app_emojis WHERE emoji_id = ?", [emoji_id])
         conn.execute(
-            "DELETE FROM app_emojis WHERE emoji_id = ?",
-            [emoji_id],
-        )
-        conn.execute(
-            "INSERT INTO app_emojis (emoji_id, name, last_used) VALUES (?, ?, NOW())",
-            [emoji_id, name],
+            "INSERT INTO app_emojis (emoji_id, name, last_used, original_id, animated) VALUES (?, ?, NOW(), ?, ?)",
+            [emoji_id, name, original_id, animated],
         )
         conn.commit()
     _db_write(_write)
+
+
+def original_emoji_exists(conn: duckdb.DuckDBPyConnection, original_id: str) -> bool:
+    """Return True if an emoji with this source ID is already stored."""
+    row = conn.execute(
+        "SELECT 1 FROM app_emojis WHERE original_id = ?", [original_id]
+    ).fetchone()
+    return row is not None
 
 
 def get_oldest_app_emoji(
@@ -1030,11 +1048,26 @@ def get_oldest_app_emoji(
 ) -> dict | None:
     """Return the emoji record with the oldest last_used timestamp, or None."""
     row = conn.execute(
-        "SELECT emoji_id, name, last_used FROM app_emojis ORDER BY last_used ASC LIMIT 1"
+        "SELECT emoji_id, name, last_used, animated FROM app_emojis ORDER BY last_used ASC LIMIT 1"
     ).fetchone()
     if not row:
         return None
-    return {"emoji_id": row[0], "name": row[1], "last_used": row[2]}
+    return {"emoji_id": row[0], "name": row[1], "last_used": row[2], "animated": row[3]}
+
+
+def get_recent_app_emojis(
+    conn: duckdb.DuckDBPyConnection,
+    limit: int = 15,
+) -> list[dict]:
+    """Return the most recently used/added app emojis, newest first."""
+    rows = conn.execute(
+        "SELECT emoji_id, name, last_used, animated FROM app_emojis ORDER BY last_used DESC LIMIT ?",
+        [limit],
+    ).fetchall()
+    return [
+        {"emoji_id": r[0], "name": r[1], "last_used": r[2], "animated": r[3]}
+        for r in rows
+    ]
 
 
 def delete_app_emoji_record(

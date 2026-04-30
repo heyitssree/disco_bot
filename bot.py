@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import re
@@ -53,9 +54,12 @@ from schema import (
     add_extra_actions,
     save_app_emoji,
     get_oldest_app_emoji,
+    get_recent_app_emojis,
+    original_emoji_exists,
     delete_app_emoji_record,
     update_app_emoji_last_used,
     count_app_emojis,
+    count_leaderboard_entries,
     DB_PATH,
 )
 from glossary import RASHIS
@@ -579,6 +583,199 @@ def _refresh_app_emoji_usage(content: str) -> None:
             logger.debug("Could not refresh emoji LRU for id %s: %s", emoji_id, exc)
 
 
+# Matches custom emojis: <:name:id> or <a:name:id>
+_CUSTOM_EMOJI_RE = re.compile(r"<(a?):(\w+):(\d+)>")
+_APP_EMOJI_MAX = 15  # Hard cap on stored application emojis
+
+
+def _emoji_format(name: str, emoji_id: str, animated: bool) -> str:
+    prefix = "a" if animated else ""
+    return f"<{prefix}:{name}:{emoji_id}>"
+
+
+async def _do_steal_emoji(
+    target_message: discord.Message,
+    respond: discord.abc.Messageable,
+    invoker_name: str,
+) -> None:
+    """Core steal logic — validate, deduplicate, download, upload, persist."""
+    matches = _CUSTOM_EMOJI_RE.findall(target_message.content)
+    if not matches:
+        await respond.send(
+            "No custom emoji in that message. Only custom emoji (not Unicode) can be stolen.",
+            ephemeral=True,
+        )
+        return
+    if len(matches) > 1:
+        await respond.send(
+            f"That message has **{len(matches)}** custom emojis — pick a message with exactly one.",
+            ephemeral=True,
+        )
+        return
+
+    animated_flag, name, emoji_id = matches[0]
+    is_animated = bool(animated_flag)
+
+    # Duplicate check
+    if original_emoji_exists(db_conn, emoji_id):
+        await respond.send(
+            f"`:{name}:` is already in the collection. Use **/emojis** to see what's stored.",
+            ephemeral=True,
+        )
+        return
+
+    extension = "gif" if is_animated else "png"
+    cdn_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{extension}"
+
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(cdn_url) as resp:
+                if resp.status != 200:
+                    await respond.send(
+                        f"Could not download the emoji image (CDN returned {resp.status}).",
+                        ephemeral=True,
+                    )
+                    return
+                image_bytes = await resp.read()
+    except Exception as exc:
+        logger.error("Failed to download emoji %s from CDN: %s", emoji_id, exc)
+        await respond.send("Failed to download the emoji image.", ephemeral=True)
+        return
+
+    try:
+        existing_emojis = await bot.fetch_application_emojis()
+        if len(existing_emojis) >= _APP_EMOJI_MAX:
+            oldest = get_oldest_app_emoji(db_conn)
+            if oldest:
+                for e in existing_emojis:
+                    if str(e.id) == oldest["emoji_id"]:
+                        await e.delete()
+                        break
+                delete_app_emoji_record(db_conn, oldest["emoji_id"])
+                logger.info("LRU evicted '%s' (id=%s) — cap=%d", oldest["name"], oldest["emoji_id"], _APP_EMOJI_MAX)
+
+        new_emoji = await bot.create_application_emoji(name=name, image=image_bytes)
+        save_app_emoji(db_conn, str(new_emoji.id), name, original_id=emoji_id, animated=is_animated)
+
+        preview = _emoji_format(name, str(new_emoji.id), is_animated)
+        await respond.send(
+            f"Stolen! {preview} `:{name}:` added to the collection.\n"
+            f"-# Use **/emojis** to browse the collection and reply to messages with it.",
+            ephemeral=True,
+        )
+        logger.info("%s stole '%s' (id=%s, animated=%s).", invoker_name, name, emoji_id, is_animated)
+    except discord.HTTPException as exc:
+        logger.error("Discord API error stealing '%s': %s", name, exc)
+        await respond.send(f"Discord rejected the upload: {exc.text}", ephemeral=True)
+    except Exception as exc:
+        logger.error("Unexpected error in _do_steal_emoji: %s", exc)
+        await respond.send("Something went wrong. Check the logs.", ephemeral=True)
+
+
+@tree.context_menu(name="Steal Emoji")
+async def steal_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
+    """Right-click → Apps → Steal Emoji: uploads the sole custom emoji in the message as an app emoji."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await _do_steal_emoji(message, interaction.followup, interaction.user.display_name)
+
+
+# ---------------------------------------------------------------------------
+# Emoji picker UI (Select menu for "Reply with Emoji" context menu)
+# ---------------------------------------------------------------------------
+
+class EmojiPickerView(discord.ui.View):
+    def __init__(self, target_message: discord.Message, emojis: list[dict]) -> None:
+        super().__init__(timeout=60)
+        self._target = target_message
+
+        options = [
+            discord.SelectOption(
+                label=e["name"],
+                value=e["emoji_id"],
+                emoji=discord.PartialEmoji(
+                    name=e["name"],
+                    id=int(e["emoji_id"]),
+                    animated=bool(e.get("animated", False)),
+                ),
+            )
+            for e in emojis
+        ]
+        select = discord.ui.Select(placeholder="Pick an emoji to reply with…", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        emoji_id = interaction.data["values"][0]
+        chosen = next((o for o in self.children[0].options if o.value == emoji_id), None)
+        if chosen is None:
+            await interaction.response.edit_message(content="Could not find that emoji.", view=None)
+            return
+
+        is_animated = chosen.emoji.animated if chosen.emoji else False
+        fmt = _emoji_format(chosen.label, emoji_id, is_animated)
+
+        try:
+            await self._target.reply(fmt)
+            update_app_emoji_last_used(db_conn, emoji_id)
+        except discord.HTTPException as exc:
+            await interaction.response.edit_message(
+                content=f"Could not send: {exc.text}", view=None
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=f"Replied with {fmt}", view=None
+        )
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
+@tree.context_menu(name="Reply with Emoji")
+async def reply_with_emoji_context(
+    interaction: discord.Interaction, message: discord.Message
+) -> None:
+    """Right-click → Apps → Reply with Emoji: pick a stored emoji and bot replies to the message."""
+    emojis = get_recent_app_emojis(db_conn, limit=_APP_EMOJI_MAX)
+    if not emojis:
+        await interaction.response.send_message(
+            "No emojis stored yet. Use **Steal Emoji** on a message first.", ephemeral=True
+        )
+        return
+
+    view = EmojiPickerView(target_message=message, emojis=emojis)
+    await interaction.response.send_message(
+        "Which emoji should I reply with?", view=view, ephemeral=True
+    )
+
+
+@tree.command(name="emojis", description="Browse the stolen emoji collection")
+async def emojis_slash(interaction: discord.Interaction) -> None:
+    """List all stored application emojis with previews."""
+    emojis = get_recent_app_emojis(db_conn, limit=_APP_EMOJI_MAX)
+    if not emojis:
+        await interaction.response.send_message(
+            "No emojis stored yet. Right-click any message → **Apps** → **Steal Emoji** to add one.",
+            ephemeral=True,
+        )
+        return
+
+    lines = []
+    for e in emojis:
+        preview = _emoji_format(e["name"], e["emoji_id"], bool(e.get("animated", False)))
+        lines.append(f"{preview} `:{e['name']}:`")
+
+    embed = discord.Embed(
+        title="Stolen Emoji Collection",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"{len(emojis)}/{_APP_EMOJI_MAX} slots used · right-click a message → Apps → Reply with Emoji to use one")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -1009,6 +1206,7 @@ async def on_message(message: discord.Message) -> None:
         logger.info("%s self-blessed (+%d pts, +1 karma)", target.display_name, pts)
         return
 
+
     # ---- Passive curse word reply ----
     curse_chance = get_config_float(db_conn, "curse_reply_chance", 0.25)
     _curse_matched, curse_used = contains_curse_word(message.content)
@@ -1268,26 +1466,38 @@ async def ping_slash(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(reply, ephemeral=True)
 
 
-@tree.command(name="rank", description="See the Top Appis — Boli Points leaderboard")
-async def rank_slash(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(thinking=False)
-    leaders = get_leaderboard(db_conn, limit=10)
+@tree.command(name="rank", description="See the Boli Points leaderboard")
+@app_commands.describe(page="Page number (10 entries per page, default 1)")
+async def rank_slash(interaction: discord.Interaction, page: int = 1) -> None:
+    _PAGE_SIZE = 10
+    total = count_leaderboard_entries(db_conn)
 
-    if not leaders:
-        await interaction.followup.send(
-            "Nobody has Boli Points yet. Use **/navi** and start earning."
+    if total == 0:
+        await interaction.response.send_message(
+            "Nobody has Boli Points yet. Use **/navi** and start earning.", ephemeral=True
         )
         return
 
+    total_pages = max(1, math.ceil(total / _PAGE_SIZE))
+    page = max(1, min(page, total_pages))
+    offset = (page - 1) * _PAGE_SIZE
+
+    await interaction.response.defer(thinking=False)
+    leaders = get_leaderboard(db_conn, limit=_PAGE_SIZE, offset=offset)
+
     embed = discord.Embed(
         title="🍮 Boli Points Leaderboard",
-        description="Top ranked members by Boli Points.",
+        description=f"Page {page} of {total_pages}",
         color=discord.Color.gold(),
     )
 
     medals = ["🥇", "🥈", "🥉"]
     for i, entry in enumerate(leaders):
-        medal = medals[i] if i < 3 else f"**{i + 1}.**"
+        global_rank = offset + i + 1
+        if page == 1 and i < 3:
+            medal = medals[i]
+        else:
+            medal = f"**{global_rank}.**"
         rashi_str = f" · {entry['rashi']}" if entry.get("rashi") else ""
         level = get_level_from_points(entry["boli_points"])
         title = get_level_title(level)
@@ -1297,7 +1507,12 @@ async def rank_slash(interaction: discord.Interaction) -> None:
             inline=False,
         )
 
-    embed.set_footer(text="Earn points by using /navi and Trivandrum slang.")
+    nav = ""
+    if page > 1:
+        nav += f"`/rank page:{page - 1}` ← "
+    if page < total_pages:
+        nav += f"→ `/rank page:{page + 1}`"
+    embed.set_footer(text=f"{nav.strip() or 'Earn points by using /navi and Trivandrum slang.'}")
     await interaction.followup.send(embed=embed)
 
 
@@ -2246,85 +2461,6 @@ async def _temp_vc_expire(channel: discord.VoiceChannel, delay: int) -> None:
         logger.warning("Could not delete temp VC '%s': %s", channel.name, exc)
     finally:
         _temp_vc_registry.pop(channel.id, None)
-
-
-@tree.command(name="steal_emoji", description="Upload an image as an Application Emoji (LRU-managed, up to 2000)")
-@app_commands.describe(
-    name="Name for the emoji (letters, numbers, underscores only)",
-    attachment="Image file to upload as an emoji",
-)
-async def steal_emoji_slash(
-    interaction: discord.Interaction,
-    name: str,
-    attachment: discord.Attachment | None = None,
-) -> None:
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
-    # Sanitise emoji name
-    safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)[:32] or "emoji"
-
-    # Resolve image source: explicit attachment or image in replied-to message
-    image_bytes: bytes | None = None
-    if attachment:
-        if not attachment.content_type or not attachment.content_type.startswith("image/"):
-            profile = get_user_profile(db_conn, interaction.user.id)
-            pts = profile["boli_points"] if profile else 0
-            err = get_template("error", pts)
-            await interaction.followup.send(f"{err or 'Error.'} Attachment must be an image.", ephemeral=True)
-            return
-        image_bytes = await attachment.read()
-    else:
-        await interaction.followup.send(
-            "Provide an image attachment with the command.", ephemeral=True
-        )
-        return
-
-    try:
-        # Check current application emoji count via Discord API
-        existing_emojis = await bot.fetch_application_emojis()
-        current_count = len(existing_emojis)
-
-        _APP_EMOJI_LIMIT_BUFFER = 1900
-        if current_count >= _APP_EMOJI_LIMIT_BUFFER:
-            oldest = get_oldest_app_emoji(db_conn)
-            if oldest:
-                # Find and delete the oldest emoji from Discord
-                for e in existing_emojis:
-                    if str(e.id) == oldest["emoji_id"]:
-                        await e.delete()
-                        break
-                delete_app_emoji_record(db_conn, oldest["emoji_id"])
-                logger.info(
-                    "LRU evicted app emoji '%s' (id=%s, last_used=%s)",
-                    oldest["name"], oldest["emoji_id"], oldest["last_used"],
-                )
-
-        # Upload the new emoji
-        new_emoji = await bot.create_application_emoji(name=safe_name, image=image_bytes)
-        save_app_emoji(db_conn, str(new_emoji.id), safe_name)
-
-        await interaction.followup.send(
-            f"Emoji `:{safe_name}:` created successfully! Use it anywhere as `<:{safe_name}:{new_emoji.id}>`.",
-            ephemeral=True,
-        )
-        logger.info(
-            "%s created app emoji '%s' (id=%s).",
-            interaction.user.display_name, safe_name, new_emoji.id,
-        )
-    except discord.HTTPException as exc:
-        logger.error("Discord API error creating app emoji '%s': %s", safe_name, exc)
-        profile = get_user_profile(db_conn, interaction.user.id)
-        pts = profile["boli_points"] if profile else 0
-        err = get_template("error", pts)
-        await interaction.followup.send(
-            f"{err or 'Error.'} Discord rejected the emoji: {exc.text}", ephemeral=True
-        )
-    except Exception as exc:
-        logger.error("Unexpected error in steal_emoji: %s", exc)
-        profile = get_user_profile(db_conn, interaction.user.id)
-        pts = profile["boli_points"] if profile else 0
-        err = get_template("error", pts)
-        await interaction.followup.send(f"{err or 'An error occurred.'}", ephemeral=True)
 
 
 @tree.command(
