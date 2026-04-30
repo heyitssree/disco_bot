@@ -58,7 +58,6 @@ from schema import (
     original_emoji_exists,
     delete_app_emoji_record,
     update_app_emoji_last_used,
-    count_app_emojis,
     count_leaderboard_entries,
     DB_PATH,
 )
