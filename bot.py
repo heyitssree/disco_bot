@@ -51,6 +51,11 @@ from schema import (
     get_extra_actions,
     decrement_extra_actions,
     add_extra_actions,
+    save_app_emoji,
+    get_oldest_app_emoji,
+    delete_app_emoji_record,
+    update_app_emoji_last_used,
+    count_app_emojis,
     DB_PATH,
 )
 from glossary import RASHIS
@@ -93,6 +98,8 @@ from curses import (
 )
 from services.gemini_service import GeminiService
 from services.api_manager import ApiManager
+from slang_scorer import load_slang_data, score_message, get_slang_matches
+from template_resolver import load_templates, get_template
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -555,6 +562,24 @@ async def get_navi_prediction(user_id: int, name: str, usage_count: int = 1) -> 
 
 
 # ---------------------------------------------------------------------------
+# Application emoji LRU helpers
+# ---------------------------------------------------------------------------
+
+_APP_EMOJI_RE = re.compile(r"<a?:\w+:(\d+)>")
+
+
+def _refresh_app_emoji_usage(content: str) -> None:
+    """Update last_used for any application emoji IDs found in content."""
+    if db_conn is None:
+        return
+    for emoji_id in _APP_EMOJI_RE.findall(content):
+        try:
+            update_app_emoji_last_used(db_conn, emoji_id)
+        except Exception as exc:
+            logger.debug("Could not refresh emoji LRU for id %s: %s", emoji_id, exc)
+
+
+# ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
 
@@ -585,6 +610,10 @@ async def on_ready() -> None:
 
     # Load feature toggles into memory cache
     _load_feature_cache()
+
+    # Load local slang dictionary and response templates into memory
+    load_slang_data()
+    load_templates()
 
     await tree.sync()
     logger.info("Slash commands synced. Navi is live. Hey! Listen!")
@@ -655,8 +684,13 @@ async def on_message(message: discord.Message) -> None:
     if _feat("master_killswitch"):
         return
 
-    # Ignore bots and self
-    if message.author.bot or message.author.id == bot.user.id:
+    # Track application emoji usage in bot's own messages for LRU cache
+    if message.author.id == bot.user.id:
+        _refresh_app_emoji_usage(message.content)
+        return
+
+    # Ignore other bots
+    if message.author.bot:
         return
 
     # Ignore replies to bot's own messages
@@ -699,6 +733,25 @@ async def on_message(message: discord.Message) -> None:
             "%s triggered Boli words %s → +%d pts",
             message.author.display_name, triggered_words, points
         )
+
+    # ---- Slang Dictionary Scoring (TVM +pts / Kochi -pts, tiered) ----
+    if get_config_int(db_conn, "feature_boli_points", 1):
+        slang_delta = score_message(message.content)
+        if slang_delta != 0:
+            profile = get_user_profile(db_conn, message.author.id)
+            old_pts = profile["boli_points"] if profile else 0
+            update_boli_points(db_conn, message.author.id, slang_delta)
+            if slang_delta > 0:
+                await _maybe_announce_levelup(
+                    message.author.mention, old_pts, old_pts + slang_delta, message.channel
+                )
+            matches = get_slang_matches(message.content)
+            logger.debug(
+                "%s slang score %+d pts — matches: %s",
+                message.author.display_name,
+                slang_delta,
+                [(m["token"], m["region"], m["points"]) for m in matches],
+            )
 
     # ---- Kochi slang detection ----
     kochi_chance = get_config_float(db_conn, "kochi_reply_chance", 0.28)
@@ -1204,6 +1257,17 @@ async def navi_slash(
             )
 
 
+@tree.command(name="ping", description="Check if Navi is awake")
+async def ping_slash(interaction: discord.Interaction) -> None:
+    latency_ms = round(bot.latency * 1000)
+    profile = get_user_profile(db_conn, interaction.user.id)
+    pts = profile["boli_points"] if profile else 0
+    reply = get_template("ping", pts, latency=latency_ms)
+    if not reply:
+        reply = f"Pong! Latency is {latency_ms}ms."
+    await interaction.response.send_message(reply, ephemeral=True)
+
+
 @tree.command(name="rank", description="See the Top Appis — Boli Points leaderboard")
 async def rank_slash(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=False)
@@ -1263,15 +1327,17 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
     else:
         progress_line = "🌟 Maximum level reached!"
 
-    await interaction.response.send_message(
+    stats_intro = get_template("stats", pts)
+    profile_text = (
         f"**Your Profile**\n"
         f"🌟 Rashi: **{rashi}**\n"
         f"⚔️ Level: **{level}** — *{title}*\n"
         f"{progress_line}\n"
         f"🍮 Boli Points: **{pts}**\n"
-        f"🔮 Predictions received: **{count}**",
-        ephemeral=True,
+        f"🔮 Predictions received: **{count}**"
     )
+    full_reply = f"{stats_intro}\n\n{profile_text}" if stats_intro else profile_text
+    await interaction.response.send_message(full_reply, ephemeral=True)
 
 
 @tree.command(name="summ", description="Get a factual summary of recent chat")
@@ -2180,6 +2246,85 @@ async def _temp_vc_expire(channel: discord.VoiceChannel, delay: int) -> None:
         logger.warning("Could not delete temp VC '%s': %s", channel.name, exc)
     finally:
         _temp_vc_registry.pop(channel.id, None)
+
+
+@tree.command(name="steal_emoji", description="Upload an image as an Application Emoji (LRU-managed, up to 2000)")
+@app_commands.describe(
+    name="Name for the emoji (letters, numbers, underscores only)",
+    attachment="Image file to upload as an emoji",
+)
+async def steal_emoji_slash(
+    interaction: discord.Interaction,
+    name: str,
+    attachment: discord.Attachment | None = None,
+) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    # Sanitise emoji name
+    safe_name = re.sub(r"[^a-zA-Z0-9_]", "_", name)[:32] or "emoji"
+
+    # Resolve image source: explicit attachment or image in replied-to message
+    image_bytes: bytes | None = None
+    if attachment:
+        if not attachment.content_type or not attachment.content_type.startswith("image/"):
+            profile = get_user_profile(db_conn, interaction.user.id)
+            pts = profile["boli_points"] if profile else 0
+            err = get_template("error", pts)
+            await interaction.followup.send(f"{err or 'Error.'} Attachment must be an image.", ephemeral=True)
+            return
+        image_bytes = await attachment.read()
+    else:
+        await interaction.followup.send(
+            "Provide an image attachment with the command.", ephemeral=True
+        )
+        return
+
+    try:
+        # Check current application emoji count via Discord API
+        existing_emojis = await bot.fetch_application_emojis()
+        current_count = len(existing_emojis)
+
+        _APP_EMOJI_LIMIT_BUFFER = 1900
+        if current_count >= _APP_EMOJI_LIMIT_BUFFER:
+            oldest = get_oldest_app_emoji(db_conn)
+            if oldest:
+                # Find and delete the oldest emoji from Discord
+                for e in existing_emojis:
+                    if str(e.id) == oldest["emoji_id"]:
+                        await e.delete()
+                        break
+                delete_app_emoji_record(db_conn, oldest["emoji_id"])
+                logger.info(
+                    "LRU evicted app emoji '%s' (id=%s, last_used=%s)",
+                    oldest["name"], oldest["emoji_id"], oldest["last_used"],
+                )
+
+        # Upload the new emoji
+        new_emoji = await bot.create_application_emoji(name=safe_name, image=image_bytes)
+        save_app_emoji(db_conn, str(new_emoji.id), safe_name)
+
+        await interaction.followup.send(
+            f"Emoji `:{safe_name}:` created successfully! Use it anywhere as `<:{safe_name}:{new_emoji.id}>`.",
+            ephemeral=True,
+        )
+        logger.info(
+            "%s created app emoji '%s' (id=%s).",
+            interaction.user.display_name, safe_name, new_emoji.id,
+        )
+    except discord.HTTPException as exc:
+        logger.error("Discord API error creating app emoji '%s': %s", safe_name, exc)
+        profile = get_user_profile(db_conn, interaction.user.id)
+        pts = profile["boli_points"] if profile else 0
+        err = get_template("error", pts)
+        await interaction.followup.send(
+            f"{err or 'Error.'} Discord rejected the emoji: {exc.text}", ephemeral=True
+        )
+    except Exception as exc:
+        logger.error("Unexpected error in steal_emoji: %s", exc)
+        profile = get_user_profile(db_conn, interaction.user.id)
+        pts = profile["boli_points"] if profile else 0
+        err = get_template("error", pts)
+        await interaction.followup.send(f"{err or 'An error occurred.'}", ephemeral=True)
 
 
 @tree.command(

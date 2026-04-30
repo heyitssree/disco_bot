@@ -1,0 +1,19 @@
+{
+  "commands": {
+    "ping": {
+      "en": "Pong! Latency is {latency}ms.",
+      "ml_reward": "Njan ivide undu! Latency: {latency}ms. Enthellaam und vishesham?",
+      "en_penalty": "I am functioning correctly. Latency is {latency}ms. Kindly improve your vocabulary."
+    },
+    "stats": {
+      "en": "Fetching your stats...",
+      "ml_reward": "Itha pidicho thalaiva, ninte kanakkukal...",
+      "en_penalty": "Retrieving your data. Please wait."
+    },
+    "error": {
+      "en": "An error occurred. Please try again.",
+      "ml_reward": "Ayyayo, entho pishakku patti. Onnude nokku.",
+      "en_penalty": "Execution failed. Ensure your inputs are logical."
+    }
+  }
+}

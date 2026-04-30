@@ -172,6 +172,14 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         CREATE SEQUENCE IF NOT EXISTS local_knowledge_seq START 1
     """)
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_emojis (
+            emoji_id    VARCHAR PRIMARY KEY,
+            name        VARCHAR NOT NULL,
+            last_used   TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
     # Insert default config if empty
     conn.execute("""
         INSERT INTO bot_config (key, value_float, value_int)
@@ -992,3 +1000,69 @@ def get_level_from_points(points: int) -> int:
     # 5n² + 15n - points = 0  →  n = (-15 + sqrt(225 + 20·points)) / 10
     n = int((-15 + math.sqrt(225 + 20 * points)) / 10)
     return min(max(n, 0), 100)
+
+
+# ---------------------------------------------------------------------------
+# Application Emojis (LRU cache for Discord Application Emojis)
+# ---------------------------------------------------------------------------
+
+def save_app_emoji(
+    conn: duckdb.DuckDBPyConnection,
+    emoji_id: str,
+    name: str,
+) -> None:
+    """Insert or replace an application emoji record with last_used = now."""
+    def _write() -> None:
+        conn.execute(
+            "DELETE FROM app_emojis WHERE emoji_id = ?",
+            [emoji_id],
+        )
+        conn.execute(
+            "INSERT INTO app_emojis (emoji_id, name, last_used) VALUES (?, ?, NOW())",
+            [emoji_id, name],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_oldest_app_emoji(
+    conn: duckdb.DuckDBPyConnection,
+) -> dict | None:
+    """Return the emoji record with the oldest last_used timestamp, or None."""
+    row = conn.execute(
+        "SELECT emoji_id, name, last_used FROM app_emojis ORDER BY last_used ASC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {"emoji_id": row[0], "name": row[1], "last_used": row[2]}
+
+
+def delete_app_emoji_record(
+    conn: duckdb.DuckDBPyConnection,
+    emoji_id: str,
+) -> None:
+    """Remove an emoji record from the database."""
+    def _write() -> None:
+        conn.execute("DELETE FROM app_emojis WHERE emoji_id = ?", [emoji_id])
+        conn.commit()
+    _db_write(_write)
+
+
+def update_app_emoji_last_used(
+    conn: duckdb.DuckDBPyConnection,
+    emoji_id: str,
+) -> None:
+    """Refresh last_used to now for a given emoji (called when the emoji is used)."""
+    def _write() -> None:
+        conn.execute(
+            "UPDATE app_emojis SET last_used = NOW() WHERE emoji_id = ?",
+            [emoji_id],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def count_app_emojis(conn: duckdb.DuckDBPyConnection) -> int:
+    """Return the number of application emoji records stored in the database."""
+    row = conn.execute("SELECT COUNT(*) FROM app_emojis").fetchone()
+    return row[0] if row else 0
