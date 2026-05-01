@@ -10,28 +10,28 @@ import random
 # ---------------------------------------------------------------------------
 
 CURSE_WORDS: list[dict] = [
-    # Tier 1 — Low risk, moderate reward (5% backfire)
-    {"word": "madiyan",      "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
-    {"word": "kozhi",        "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
-    {"word": "vayadi",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
-    {"word": "mandan",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
-    {"word": "pottan",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
+    # Tier 1 — Mild (10% backfire, symmetric ±5 pts)
+    {"word": "madiyan",      "tier": "Mild",     "target_damage": 5,  "invoker_reward": 5,  "backfire_chance": 0.10},
+    {"word": "kozhi",        "tier": "Mild",     "target_damage": 5,  "invoker_reward": 5,  "backfire_chance": 0.10},
+    {"word": "vayadi",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 5,  "backfire_chance": 0.10},
+    {"word": "mandan",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 5,  "backfire_chance": 0.10},
+    {"word": "pottan",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 5,  "backfire_chance": 0.10},
 
-    # Tier 2 — Medium risk, higher reward (7% backfire)
-    {"word": "vattan",       "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
-    {"word": "oolan",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
-    {"word": "shasi",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
-    {"word": "vazha",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
-    {"word": "kumbidi",      "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
-    {"word": "kalippan",     "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
-    {"word": "durantham",    "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
+    # Tier 2 — Moderate (15% backfire, symmetric ±10 pts)
+    {"word": "vattan",       "tier": "Moderate", "target_damage": 10, "invoker_reward": 10, "backfire_chance": 0.15},
+    {"word": "oolan",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 10, "backfire_chance": 0.15},
+    {"word": "shasi",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 10, "backfire_chance": 0.15},
+    {"word": "vazha",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 10, "backfire_chance": 0.15},
+    {"word": "kumbidi",      "tier": "Moderate", "target_damage": 10, "invoker_reward": 10, "backfire_chance": 0.15},
+    {"word": "kalippan",     "tier": "Moderate", "target_damage": 10, "invoker_reward": 10, "backfire_chance": 0.15},
+    {"word": "durantham",    "tier": "Moderate", "target_damage": 10, "invoker_reward": 10, "backfire_chance": 0.15},
 
-    # Tier 3 — High risk, high reward (10% backfire)
-    {"word": "thallippoli",    "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
-    {"word": "perum kallan",   "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
-    {"word": "dushtan",        "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
-    {"word": "kuzhappakkaran", "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
-    {"word": "alavalathi",     "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
+    # Tier 3 — Severe (20% backfire, symmetric ±20 pts)
+    {"word": "thallippoli",    "tier": "Severe", "target_damage": 20, "invoker_reward": 20, "backfire_chance": 0.20},
+    {"word": "perum kallan",   "tier": "Severe", "target_damage": 20, "invoker_reward": 20, "backfire_chance": 0.20},
+    {"word": "dushtan",        "tier": "Severe", "target_damage": 20, "invoker_reward": 20, "backfire_chance": 0.20},
+    {"word": "kuzhappakkaran", "tier": "Severe", "target_damage": 20, "invoker_reward": 20, "backfire_chance": 0.20},
+    {"word": "alavalathi",     "tier": "Severe", "target_damage": 20, "invoker_reward": 20, "backfire_chance": 0.20},
 ]
 
 # Severe subset that triggers the 3-strike system (Feature 7).
@@ -104,34 +104,32 @@ CURSE_BACK_REPLIES: list[str] = [
 # ---------------------------------------------------------------------------
 
 COMPLIMENTS: list[dict] = [
-    # Tier 1 — Affectionate & Sweet (5 pts)
-    {"word": "muthe",        "meaning": "pearl / dear",         "tier": "Affectionate & Sweet", "points": 5},
-    {"word": "chakkara",     "meaning": "sugar / sweetheart",   "tier": "Affectionate & Sweet", "points": 5},
-    {"word": "ponnumuthe",   "meaning": "golden pearl",         "tier": "Affectionate & Sweet", "points": 5},
-    {"word": "uyir",         "meaning": "life / my everything", "tier": "Affectionate & Sweet", "points": 5},
-    {"word": "vavakutty",   "meaning": "darling / dear one",   "tier": "Affectionate & Sweet", "points": 5},
-    {"word": "pookie", "meaning": "pookie", "tier": "Adorable & Sweet", "points": 5},
-    # Tier 2 — Friendship (10 pts)
-    {"word": "chunk",        "meaning": "best friend",          "tier": "Friendship",           "points": 10},
-    {"word": "machane",      "meaning": "bro / buddy",          "tier": "Friendship",           "points": 10},
-    {"word": "chankidippu",  "meaning": "heartbeat / bestie",   "tier": "Friendship",           "points": 10},
-    {"word": "aliyan",       "meaning": "bestie / bro",         "tier": "Friendship",           "points": 10},
-    # Tier 3 — Hype & Legend (15 pts)
-    {"word": "puli",         "meaning": "tiger / legend",       "tier": "Hype & Legend",        "points": 15},
-    {"word": "killadi",      "meaning": "master / legend",      "tier": "Hype & Legend",        "points": 15},
-    {"word": "kiduve",       "meaning": "awesome person",       "tier": "Hype & Legend",        "points": 15},
-    {"word": "poli",         "meaning": "fire / awesome",       "tier": "Hype & Legend",        "points": 15},
-    {"word": "mass",         "meaning": "legendary / swag",     "tier": "Hype & Legend",        "points": 15},
-    {"word": "minnal",       "meaning": "lightning / stunning", "tier": "Hype & Legend",        "points": 15},
-    {"word": "chakkaramuthu", "meaning": "sweetest",             "tier": "Hype & Legend",        "points": 15},
-    # Tier 4 — Respect (15 pts)
-    {"word": "karanavar",   "meaning": "wise elder",  "tier": "Respect",    "points": 15},
-    {"word": "tharavadi",   "meaning": "noble",        "tier": "Respect",    "points": 15},
-    {"word": "kalakki",     "meaning": "rockstar",     "tier": "Hype & Legend", "points": 15},
-    # Friendship extras
-    {"word": "muthalali",   "meaning": "boss",         "tier": "Friendship", "points": 10},
-    # Affectionate extras
-    {"word": "minnaram",    "meaning": "shining light","tier": "Affectionate & Sweet", "points": 5},
+    # Tier 1 — Affectionate & Sweet (5 pts, caster gets 15%)
+    {"word": "muthe",         "meaning": "pearl / dear",         "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "chakkara",      "meaning": "sugar / sweetheart",   "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "ponnumuthe",    "meaning": "golden pearl",         "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "uyir",          "meaning": "life / my everything", "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "vavakutty",     "meaning": "darling / dear one",   "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "pookie",        "meaning": "pookie",               "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "minnaram",      "meaning": "shining light",        "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    # Tier 2 — Friendship (10 pts, caster gets 20%)
+    {"word": "chunk",         "meaning": "best friend",          "tier": "Friendship",           "points": 10, "caster_share_pct": 20},
+    {"word": "machane",       "meaning": "bro / buddy",          "tier": "Friendship",           "points": 10, "caster_share_pct": 20},
+    {"word": "chankidippu",   "meaning": "heartbeat / bestie",   "tier": "Friendship",           "points": 10, "caster_share_pct": 20},
+    {"word": "aliyan",        "meaning": "bestie / bro",         "tier": "Friendship",           "points": 10, "caster_share_pct": 20},
+    {"word": "muthalali",     "meaning": "boss",                 "tier": "Friendship",           "points": 10, "caster_share_pct": 20},
+    # Tier 3 — Hype & Legend (15 pts, caster gets 25%)
+    {"word": "puli",          "meaning": "tiger / legend",       "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    {"word": "killadi",       "meaning": "master / legend",      "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    {"word": "kiduve",        "meaning": "awesome person",       "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    {"word": "poli",          "meaning": "fire / awesome",       "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    {"word": "mass",          "meaning": "legendary / swag",     "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    {"word": "minnal",        "meaning": "lightning / stunning", "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    {"word": "chakkaramuthu", "meaning": "sweetest",             "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    {"word": "kalakki",       "meaning": "rockstar",             "tier": "Hype & Legend",        "points": 15, "caster_share_pct": 25},
+    # Tier 4 — Respect (15 pts, caster gets 25%)
+    {"word": "karanavar",     "meaning": "wise elder",           "tier": "Respect",              "points": 15, "caster_share_pct": 25},
+    {"word": "tharavadi",     "meaning": "noble",                "tier": "Respect",              "points": 15, "caster_share_pct": 25},
 ]
 
 

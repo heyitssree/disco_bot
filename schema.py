@@ -8,7 +8,7 @@ import logging
 import math
 import time
 import functools
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -896,8 +896,16 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Daily action quota (curses + blessings combined, 15/day)
+# Daily action quota (curses + blessings combined, 20/day) — resets at midnight IST
 # ---------------------------------------------------------------------------
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _today_ist() -> date:
+    """Return the current date in IST (UTC+5:30), used for daily quota resets."""
+    return datetime.now(_IST).date()
+
 
 def get_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
     """Return today's combined curse/bless action count. Returns 0 if the record is from a previous day."""
@@ -908,14 +916,14 @@ def get_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int
     if not row:
         return 0
     count, last_date = row
-    if last_date != date.today():
+    if last_date != _today_ist():
         return 0
     return int(count) if count else 0
 
 
 def increment_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
     """Increment daily action count (resetting to 1 if it's a new day). Returns new count."""
-    today = date.today()
+    today = _today_ist()
     _db_write(lambda: (
         conn.execute(
             """
