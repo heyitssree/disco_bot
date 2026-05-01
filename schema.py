@@ -85,7 +85,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             user_id     BIGINT,
             original_prompt VARCHAR,
             template_text   VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT current_timestamp
+            timestamp   TIMESTAMP DEFAULT NOW()
         )
     """)
     conn.execute("""
@@ -98,7 +98,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             username        VARCHAR NOT NULL,
             rashi           VARCHAR,
             boli_points     INTEGER DEFAULT 0,
-            last_seen       TIMESTAMP DEFAULT current_timestamp,
+            last_seen       TIMESTAMP DEFAULT NOW(),
             prediction_count INTEGER DEFAULT 0,
             extra_actions   INTEGER DEFAULT 0
         )
@@ -109,7 +109,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             id          INTEGER PRIMARY KEY,
             user_id     BIGINT NOT NULL,
             prediction_text VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT current_timestamp
+            timestamp   TIMESTAMP DEFAULT NOW()
         )
     """)
     conn.execute("""
@@ -122,7 +122,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             user_id     BIGINT NOT NULL,
             username    VARCHAR NOT NULL,
             curse_used  VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT current_timestamp
+            timestamp   TIMESTAMP DEFAULT NOW()
         )
     """)
     conn.execute("""
@@ -176,7 +176,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         CREATE TABLE IF NOT EXISTS app_emojis (
             emoji_id    VARCHAR PRIMARY KEY,
             name        VARCHAR NOT NULL,
-            last_used   TIMESTAMP DEFAULT current_timestamp,
+            last_used   TIMESTAMP DEFAULT NOW(),
             original_id VARCHAR,
             animated    BOOLEAN DEFAULT FALSE
         )
@@ -191,7 +191,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             file_path   VARCHAR NOT NULL,
             media_type  VARCHAR NOT NULL,
             source_url  VARCHAR,
-            created_at  TIMESTAMP DEFAULT current_timestamp
+            created_at  TIMESTAMP DEFAULT NOW()
         )
     """)
 
@@ -201,7 +201,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             user_id     BIGINT NOT NULL,
             username    VARCHAR NOT NULL,
             bless_used  VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT current_timestamp
+            timestamp   TIMESTAMP DEFAULT NOW()
         )
     """)
     conn.execute("""
@@ -388,18 +388,18 @@ def upsert_user(
             conn.execute(
                 """
                 INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count)
-                VALUES (?, ?, ?, 0, current_timestamp, 0)
+                VALUES (?, ?, ?, 0, NOW(), 0)
                 """,
                 [user_id, username, rashi],
             )
         elif rashi:
             conn.execute(
-                "UPDATE user_stats SET username=?, rashi=?, last_seen=current_timestamp WHERE user_id=?",
+                "UPDATE user_stats SET username=?, rashi=?, last_seen=NOW() WHERE user_id=?",
                 [username, rashi, user_id],
             )
         else:
             conn.execute(
-                "UPDATE user_stats SET username=?, last_seen=current_timestamp WHERE user_id=?",
+                "UPDATE user_stats SET username=?, last_seen=NOW() WHERE user_id=?",
                 [username, user_id],
             )
         conn.commit()
@@ -663,7 +663,7 @@ def set_user_points(conn: duckdb.DuckDBPyConnection, user_id: int, username: str
     def _write() -> None:
         if existing is None:
             conn.execute(
-                "INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count) VALUES (?, ?, ?, ?, current_timestamp, ?)",
+                "INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count) VALUES (?, ?, ?, ?, NOW(), ?)",
                 [user_id, username, rashi, points, prediction_count],
             )
         else:
@@ -849,7 +849,7 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     )[0]
     stats["active_week"] = (
         conn.execute(
-            "SELECT COUNT(*) FROM user_stats WHERE last_seen >= current_timestamp - INTERVAL 7 DAY"
+            "SELECT COUNT(*) FROM user_stats WHERE last_seen >= NOW() - INTERVAL 7 DAY"
         ).fetchone() or (0,)
     )[0]
     stats["total_boli_points"] = (
@@ -888,7 +888,7 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     # --- Active perks ---
     stats["active_perks"] = (
         conn.execute(
-            "SELECT COUNT(*) FROM user_perks WHERE expires_at > current_timestamp"
+            "SELECT COUNT(*) FROM user_perks WHERE expires_at > NOW()"
         ).fetchone() or (0,)
     )[0]
 
@@ -996,7 +996,7 @@ def has_active_perk(
 ) -> bool:
     """Return True if the user has a non-expired perk of the given type."""
     row = conn.execute(
-        "SELECT 1 FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > current_timestamp",
+        "SELECT 1 FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > NOW()",
         [user_id, perk_type],
     ).fetchone()
     return row is not None
@@ -1018,7 +1018,7 @@ def grant_perk(
         conn.execute(
             """
             INSERT INTO user_perks (user_id, perk_type, expires_at)
-            VALUES (?, ?, current_timestamp + INTERVAL (?) SECOND)
+            VALUES (?, ?, NOW() + INTERVAL (?) SECOND)
             ON CONFLICT (user_id, perk_type) DO UPDATE SET
                 expires_at = GREATEST(user_perks.expires_at, excluded.expires_at)
             """,
@@ -1035,7 +1035,7 @@ def get_perk_expiry(
 ) -> datetime | None:
     """Return the expiry datetime of a perk, or None if not active."""
     row = conn.execute(
-        "SELECT expires_at FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > current_timestamp",
+        "SELECT expires_at FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > NOW()",
         [user_id, perk_type],
     ).fetchone()
     return row[0] if row else None
@@ -1072,13 +1072,13 @@ def save_local_media(
         conn.execute(
             """
             INSERT INTO local_media (shortcut, user_id, file_path, media_type, source_url, created_at)
-            VALUES (?, ?, ?, ?, ?, current_timestamp)
+            VALUES (?, ?, ?, ?, ?, NOW())
             ON CONFLICT (shortcut) DO UPDATE SET
                 user_id = excluded.user_id,
                 file_path = excluded.file_path,
                 media_type = excluded.media_type,
                 source_url = excluded.source_url,
-                created_at = current_timestamp
+                created_at = NOW()
             """,
             [shortcut, user_id, file_path, media_type, source_url],
         )
