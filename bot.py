@@ -60,6 +60,15 @@ from schema import (
     update_app_emoji_last_used,
     count_leaderboard_entries,
     DB_PATH,
+    save_local_media,
+    get_local_media,
+    get_user_local_media_count,
+    get_global_local_media_count,
+    list_user_local_media,
+    delete_local_media,
+    log_bless,
+    get_curse_leaderboard,
+    get_bless_leaderboard,
 )
 from glossary import RASHIS
 from prompts import (
@@ -586,6 +595,10 @@ def _refresh_app_emoji_usage(content: str) -> None:
 _CUSTOM_EMOJI_RE = re.compile(r"<(a?):(\w+):(\d+)>")
 _APP_EMOJI_MAX = 15  # Hard cap on stored application emojis
 
+# Local media shortcut trigger (;;name)
+_LOCAL_SHORTCUT_RE = re.compile(r"^;;(\w+)", re.IGNORECASE)
+_LOCAL_MEDIA_DIR = "data/local_media"
+
 
 def _emoji_format(name: str, emoji_id: str, animated: bool) -> str:
     prefix = "a" if animated else ""
@@ -776,6 +789,195 @@ async def emojis_slash(interaction: discord.Interaction) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Local Media Stealing — context menus + ;;shortcut trigger
+# ---------------------------------------------------------------------------
+
+class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
+    """Modal asking the user for a ;;name shortcut when stealing media."""
+
+    shortcut_name = discord.ui.TextInput(
+        label="Shortcut name (type ;;name to trigger it later)",
+        placeholder="e.g. stolen_meme",
+        min_length=2,
+        max_length=30,
+    )
+
+    def __init__(self, download_url: str, media_type: str, file_ext: str, invoker_id: int) -> None:
+        super().__init__()
+        self._url = download_url
+        self._media_type = media_type
+        self._ext = file_ext
+        self._invoker_id = invoker_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.shortcut_name.value.strip().lstrip(";")
+        if not re.match(r"^\w+$", raw):
+            await interaction.response.send_message(
+                "Shortcut name can only contain letters, numbers, and underscores.", ephemeral=True
+            )
+            return
+
+        name = raw.lower()
+
+        # Per-user and global limits
+        user_count = get_user_local_media_count(db_conn, self._invoker_id)
+        max_per_user = get_config_int(db_conn, "local_media_max_per_user", 20)
+        if user_count >= max_per_user:
+            await interaction.response.send_message(
+                f"You've hit your local media limit ({max_per_user} items). Delete some with `/my_media` first.",
+                ephemeral=True,
+            )
+            return
+
+        global_count = get_global_local_media_count(db_conn)
+        max_global = get_config_int(db_conn, "local_media_max_global", 200)
+        if global_count >= max_global:
+            await interaction.response.send_message(
+                f"The global media storage is full ({max_global} items). Contact an admin.",
+                ephemeral=True,
+            )
+            return
+
+        existing = get_local_media(db_conn, name)
+        if existing:
+            await interaction.response.send_message(
+                f"`;;{name}` is already taken by someone. Pick a different name.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        import aiohttp
+        import os as _os
+        _os.makedirs(_LOCAL_MEDIA_DIR, exist_ok=True)
+        file_path = f"{_LOCAL_MEDIA_DIR}/{name}.{self._ext}"
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self._url) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send(
+                            f"Could not download the media (CDN returned {resp.status}).", ephemeral=True
+                        )
+                        return
+                    data = await resp.read()
+        except Exception as exc:
+            logger.error("ShortcutModal: download failed for %s: %s", self._url, exc)
+            await interaction.followup.send("Download failed. Check the logs.", ephemeral=True)
+            return
+
+        try:
+            with open(file_path, "wb") as f:
+                f.write(data)
+        except Exception as exc:
+            logger.error("ShortcutModal: file write failed for %s: %s", file_path, exc)
+            await interaction.followup.send("Could not save the file locally. Check disk space.", ephemeral=True)
+            return
+
+        save_local_media(
+            db_conn,
+            user_id=self._invoker_id,
+            shortcut=name,
+            file_path=file_path,
+            media_type=self._media_type,
+            source_url=self._url,
+        )
+        await interaction.followup.send(
+            f"✅ Saved! Type `;;{name}` in any channel and I'll post it.", ephemeral=True
+        )
+        logger.info("User %s saved local media shortcut ';;%s' (%s)", self._invoker_id, name, self._media_type)
+
+
+@tree.context_menu(name="Save as Emoji")
+async def save_as_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
+    """Right-click → Apps → Save as Emoji: save a custom emoji locally with a ;;name shortcut."""
+    matches = _CUSTOM_EMOJI_RE.findall(message.content)
+    if not matches:
+        await interaction.response.send_message(
+            "No custom emoji in that message. This command only works on messages containing a custom emoji (not Unicode).",
+            ephemeral=True,
+        )
+        return
+    if len(matches) > 1:
+        await interaction.response.send_message(
+            f"That message has **{len(matches)}** custom emojis — pick a message with exactly one.",
+            ephemeral=True,
+        )
+        return
+
+    animated_flag, name, emoji_id = matches[0]
+    is_animated = bool(animated_flag)
+    ext = "gif" if is_animated else "png"
+    cdn_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+
+    await interaction.response.send_modal(
+        ShortcutModal(download_url=cdn_url, media_type="emoji", file_ext=ext, invoker_id=interaction.user.id)
+    )
+
+
+@tree.context_menu(name="Save as Sticker")
+async def save_as_sticker_context(interaction: discord.Interaction, message: discord.Message) -> None:
+    """Right-click → Apps → Save as Sticker: save a sticker or image attachment locally with a ;;name shortcut."""
+    download_url: str | None = None
+    file_ext = "png"
+    media_type = "sticker"
+
+    # Prefer stickers attached to the message
+    if message.stickers:
+        sticker = message.stickers[0]
+        fmt = sticker.format
+        if fmt == discord.StickerFormatType.apng:
+            file_ext = "png"
+        elif fmt == discord.StickerFormatType.gif:
+            file_ext = "gif"
+        else:
+            file_ext = "png"
+        download_url = str(sticker.url)
+
+    # Fall back to image/GIF attachments
+    if download_url is None:
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith("image/"):
+                ext_guess = att.filename.rsplit(".", 1)[-1].lower()
+                file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
+                media_type = "gif" if file_ext == "gif" else "image"
+                download_url = att.url
+                break
+
+    if download_url is None:
+        await interaction.response.send_message(
+            "No sticker or image attachment found in that message.", ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(
+        ShortcutModal(download_url=download_url, media_type=media_type, file_ext=file_ext, invoker_id=interaction.user.id)
+    )
+
+
+@tree.command(name="my_media", description="List your saved local media shortcuts")
+async def my_media_slash(interaction: discord.Interaction) -> None:
+    """Show the caller's saved ;;shortcut entries."""
+    entries = list_user_local_media(db_conn, interaction.user.id)
+    if not entries:
+        await interaction.response.send_message(
+            "You have no saved media. Right-click a message → **Apps** → **Save as Emoji** or **Save as Sticker**.",
+            ephemeral=True,
+        )
+        return
+
+    max_per_user = get_config_int(db_conn, "local_media_max_per_user", 20)
+    lines = [f"`;;{e['shortcut']}` — {e['media_type']}" for e in entries]
+    embed = discord.Embed(
+        title="Your Saved Media",
+        description="\n".join(lines),
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"{len(entries)}/{max_per_user} slots used")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
 
@@ -810,6 +1012,10 @@ async def on_ready() -> None:
     # Load local slang dictionary and response templates into memory
     load_slang_data()
     load_templates()
+
+    # Ensure local media storage directory exists
+    import os as _os
+    _os.makedirs(_LOCAL_MEDIA_DIR, exist_ok=True)
 
     await tree.sync()
     logger.info("Slash commands synced. Navi is live. Hey! Listen!")
@@ -911,6 +1117,19 @@ async def on_message(message: discord.Message) -> None:
         upsert_user(db_conn, message.author.id, message.author.display_name)
         _seen_users.add(message.author.id)
 
+    # ---- Local media shortcut trigger (;;name) ----
+    shortcut_match = _LOCAL_SHORTCUT_RE.match(message.content.strip())
+    if shortcut_match:
+        shortcut_key = shortcut_match.group(1).lower()
+        media_entry = get_local_media(db_conn, shortcut_key)
+        if media_entry:
+            import os as _os
+            if _os.path.isfile(media_entry["file_path"]):
+                await message.channel.send(file=discord.File(media_entry["file_path"]))
+            else:
+                await message.reply(f"Media file for `;;{shortcut_key}` is missing from disk.")
+        return  # shortcut messages don't trigger any other processing
+
     # ---- Vibe Check: lightweight heat tracker — no API cost unless triggered ----
     if _feat("feature_vibe_check"):
         await _check_vibe(message)
@@ -1011,6 +1230,16 @@ async def on_message(message: discord.Message) -> None:
                 await message.reply(f"{invoker.mention} {random.choice(BOT_LOOP_CURSE_REPLIES)}")
                 return
 
+            # --- Curse Timeout check: invoker may be blocked by a Timeout Ticket ---
+            if has_active_perk(db_conn, invoker.id, "curse_timeout"):
+                update_boli_points(db_conn, invoker.id, -3)
+                await message.reply(
+                    f"🚫 {invoker.display_name}, you're under a **Timeout Ticket**! "
+                    f"Casting curses is blocked. That stunt cost you **3 Boli**."
+                )
+                logger.info("%s tried to curse while timed out — -3 Boli penalty", invoker.display_name)
+                return
+
             # --- Daily quota check ---
             daily_count = get_daily_action_count(db_conn, invoker.id)
             extra_actions = get_extra_actions(db_conn, invoker.id)
@@ -1025,11 +1254,12 @@ async def on_message(message: discord.Message) -> None:
             curse_data = get_random_curse()
             curse_word = curse_data["word"]
 
-            # Check if target has curse protection
+            # Check if target has curse protection or deflector shield
             target_protected = has_active_perk(db_conn, target.id, "curse_protection")
+            target_shielded = has_active_perk(db_conn, target.id, "deflector_shield")
 
-            if target_protected:
-                reversal_chance = 1.0  # Protected targets always bounce the curse back
+            if target_protected or target_shielded:
+                reversal_chance = 1.0  # Protected/shielded targets always bounce the curse back
             else:
                 reversal_chance = curse_data["backfire_chance"]
 
@@ -1037,21 +1267,28 @@ async def on_message(message: discord.Message) -> None:
             if daily_count > _DAILY_QUOTA:
                 decrement_extra_actions(db_conn, invoker.id)
 
-            if random.random() < reversal_chance:
+            first_reversed = random.random() < reversal_chance
+            if first_reversed:
                 # Backfire — invoker takes double damage, target unharmed
                 points_lost = curse_data["target_damage"] * 2
                 update_boli_points(db_conn, invoker.id, -points_lost)
                 log_curse(db_conn, invoker.id, invoker.display_name, f"backfire_{curse_word}")
                 if target_protected:
+                    perk_label = "Curse Protection"
+                elif target_shielded:
+                    perk_label = "Deflector Shield"
+                else:
+                    perk_label = None
+                if perk_label:
                     await message.reply(
                         f"The cosmos rejected your negativity, {invoker.display_name}. "
-                        f"{target.display_name} is protected by a Shop Perk. "
-                        f"The curse bounced back and hit you for {points_lost} points. {curse_word}!"
+                        f"{target.display_name} has an active **{perk_label}**. "
+                        f"The curse bounced back and hit you for **{points_lost} pts**. {curse_word}!"
                     )
                 else:
                     await message.reply(
                         f"The cosmos rejected your negativity, {invoker.display_name}. "
-                        f"The curse bounced back and hit you for {points_lost} points. {curse_word}!"
+                        f"The curse bounced back and hit you for **{points_lost} pts**. {curse_word}!"
                     )
                 logger.info(
                     "Curse backfired on %s [%s, -%d invoker]",
@@ -1059,7 +1296,7 @@ async def on_message(message: discord.Message) -> None:
                 )
             else:
                 # Curse lands — but protected targets take no damage
-                if not target_protected:
+                if not target_protected and not target_shielded:
                     update_boli_points(db_conn, target.id, -curse_data["target_damage"])
                 update_boli_points(db_conn, invoker.id, curse_data["invoker_reward"])
                 log_curse(db_conn, target.id, target.display_name, curse_word)
@@ -1067,10 +1304,38 @@ async def on_message(message: discord.Message) -> None:
                 logger.info(
                     "%s cursed %s [%s, %s-%d target, +%d invoker]",
                     invoker.display_name, target.display_name,
-                    curse_data["tier"], "protected, no " if target_protected else "-",
+                    curse_data["tier"], "protected, no " if (target_protected or target_shielded) else "-",
                     curse_data["target_damage"],
                     curse_data["invoker_reward"],
                 )
+
+            # --- Multiplier Potion: fire a second curse after a delay ---
+            if has_active_perk(db_conn, invoker.id, "multiplier_potion"):
+                second_curse = get_random_curse()
+
+                async def _fire_second_curse() -> None:
+                    delay = random.randint(15, 45)
+                    await asyncio.sleep(delay)
+                    if first_reversed:
+                        pts_lost = second_curse["target_damage"] * 2
+                        update_boli_points(db_conn, invoker.id, -pts_lost)
+                        log_curse(db_conn, invoker.id, invoker.display_name, f"potion_backfire_{second_curse['word']}")
+                        await message.channel.send(
+                            f"⚡ **Potion echo!** `{second_curse['word']}` — the 2nd curse also bounced back on "
+                            f"{invoker.display_name} for **{pts_lost} pts**."
+                        )
+                    else:
+                        if not target_protected and not target_shielded:
+                            update_boli_points(db_conn, target.id, -second_curse["target_damage"])
+                        update_boli_points(db_conn, invoker.id, second_curse["invoker_reward"])
+                        log_curse(db_conn, target.id, target.display_name, f"potion_{second_curse['word']}")
+                        await message.channel.send(
+                            f"⚡ **Potion echo!** {second_curse['word']} {target.display_name} "
+                            f"(2nd curse landed, +{second_curse['invoker_reward']} Boli)"
+                        )
+
+                asyncio.create_task(_fire_second_curse())
+
             return
 
         # "navi" as a reply to someone → curse the replied-to user
@@ -1119,10 +1384,10 @@ async def on_message(message: discord.Message) -> None:
     if re.match(r'^chunk\b', message.content, re.IGNORECASE):
         invoker = message.author
 
-        def _bless_target(target: discord.Member | discord.User, award_points: bool) -> tuple[str, int]:
+        def _bless_target(target: discord.Member | discord.User, award_points: bool) -> tuple[str, int, str]:
             compliment = get_random_compliment()
             pts = compliment["points"] if award_points else 0
-            return f"{compliment['word']} {target.display_name}", pts  # display_name, not mention
+            return f"{compliment['word']} {target.display_name}", pts, compliment["word"]
 
         # "chunk @mention" → bless the mentioned user
         if message.mentions:
@@ -1138,7 +1403,7 @@ async def on_message(message: discord.Message) -> None:
             extra_actions = get_extra_actions(db_conn, invoker.id)
             if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
                 # Recipient still gets the blessing message, but NO points
-                reply, _ = _bless_target(target, award_points=False)
+                reply, _, _ = _bless_target(target, award_points=False)
                 await message.reply(reply)
                 # Invoker gets cursed by bot for exceeding quota
                 curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
@@ -1148,9 +1413,10 @@ async def on_message(message: discord.Message) -> None:
                 logger.info("%s exceeded daily bless quota — no points awarded, invoker cursed", invoker.display_name)
                 return
 
-            reply, pts = _bless_target(target, award_points=True)
+            reply, pts, bless_word = _bless_target(target, award_points=True)
             update_boli_points(db_conn, target.id, pts)
             update_boli_points(db_conn, invoker.id, 1)
+            log_bless(db_conn, target.id, target.display_name, bless_word)
             daily_count = increment_daily_action_count(db_conn, invoker.id)
             if daily_count > _DAILY_QUOTA:
                 decrement_extra_actions(db_conn, invoker.id)
@@ -1166,16 +1432,17 @@ async def on_message(message: discord.Message) -> None:
                 daily_count = get_daily_action_count(db_conn, invoker.id)
                 extra_actions = get_extra_actions(db_conn, invoker.id)
                 if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
-                    reply, _ = _bless_target(target, award_points=False)
+                    reply, _, _ = _bless_target(target, award_points=False)
                     await message.reply(reply)
                     curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
                         invoker=invoker.display_name, quota=_DAILY_QUOTA
                     )
                     await message.channel.send(curse_msg)
                     return
-                reply, pts = _bless_target(target, award_points=True)
+                reply, pts, bless_word = _bless_target(target, award_points=True)
                 update_boli_points(db_conn, target.id, pts)
                 update_boli_points(db_conn, invoker.id, 1)
+                log_bless(db_conn, target.id, target.display_name, bless_word)
                 daily_count = increment_daily_action_count(db_conn, invoker.id)
                 if daily_count > _DAILY_QUOTA:
                     decrement_extra_actions(db_conn, invoker.id)
@@ -1188,16 +1455,17 @@ async def on_message(message: discord.Message) -> None:
         daily_count = get_daily_action_count(db_conn, invoker.id)
         extra_actions = get_extra_actions(db_conn, invoker.id)
         if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
-            reply, _ = _bless_target(target, award_points=False)
+            reply, _, _ = _bless_target(target, award_points=False)
             await message.reply(reply)
             curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
                 invoker=invoker.display_name, quota=_DAILY_QUOTA
             )
             await message.channel.send(curse_msg)
             return
-        reply, pts = _bless_target(target, award_points=True)
+        reply, pts, bless_word = _bless_target(target, award_points=True)
         update_boli_points(db_conn, target.id, pts)
         update_boli_points(db_conn, invoker.id, 1)
+        log_bless(db_conn, target.id, target.display_name, bless_word)
         daily_count = increment_daily_action_count(db_conn, invoker.id)
         if daily_count > _DAILY_QUOTA:
             decrement_extra_actions(db_conn, invoker.id)
@@ -1512,6 +1780,46 @@ async def rank_slash(interaction: discord.Interaction, page: int = 1) -> None:
     if page < total_pages:
         nav += f"→ `/rank page:{page + 1}`"
     embed.set_footer(text=f"{nav.strip() or 'Earn points by using /navi and Trivandrum slang.'}")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="leaderboard", description="Fun stats leaderboard: most cursed, most blessed, and richest")
+async def leaderboard_slash(interaction: discord.Interaction) -> None:
+    """Three-section embed: most cursed, most blessed, highest Boli net worth."""
+    await interaction.response.defer(thinking=False)
+
+    curse_board = get_curse_leaderboard(db_conn, limit=5)
+    bless_board = get_bless_leaderboard(db_conn, limit=5)
+    rich_board = get_leaderboard(db_conn, limit=5, offset=0)
+
+    embed = discord.Embed(
+        title="🌌 Cosmic Leaderboards",
+        color=discord.Color.dark_purple(),
+    )
+
+    medals = ["🥇", "🥈", "🥉", "4.", "5."]
+
+    def _fmt_board(entries: list[dict], count_key: str) -> str:
+        if not entries:
+            return "*No data yet.*"
+        lines = []
+        for i, e in enumerate(entries):
+            medal = medals[i] if i < len(medals) else f"{i+1}."
+            lines.append(f"{medal} **{e['username']}** — {e[count_key]}")
+        return "\n".join(lines)
+
+    curse_lines = _fmt_board(curse_board, "hits")
+    bless_lines = _fmt_board(bless_board, "hits")
+    rich_lines = "\n".join(
+        f"{medals[i] if i < len(medals) else f'{i+1}.'} **{e['username']}** — 🍮 {e['boli_points']} pts"
+        for i, e in enumerate(rich_board)
+    ) if rich_board else "*No data yet.*"
+
+    embed.add_field(name="💀 Most Cursed", value=curse_lines, inline=False)
+    embed.add_field(name="✨ Most Blessed", value=bless_lines, inline=False)
+    embed.add_field(name="💰 Highest Boli Net Worth", value=rich_lines, inline=False)
+    embed.set_footer(text="Curse & bless counts update in real time · /rank for full points board")
+
     await interaction.followup.send(embed=embed)
 
 
@@ -2281,6 +2589,250 @@ async def strike_slash(
 
 
 # ---------------------------------------------------------------------------
+# Gambling Mini-Games
+# ---------------------------------------------------------------------------
+
+_ROULETTE_RED: frozenset[int] = frozenset({1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36})
+
+
+def _gambling_guard(
+    profile: dict | None,
+    bet: int,
+) -> str | None:
+    """Return an error string if the bet is invalid, else None."""
+    if profile is None:
+        return "No profile found. Use /navi first to get started."
+    if bet < 1:
+        return "Bet must be at least 1 Boli."
+    if profile["boli_points"] < bet:
+        return f"Not enough Boli. You have 🍮 **{profile['boli_points']}** but bet **{bet}**."
+    return None
+
+
+@tree.command(name="flip", description="Coin flip — bet Boli on heads or tails (1:1 payout)")
+@app_commands.describe(choice="heads or tails", bet="How many Boli to wager")
+@app_commands.choices(choice=[
+    app_commands.Choice(name="Heads", value="heads"),
+    app_commands.Choice(name="Tails", value="tails"),
+])
+async def flip_slash(
+    interaction: discord.Interaction,
+    choice: str,
+    bet: app_commands.Range[int, 1, 50000],
+) -> None:
+    profile = get_user_profile(db_conn, interaction.user.id)
+    err = _gambling_guard(profile, bet)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    update_boli_points(db_conn, interaction.user.id, -bet)
+    await asyncio.sleep(1.5)
+
+    result = random.choice(["heads", "tails"])
+    coin_emoji = "🪙"
+    if result == choice:
+        update_boli_points(db_conn, interaction.user.id, bet * 2)
+        outcome = f"✅ **{result.capitalize()}!** You win **{bet} Boli**! {coin_emoji}"
+    else:
+        outcome = f"❌ **{result.capitalize()}.** You lose **{bet} Boli**. {coin_emoji}"
+
+    embed = discord.Embed(
+        title=f"{coin_emoji} Cosmic Coin Flip",
+        description=f"{interaction.user.mention} bet **{bet} Boli** on **{choice}**.\n\n{outcome}",
+        color=discord.Color.green() if result == choice else discord.Color.red(),
+    )
+    new_pts = (profile["boli_points"] - bet) + (bet * 2 if result == choice else 0)
+    embed.set_footer(text=f"Balance: 🍮 {new_pts} Boli")
+    await interaction.followup.send(embed=embed)
+    logger.info(
+        "%s flipped %s on %s, result=%s → %s",
+        interaction.user.display_name, bet, choice, result, "win" if result == choice else "lose",
+    )
+
+
+@tree.command(name="roll_dice", description="Roll two dice — bet on over 7, under 7, or exact 7")
+@app_commands.describe(bet_type="Your prediction", bet="How many Boli to wager")
+@app_commands.choices(bet_type=[
+    app_commands.Choice(name="Over 7 (1:1 payout)", value="over7"),
+    app_commands.Choice(name="Under 7 (1:1 payout)", value="under7"),
+    app_commands.Choice(name="Exact 7 (4:1 payout)", value="exact7"),
+])
+async def roll_dice_slash(
+    interaction: discord.Interaction,
+    bet_type: str,
+    bet: app_commands.Range[int, 1, 50000],
+) -> None:
+    profile = get_user_profile(db_conn, interaction.user.id)
+    err = _gambling_guard(profile, bet)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    update_boli_points(db_conn, interaction.user.id, -bet)
+    await asyncio.sleep(1.5)
+
+    d1, d2 = random.randint(1, 6), random.randint(1, 6)
+    total = d1 + d2
+
+    if bet_type == "over7":
+        won = total > 7
+        payout_mult = 2
+    elif bet_type == "under7":
+        won = total < 7
+        payout_mult = 2
+    else:  # exact7
+        won = total == 7
+        payout_mult = 5
+
+    winnings = bet * payout_mult if won else 0
+    if won:
+        update_boli_points(db_conn, interaction.user.id, winnings)
+
+    dice_display = f"🎲 **{d1}** + **{d2}** = **{total}**"
+    outcome_str = f"✅ **Win!** +**{winnings - bet} Boli**" if won else f"❌ **Loss.** -{bet} Boli"
+    embed = discord.Embed(
+        title="🎲 Cosmic Dice",
+        description=(
+            f"{interaction.user.mention} bet **{bet} Boli** on **{bet_type}**.\n\n"
+            f"{dice_display}\n\n{outcome_str}"
+        ),
+        color=discord.Color.green() if won else discord.Color.red(),
+    )
+    new_pts = (profile["boli_points"] - bet) + winnings
+    embed.set_footer(text=f"Balance: 🍮 {new_pts} Boli")
+    await interaction.followup.send(embed=embed)
+    logger.info(
+        "%s rolled dice (%d+%d=%d) on %s, bet=%d → %s",
+        interaction.user.display_name, d1, d2, total, bet_type, bet, "win" if won else "lose",
+    )
+
+
+@tree.command(name="roulette", description="Space roulette — bet on a color (1:1) or number 1-36 (35:1)")
+@app_commands.describe(
+    choice="red, black, or a number 1-36",
+    bet="How many Boli to wager",
+)
+async def roulette_slash(
+    interaction: discord.Interaction,
+    choice: str,
+    bet: app_commands.Range[int, 1, 50000],
+) -> None:
+    choice = choice.strip().lower()
+    valid_colors = {"red", "black"}
+    is_color = choice in valid_colors
+    is_number = choice.isdigit() and 1 <= int(choice) <= 36
+    if not is_color and not is_number:
+        await interaction.response.send_message(
+            "Invalid choice. Use `red`, `black`, or a number `1`–`36`.", ephemeral=True
+        )
+        return
+
+    profile = get_user_profile(db_conn, interaction.user.id)
+    err = _gambling_guard(profile, bet)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    update_boli_points(db_conn, interaction.user.id, -bet)
+
+    await interaction.followup.send(
+        f"🌀 The cosmic wheel is spinning for {interaction.user.mention}…", silent=True
+    )
+    await asyncio.sleep(2)
+
+    landed = random.randint(1, 36)
+    landed_color = "red" if landed in _ROULETTE_RED else "black"
+    color_emoji = "🔴" if landed_color == "red" else "⚫"
+
+    if is_color:
+        won = landed_color == choice
+        payout_mult = 2
+    else:
+        won = landed == int(choice)
+        payout_mult = 36
+
+    winnings = bet * payout_mult if won else 0
+    if won:
+        update_boli_points(db_conn, interaction.user.id, winnings)
+
+    outcome_str = f"✅ **Win!** +**{winnings - bet} Boli**" if won else f"❌ **Loss.** -{bet} Boli"
+    embed = discord.Embed(
+        title="🌀 Space Roulette",
+        description=(
+            f"{interaction.user.mention} bet **{bet} Boli** on **{choice}**.\n\n"
+            f"The wheel landed on: {color_emoji} **{landed}** ({landed_color})\n\n{outcome_str}"
+        ),
+        color=discord.Color.green() if won else discord.Color.red(),
+    )
+    new_pts = (profile["boli_points"] - bet) + winnings
+    embed.set_footer(text=f"Balance: 🍮 {new_pts} Boli")
+    await interaction.followup.send(embed=embed)
+    logger.info(
+        "%s roulette: bet %d on '%s', landed %d (%s) → %s",
+        interaction.user.display_name, bet, choice, landed, landed_color, "win" if won else "lose",
+    )
+
+
+# ---------------------------------------------------------------------------
+# /gift — send Boli points to another user
+# ---------------------------------------------------------------------------
+
+_GIFT_TEMPLATES: list[str] = [
+    "✨ A cosmic breeze just blew **{amount} Boli** from {sender} into {recipient}'s pocket! Don't spend it all in one dimension.",
+    "💖 {sender} just sprinkled **{amount} Boli** points onto {recipient}! Friendship level up!",
+    "🚀 Delivery! {sender} fired a care package of **{amount} Boli** straight at {recipient}.",
+    "🪄 Poof! {sender} magically transferred **{amount} Boli** to {recipient}. Use it wisely!",
+    "🎁 {sender} slipped **{amount} Boli** under {recipient}'s pillow. The Boli fairy has arrived!",
+]
+
+
+@tree.command(name="gift", description="Gift Boli points to another user")
+@app_commands.describe(recipient="Who to gift points to", amount="How many Boli points to send")
+async def gift_slash(
+    interaction: discord.Interaction,
+    recipient: discord.Member,
+    amount: app_commands.Range[int, 1, 10000],
+) -> None:
+    if recipient.id == interaction.user.id:
+        await interaction.response.send_message("You can't gift points to yourself.", ephemeral=True)
+        return
+    if recipient.bot:
+        await interaction.response.send_message("Bots don't need Boli points.", ephemeral=True)
+        return
+
+    profile = get_user_profile(db_conn, interaction.user.id)
+    if not profile:
+        await interaction.response.send_message(
+            "No profile found. Use /navi first to get started.", ephemeral=True
+        )
+        return
+
+    sender_pts = profile["boli_points"]
+    if sender_pts < amount:
+        await interaction.response.send_message(
+            f"Not enough Boli. You have 🍮 **{sender_pts}** but tried to gift **{amount}**.",
+            ephemeral=True,
+        )
+        return
+
+    update_boli_points(db_conn, interaction.user.id, -amount)
+    upsert_user(db_conn, recipient.id, recipient.display_name)
+    update_boli_points(db_conn, recipient.id, amount)
+
+    msg = random.choice(_GIFT_TEMPLATES).format(
+        sender=interaction.user.mention,
+        recipient=recipient.mention,
+        amount=amount,
+    )
+    await interaction.response.send_message(msg)
+    logger.info("%s gifted %d Boli to %s", interaction.user.display_name, amount, recipient.display_name)
+
+
+# ---------------------------------------------------------------------------
 # Boli Marketplace
 # ---------------------------------------------------------------------------
 
@@ -2306,6 +2858,28 @@ _SHOP_ITEMS: dict[str, dict] = {
         "emoji": "🔋",
         "duration_hours": 0,
     },
+    "deflector_shield": {
+        "name": "Deflector Shield",
+        "cost": 15,
+        "description": "For 30 minutes after activation, any curse aimed at you is automatically reversed back to the caster.",
+        "emoji": "🔮",
+        "duration_hours": 0.5,
+    },
+    "timeout_ticket": {
+        "name": "Timeout Ticket",
+        "cost": 25,
+        "description": "Block a target user from casting curses for 30 minutes. They lose 3 Boli per attempt. Requires a target.",
+        "emoji": "🚫",
+        "duration_hours": 0.5,
+        "requires_target": True,
+    },
+    "multiplier_potion": {
+        "name": "Multiplier Potion",
+        "cost": 35,
+        "description": "For 15 minutes, every curse you cast fires twice. The 2nd curse (15–45s later) mirrors the fate of the 1st.",
+        "emoji": "⚡",
+        "duration_hours": 0.25,
+    },
 }
 
 
@@ -2325,11 +2899,17 @@ class ShopGroup(app_commands.Group):
             description=f"Your balance: 🍮 **{pts} Boli Points**\nUse `/shop buy <item>` to purchase.",
             color=discord.Color.dark_gold(),
         )
+        _perk_map = {
+            "curse_protection": "curse_protection",
+            "deflector_shield": "deflector_shield",
+            "multiplier_potion": "multiplier_potion",
+        }
         for item_id, item in _SHOP_ITEMS.items():
             can_afford = "✅" if pts >= item["cost"] else "❌"
             active_note = ""
-            if item_id == "curse_protection":
-                expiry = get_perk_expiry(db_conn, interaction.user.id, "curse_protection")
+            perk_key = _perk_map.get(item_id)
+            if perk_key:
+                expiry = get_perk_expiry(db_conn, interaction.user.id, perk_key)
                 if expiry:
                     expiry_utc = expiry.replace(tzinfo=timezone.utc)
                     active_note = f"\n*(Active until <t:{int(expiry_utc.timestamp())}:t>)*"
@@ -2343,17 +2923,25 @@ class ShopGroup(app_commands.Group):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="buy", description="Purchase an item from the Boli Marketplace")
-    @app_commands.describe(item="Which item to buy", rashi_choice="Your chosen Rashi (only for custom_rashi)")
+    @app_commands.describe(
+        item="Which item to buy",
+        rashi_choice="Your chosen Rashi (only for custom_rashi)",
+        target="Target user (only for timeout_ticket)",
+    )
     @app_commands.choices(item=[
         app_commands.Choice(name="🛡️ Curse Protection (20 pts)", value="curse_protection"),
         app_commands.Choice(name="🌟 Customize Rashi (40 pts)", value="custom_rashi"),
         app_commands.Choice(name="🔋 10x Cosmic Actions Refill (30 pts)", value="action_refill"),
+        app_commands.Choice(name="🔮 Deflector Shield (15 pts)", value="deflector_shield"),
+        app_commands.Choice(name="🚫 Timeout Ticket (25 pts)", value="timeout_ticket"),
+        app_commands.Choice(name="⚡ Multiplier Potion (35 pts)", value="multiplier_potion"),
     ])
     async def buy(
         self,
         interaction: discord.Interaction,
         item: str,
         rashi_choice: str | None = None,
+        target: discord.Member | None = None,
     ) -> None:
         if item not in _SHOP_ITEMS:
             await interaction.response.send_message("That item doesn't exist.", ephemeral=True)
@@ -2433,6 +3021,64 @@ class ShopGroup(app_commands.Group):
                 ephemeral=True,
             )
             logger.info("%s purchased Action Refill (+10 extra actions)", interaction.user.display_name)
+
+        # --- Deflector Shield ---
+        elif item == "deflector_shield":
+            update_boli_points(db_conn, interaction.user.id, -cost)
+            grant_perk(db_conn, interaction.user.id, "deflector_shield", duration_hours=0.5)
+            expiry = get_perk_expiry(db_conn, interaction.user.id, "deflector_shield")
+            expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
+            ts = f"<t:{int(expiry_utc.timestamp())}:f>" if expiry_utc else "30 minutes"
+            await interaction.response.send_message(
+                f"🔮 **Deflector Shield active!** {interaction.user.mention}, curses will bounce back to their caster until {ts}.\n"
+                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+                ephemeral=True,
+            )
+            logger.info("%s purchased Deflector Shield", interaction.user.display_name)
+
+        # --- Timeout Ticket ---
+        elif item == "timeout_ticket":
+            if target is None:
+                await interaction.response.send_message(
+                    "🚫 **Timeout Ticket** requires a target. Use `/shop buy item:timeout_ticket target:@user`.",
+                    ephemeral=True,
+                )
+                return
+            if target.bot:
+                await interaction.response.send_message("You can't timeout a bot.", ephemeral=True)
+                return
+            if target.id == interaction.user.id:
+                await interaction.response.send_message("You can't timeout yourself.", ephemeral=True)
+                return
+            update_boli_points(db_conn, interaction.user.id, -cost)
+            upsert_user(db_conn, target.id, target.display_name)
+            grant_perk(db_conn, target.id, "curse_timeout", duration_hours=0.5)
+            expiry = get_perk_expiry(db_conn, target.id, "curse_timeout")
+            expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
+            ts = f"<t:{int(expiry_utc.timestamp())}:f>" if expiry_utc else "30 minutes"
+            await interaction.response.send_message(
+                f"🚫 **Timeout Ticket used!** {target.mention} is barred from casting curses until {ts}. "
+                f"Any attempt will cost them 3 Boli.\n"
+                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+            )
+            logger.info(
+                "%s used Timeout Ticket on %s", interaction.user.display_name, target.display_name
+            )
+
+        # --- Multiplier Potion ---
+        elif item == "multiplier_potion":
+            update_boli_points(db_conn, interaction.user.id, -cost)
+            grant_perk(db_conn, interaction.user.id, "multiplier_potion", duration_hours=0.25)
+            expiry = get_perk_expiry(db_conn, interaction.user.id, "multiplier_potion")
+            expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
+            ts = f"<t:{int(expiry_utc.timestamp())}:f>" if expiry_utc else "15 minutes"
+            await interaction.response.send_message(
+                f"⚡ **Multiplier Potion active!** {interaction.user.mention}, every curse you cast until {ts} "
+                f"will fire twice — the 2nd following 15–45 seconds later, fate-locked to the 1st.\n"
+                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+                ephemeral=True,
+            )
+            logger.info("%s purchased Multiplier Potion", interaction.user.display_name)
 
 
 tree.add_command(ShopGroup())

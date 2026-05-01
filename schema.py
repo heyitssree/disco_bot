@@ -184,6 +184,30 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE app_emojis ADD COLUMN IF NOT EXISTS original_id VARCHAR")
     conn.execute("ALTER TABLE app_emojis ADD COLUMN IF NOT EXISTS animated BOOLEAN DEFAULT FALSE")
 
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS local_media (
+            shortcut    VARCHAR PRIMARY KEY,
+            user_id     BIGINT NOT NULL,
+            file_path   VARCHAR NOT NULL,
+            media_type  VARCHAR NOT NULL,
+            source_url  VARCHAR,
+            created_at  TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bless_logs (
+            id          INTEGER PRIMARY KEY,
+            user_id     BIGINT NOT NULL,
+            username    VARCHAR NOT NULL,
+            bless_used  VARCHAR NOT NULL,
+            timestamp   TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+    conn.execute("""
+        CREATE SEQUENCE IF NOT EXISTS bless_logs_seq START 1
+    """)
+
     # Insert default config if empty
     conn.execute("""
         INSERT INTO bot_config (key, value_float, value_int)
@@ -231,6 +255,17 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         INSERT INTO bot_config (key, value_int)
         SELECT 'master_killswitch', 0
         WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'master_killswitch');
+    """)
+
+    conn.execute("""
+        INSERT INTO bot_config (key, value_int)
+        SELECT 'local_media_max_per_user', 20
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'local_media_max_per_user');
+    """)
+    conn.execute("""
+        INSERT INTO bot_config (key, value_int)
+        SELECT 'local_media_max_global', 200
+        WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'local_media_max_global');
     """)
 
     # Emoji for link-summary reaction (Feature 3)
@@ -971,18 +1006,23 @@ def grant_perk(
     conn: duckdb.DuckDBPyConnection,
     user_id: int,
     perk_type: str,
-    duration_hours: int = 24,
+    duration_hours: float = 24,
 ) -> None:
-    """Grant a timed perk to a user, extending if they already have one."""
+    """Grant a timed perk to a user, extending if they already have one.
+
+    duration_hours may be fractional (e.g. 0.5 for 30 minutes).
+    """
+    duration_seconds = int(duration_hours * 3600)
+
     def _write() -> None:
         conn.execute(
             """
             INSERT INTO user_perks (user_id, perk_type, expires_at)
-            VALUES (?, ?, current_timestamp + INTERVAL (?) HOUR)
+            VALUES (?, ?, current_timestamp + INTERVAL (?) SECOND)
             ON CONFLICT (user_id, perk_type) DO UPDATE SET
                 expires_at = GREATEST(user_perks.expires_at, excluded.expires_at)
             """,
-            [user_id, perk_type, duration_hours],
+            [user_id, perk_type, duration_seconds],
         )
         conn.commit()
     _db_write(_write)
@@ -1099,3 +1139,159 @@ def count_app_emojis(conn: duckdb.DuckDBPyConnection) -> int:
     """Return the number of application emoji records stored in the database."""
     row = conn.execute("SELECT COUNT(*) FROM app_emojis").fetchone()
     return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# Local Media (user-stolen emojis/stickers stored on disk)
+# ---------------------------------------------------------------------------
+
+def save_local_media(
+    conn: duckdb.DuckDBPyConnection,
+    user_id: int,
+    shortcut: str,
+    file_path: str,
+    media_type: str,
+    source_url: str | None = None,
+) -> None:
+    """Insert a local media entry, replacing any existing entry for the same shortcut."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO local_media (shortcut, user_id, file_path, media_type, source_url, created_at)
+            VALUES (?, ?, ?, ?, ?, current_timestamp)
+            ON CONFLICT (shortcut) DO UPDATE SET
+                user_id = excluded.user_id,
+                file_path = excluded.file_path,
+                media_type = excluded.media_type,
+                source_url = excluded.source_url,
+                created_at = current_timestamp
+            """,
+            [shortcut, user_id, file_path, media_type, source_url],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_local_media(
+    conn: duckdb.DuckDBPyConnection,
+    shortcut: str,
+) -> dict | None:
+    """Return local media entry for the given shortcut, or None if not found."""
+    row = conn.execute(
+        "SELECT shortcut, user_id, file_path, media_type, source_url, created_at FROM local_media WHERE shortcut = ?",
+        [shortcut],
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "shortcut": row[0],
+        "user_id": row[1],
+        "file_path": row[2],
+        "media_type": row[3],
+        "source_url": row[4],
+        "created_at": row[5],
+    }
+
+
+def get_user_local_media_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+    """Return how many local media entries the user has saved."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM local_media WHERE user_id = ?", [user_id]
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def get_global_local_media_count(conn: duckdb.DuckDBPyConnection) -> int:
+    """Return total number of local media entries stored globally."""
+    row = conn.execute("SELECT COUNT(*) FROM local_media").fetchone()
+    return row[0] if row else 0
+
+
+def list_user_local_media(
+    conn: duckdb.DuckDBPyConnection,
+    user_id: int,
+) -> list[dict]:
+    """Return all local media entries owned by a user, newest first."""
+    rows = conn.execute(
+        "SELECT shortcut, file_path, media_type, created_at FROM local_media WHERE user_id = ? ORDER BY created_at DESC",
+        [user_id],
+    ).fetchall()
+    return [{"shortcut": r[0], "file_path": r[1], "media_type": r[2], "created_at": r[3]} for r in rows]
+
+
+def delete_local_media(conn: duckdb.DuckDBPyConnection, shortcut: str) -> bool:
+    """Delete a local media entry by shortcut. Returns True if a row was deleted."""
+    existing = conn.execute(
+        "SELECT 1 FROM local_media WHERE shortcut = ?", [shortcut]
+    ).fetchone()
+    if not existing:
+        return False
+    _db_write(lambda: (
+        conn.execute("DELETE FROM local_media WHERE shortcut = ?", [shortcut]),
+        conn.commit(),
+    ))
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Bless logs (parallel to curse_logs, used by /leaderboard)
+# ---------------------------------------------------------------------------
+
+def log_bless(
+    conn: duckdb.DuckDBPyConnection,
+    user_id: int,
+    username: str,
+    bless_used: str,
+) -> None:
+    """Log a successful bless event (recipient's perspective)."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO bless_logs (id, user_id, username, bless_used)
+            VALUES (nextval('bless_logs_seq'), ?, ?, ?)
+            """,
+            [user_id, username, bless_used],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+# ---------------------------------------------------------------------------
+# Fun leaderboards (/leaderboard command)
+# ---------------------------------------------------------------------------
+
+def get_curse_leaderboard(
+    conn: duckdb.DuckDBPyConnection,
+    limit: int = 5,
+) -> list[dict]:
+    """Return the most-cursed users (excluding backfires from the count)."""
+    rows = conn.execute(
+        """
+        SELECT user_id, username, COUNT(*) AS hits
+        FROM curse_logs
+        WHERE curse_used NOT LIKE 'backfire_%' AND curse_used NOT LIKE 'proxy_%'
+        GROUP BY user_id, username
+        ORDER BY hits DESC
+        LIMIT ?
+        """,
+        [limit],
+    ).fetchall()
+    return [{"user_id": r[0], "username": r[1], "hits": r[2]} for r in rows]
+
+
+def get_bless_leaderboard(
+    conn: duckdb.DuckDBPyConnection,
+    limit: int = 5,
+) -> list[dict]:
+    """Return the most-blessed users."""
+    rows = conn.execute(
+        """
+        SELECT user_id, username, COUNT(*) AS hits
+        FROM bless_logs
+        GROUP BY user_id, username
+        ORDER BY hits DESC
+        LIMIT ?
+        """,
+        [limit],
+    ).fetchall()
+    return [{"user_id": r[0], "username": r[1], "hits": r[2]} for r in rows]

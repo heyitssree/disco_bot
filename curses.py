@@ -10,28 +10,28 @@ import random
 # ---------------------------------------------------------------------------
 
 CURSE_WORDS: list[dict] = [
-    # Tier 1 — Low risk, low reward
-    {"word": "madiyan",      "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
-    {"word": "kozhi",        "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
-    {"word": "vayadi",       "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
-    {"word": "mandan",       "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
-    {"word": "pottan",       "tier": "Mild",     "target_damage": 3,  "invoker_reward": 2, "backfire_chance": 0.15},
+    # Tier 1 — Low risk, moderate reward (5% backfire)
+    {"word": "madiyan",      "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
+    {"word": "kozhi",        "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
+    {"word": "vayadi",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
+    {"word": "mandan",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
+    {"word": "pottan",       "tier": "Mild",     "target_damage": 5,  "invoker_reward": 3, "backfire_chance": 0.05},
 
-    # Tier 2 — Medium risk, medium reward
-    {"word": "vattan",       "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
-    {"word": "oolan",        "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
-    {"word": "shasi",        "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
-    {"word": "vazha",        "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
-    {"word": "kumbidi",      "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
-    {"word": "kalippan",     "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
-    {"word": "durantham",    "tier": "Moderate", "target_damage": 5,  "invoker_reward": 4, "backfire_chance": 0.30},
+    # Tier 2 — Medium risk, higher reward (7% backfire)
+    {"word": "vattan",       "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
+    {"word": "oolan",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
+    {"word": "shasi",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
+    {"word": "vazha",        "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
+    {"word": "kumbidi",      "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
+    {"word": "kalippan",     "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
+    {"word": "durantham",    "tier": "Moderate", "target_damage": 10, "invoker_reward": 6, "backfire_chance": 0.07},
 
-    # Tier 3 — High risk, high reward
-    {"word": "thallippoli",    "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
-    {"word": "perum kallan",   "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
-    {"word": "dushtan",        "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
-    {"word": "kuzhappakkaran", "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
-    {"word": "alavalathi",     "tier": "Severe", "target_damage": 7,  "invoker_reward": 6, "backfire_chance": 0.45},
+    # Tier 3 — High risk, high reward (10% backfire)
+    {"word": "thallippoli",    "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
+    {"word": "perum kallan",   "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
+    {"word": "dushtan",        "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
+    {"word": "kuzhappakkaran", "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
+    {"word": "alavalathi",     "tier": "Severe", "target_damage": 20, "invoker_reward": 12, "backfire_chance": 0.10},
 ]
 
 # Severe subset that triggers the 3-strike system (Feature 7).
