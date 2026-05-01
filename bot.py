@@ -593,7 +593,7 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
     """Modal asking the user for a ;;name shortcut when stealing media."""
 
     shortcut_name = discord.ui.TextInput(
-        label="Shortcut name (type ;;name to trigger it later)",
+        label="Shortcut name (type ;;name to use later)",
         placeholder="e.g. stolen_meme",
         min_length=2,
         max_length=30,
