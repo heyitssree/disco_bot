@@ -52,12 +52,6 @@ from schema import (
     get_extra_actions,
     decrement_extra_actions,
     add_extra_actions,
-    save_app_emoji,
-    get_oldest_app_emoji,
-    get_recent_app_emojis,
-    original_emoji_exists,
-    delete_app_emoji_record,
-    update_app_emoji_last_used,
     count_leaderboard_entries,
     DB_PATH,
     save_local_media,
@@ -580,125 +574,15 @@ async def get_navi_prediction(user_id: int, name: str, usage_count: int = 1) -> 
 _APP_EMOJI_RE = re.compile(r"<a?:\w+:(\d+)>")
 
 
-def _refresh_app_emoji_usage(content: str) -> None:
-    """Update last_used for any application emoji IDs found in content."""
-    if db_conn is None:
-        return
-    for emoji_id in _APP_EMOJI_RE.findall(content):
-        try:
-            update_app_emoji_last_used(db_conn, emoji_id)
-        except Exception as exc:
-            logger.debug("Could not refresh emoji LRU for id %s: %s", emoji_id, exc)
-
-
 # Matches custom emojis: <:name:id> or <a:name:id>
 _CUSTOM_EMOJI_RE = re.compile(r"<(a?):(\w+):(\d+)>")
-_APP_EMOJI_MAX = 15  # Hard cap on stored application emojis
 
 # Local media shortcut trigger (;;name)
 _LOCAL_SHORTCUT_RE = re.compile(r"^;;(\w+)", re.IGNORECASE)
 _LOCAL_MEDIA_DIR = "data/local_media"
 
 
-def _emoji_format(name: str, emoji_id: str, animated: bool) -> str:
-    prefix = "a" if animated else ""
-    return f"<{prefix}:{name}:{emoji_id}>"
 
-
-# ---------------------------------------------------------------------------
-# Emoji picker UI (Select menu for "Reply with Emoji" context menu)
-# ---------------------------------------------------------------------------
-
-class EmojiPickerView(discord.ui.View):
-    def __init__(self, target_message: discord.Message, emojis: list[dict]) -> None:
-        super().__init__(timeout=60)
-        self._target = target_message
-
-        options = [
-            discord.SelectOption(
-                label=e["name"],
-                value=e["emoji_id"],
-                emoji=discord.PartialEmoji(
-                    name=e["name"],
-                    id=int(e["emoji_id"]),
-                    animated=bool(e.get("animated", False)),
-                ),
-            )
-            for e in emojis
-        ]
-        select = discord.ui.Select(placeholder="Pick an emoji to reply with…", options=options)
-        select.callback = self._on_select
-        self.add_item(select)
-
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        emoji_id = interaction.data["values"][0]
-        chosen = next((o for o in self.children[0].options if o.value == emoji_id), None)
-        if chosen is None:
-            await interaction.response.edit_message(content="Could not find that emoji.", view=None)
-            return
-
-        is_animated = chosen.emoji.animated if chosen.emoji else False
-        fmt = _emoji_format(chosen.label, emoji_id, is_animated)
-
-        try:
-            await self._target.reply(fmt)
-            update_app_emoji_last_used(db_conn, emoji_id)
-        except discord.HTTPException as exc:
-            await interaction.response.edit_message(
-                content=f"Could not send: {exc.text}", view=None
-            )
-            return
-
-        await interaction.response.edit_message(
-            content=f"Replied with {fmt}", view=None
-        )
-
-    async def on_timeout(self) -> None:
-        for item in self.children:
-            item.disabled = True
-
-
-@tree.context_menu(name="Reply with Emoji")
-async def reply_with_emoji_context(
-    interaction: discord.Interaction, message: discord.Message
-) -> None:
-    """Right-click → Apps → Reply with Emoji: pick a stored emoji and bot replies to the message."""
-    emojis = get_recent_app_emojis(db_conn, limit=_APP_EMOJI_MAX)
-    if not emojis:
-        await interaction.response.send_message(
-            "No emojis stored yet. Use **Save as Emoji** on a message first.", ephemeral=True
-        )
-        return
-
-    view = EmojiPickerView(target_message=message, emojis=emojis)
-    await interaction.response.send_message(
-        "Which emoji should I reply with?", view=view, ephemeral=True
-    )
-
-
-@tree.command(name="emojis", description="Browse the stolen emoji collection")
-async def emojis_slash(interaction: discord.Interaction) -> None:
-    """List all stored application emojis with previews."""
-    emojis = get_recent_app_emojis(db_conn, limit=_APP_EMOJI_MAX)
-    if not emojis:
-        await interaction.response.send_message(
-            "No emojis stored yet. Right-click any message → **Apps** → **Save as Emoji** to add one.",
-            ephemeral=True,
-        )
-        return
-
-    lines = []
-    for e in emojis:
-        preview = _emoji_format(e["name"], e["emoji_id"], bool(e.get("animated", False)))
-        lines.append(f"{preview} `:{e['name']}:`")
-
-    embed = discord.Embed(
-        title="Stolen Emoji Collection",
-        description="\n".join(lines),
-        color=discord.Color.blurple(),
-    )
-    embed.set_footer(text=f"{len(emojis)}/{_APP_EMOJI_MAX} slots used · right-click a message → Apps → Reply with Emoji to use one")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +712,7 @@ async def save_as_emoji_context(interaction: discord.Interaction, message: disco
             if att.content_type and att.content_type.startswith("image/"):
                 ext_guess = att.filename.rsplit(".", 1)[-1].lower()
                 file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
-                media_type = "gif" if file_ext == "gif" else "image"
+                media_type = "emoji"
                 download_url = att.url
                 break
 
@@ -869,7 +753,7 @@ async def save_as_sticker_context(interaction: discord.Interaction, message: dis
             if att.content_type and att.content_type.startswith("image/"):
                 ext_guess = att.filename.rsplit(".", 1)[-1].lower()
                 file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
-                media_type = "gif" if file_ext == "gif" else "image"
+                media_type = "sticker"
                 download_url = att.url
                 break
 
@@ -950,20 +834,37 @@ class LocalMediaPickerView(discord.ui.View):
             item.disabled = True
 
 
-@tree.context_menu(name="Reply with Media")
-async def reply_with_media_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Reply with Media: pick a saved ;;shortcut and reply to this message with it."""
-    entries = list_user_local_media(db_conn, interaction.user.id)
+@tree.context_menu(name="Reply with Emoji")
+async def reply_with_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
+    """Right-click → Apps → Reply with Emoji: pick a saved emoji shortcut and reply to this message with it."""
+    entries = list_user_local_media(db_conn, interaction.user.id, media_type="emoji")
     if not entries:
         await interaction.response.send_message(
-            "You have no saved media. Right-click a message → **Apps** → **Save as Emoji** or **Save as Sticker** first.",
+            "You have no saved emojis. Right-click a message → **Apps** → **Save as Emoji** first.",
             ephemeral=True,
         )
         return
 
     view = LocalMediaPickerView(target_message=message, entries=entries)
     await interaction.response.send_message(
-        "Which saved media should I reply with?", view=view, ephemeral=True
+        "Which saved emoji should I reply with?", view=view, ephemeral=True
+    )
+
+
+@tree.context_menu(name="Reply with Sticker")
+async def reply_with_sticker_context(interaction: discord.Interaction, message: discord.Message) -> None:
+    """Right-click → Apps → Reply with Sticker: pick a saved sticker shortcut and reply to this message with it."""
+    entries = list_user_local_media(db_conn, interaction.user.id, media_type="sticker")
+    if not entries:
+        await interaction.response.send_message(
+            "You have no saved stickers. Right-click a message → **Apps** → **Save as Sticker** first.",
+            ephemeral=True,
+        )
+        return
+
+    view = LocalMediaPickerView(target_message=message, entries=entries)
+    await interaction.response.send_message(
+        "Which saved sticker should I reply with?", view=view, ephemeral=True
     )
 
 
@@ -1074,11 +975,6 @@ async def on_message(message: discord.Message) -> None:
 
     # Master kill switch — ignore everything (except owner text commands)
     if _feat("master_killswitch"):
-        return
-
-    # Track application emoji usage in bot's own messages for LRU cache
-    if message.author.id == bot.user.id:
-        _refresh_app_emoji_usage(message.content)
         return
 
     # Ignore other bots

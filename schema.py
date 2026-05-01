@@ -1053,92 +1053,6 @@ def get_level_from_points(points: int) -> int:
     return min(max(n, 0), 100)
 
 
-# ---------------------------------------------------------------------------
-# Application Emojis (LRU cache for Discord Application Emojis)
-# ---------------------------------------------------------------------------
-
-def save_app_emoji(
-    conn: duckdb.DuckDBPyConnection,
-    emoji_id: str,
-    name: str,
-    original_id: str | None = None,
-    animated: bool = False,
-) -> None:
-    """Insert or replace an application emoji record with last_used = now."""
-    def _write() -> None:
-        conn.execute("DELETE FROM app_emojis WHERE emoji_id = ?", [emoji_id])
-        conn.execute(
-            "INSERT INTO app_emojis (emoji_id, name, last_used, original_id, animated) VALUES (?, ?, NOW(), ?, ?)",
-            [emoji_id, name, original_id, animated],
-        )
-        conn.commit()
-    _db_write(_write)
-
-
-def original_emoji_exists(conn: duckdb.DuckDBPyConnection, original_id: str) -> bool:
-    """Return True if an emoji with this source ID is already stored."""
-    row = conn.execute(
-        "SELECT 1 FROM app_emojis WHERE original_id = ?", [original_id]
-    ).fetchone()
-    return row is not None
-
-
-def get_oldest_app_emoji(
-    conn: duckdb.DuckDBPyConnection,
-) -> dict | None:
-    """Return the emoji record with the oldest last_used timestamp, or None."""
-    row = conn.execute(
-        "SELECT emoji_id, name, last_used, animated FROM app_emojis ORDER BY last_used ASC LIMIT 1"
-    ).fetchone()
-    if not row:
-        return None
-    return {"emoji_id": row[0], "name": row[1], "last_used": row[2], "animated": row[3]}
-
-
-def get_recent_app_emojis(
-    conn: duckdb.DuckDBPyConnection,
-    limit: int = 15,
-) -> list[dict]:
-    """Return the most recently used/added app emojis, newest first."""
-    rows = conn.execute(
-        "SELECT emoji_id, name, last_used, animated FROM app_emojis ORDER BY last_used DESC LIMIT ?",
-        [limit],
-    ).fetchall()
-    return [
-        {"emoji_id": r[0], "name": r[1], "last_used": r[2], "animated": r[3]}
-        for r in rows
-    ]
-
-
-def delete_app_emoji_record(
-    conn: duckdb.DuckDBPyConnection,
-    emoji_id: str,
-) -> None:
-    """Remove an emoji record from the database."""
-    def _write() -> None:
-        conn.execute("DELETE FROM app_emojis WHERE emoji_id = ?", [emoji_id])
-        conn.commit()
-    _db_write(_write)
-
-
-def update_app_emoji_last_used(
-    conn: duckdb.DuckDBPyConnection,
-    emoji_id: str,
-) -> None:
-    """Refresh last_used to now for a given emoji (called when the emoji is used)."""
-    def _write() -> None:
-        conn.execute(
-            "UPDATE app_emojis SET last_used = NOW() WHERE emoji_id = ?",
-            [emoji_id],
-        )
-        conn.commit()
-    _db_write(_write)
-
-
-def count_app_emojis(conn: duckdb.DuckDBPyConnection) -> int:
-    """Return the number of application emoji records stored in the database."""
-    row = conn.execute("SELECT COUNT(*) FROM app_emojis").fetchone()
-    return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1210,12 +1124,19 @@ def get_global_local_media_count(conn: duckdb.DuckDBPyConnection) -> int:
 def list_user_local_media(
     conn: duckdb.DuckDBPyConnection,
     user_id: int,
+    media_type: str | None = None,
 ) -> list[dict]:
     """Return all local media entries owned by a user, newest first."""
-    rows = conn.execute(
-        "SELECT shortcut, file_path, media_type, created_at FROM local_media WHERE user_id = ? ORDER BY created_at DESC",
-        [user_id],
-    ).fetchall()
+    if media_type:
+        rows = conn.execute(
+            "SELECT shortcut, file_path, media_type, created_at FROM local_media WHERE user_id = ? AND media_type = ? ORDER BY created_at DESC",
+            [user_id, media_type],
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT shortcut, file_path, media_type, created_at FROM local_media WHERE user_id = ? ORDER BY created_at DESC",
+            [user_id],
+        ).fetchall()
     return [{"shortcut": r[0], "file_path": r[1], "media_type": r[2], "created_at": r[3]} for r in rows]
 
 
