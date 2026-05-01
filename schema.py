@@ -181,8 +181,6 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             animated    BOOLEAN DEFAULT FALSE
         )
     """)
-    conn.execute("ALTER TABLE app_emojis ADD COLUMN IF NOT EXISTS original_id VARCHAR")
-    conn.execute("ALTER TABLE app_emojis ADD COLUMN IF NOT EXISTS animated BOOLEAN DEFAULT FALSE")
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS local_media (
@@ -282,6 +280,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS extra_actions INTEGER DEFAULT 0")
 
     conn.commit()
+    conn.execute("CHECKPOINT")
 
 
 # ---------------------------------------------------------------------------
