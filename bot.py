@@ -605,93 +605,6 @@ def _emoji_format(name: str, emoji_id: str, animated: bool) -> str:
     return f"<{prefix}:{name}:{emoji_id}>"
 
 
-async def _do_steal_emoji(
-    target_message: discord.Message,
-    respond: discord.abc.Messageable,
-    invoker_name: str,
-) -> None:
-    """Core steal logic — validate, deduplicate, download, upload, persist."""
-    matches = _CUSTOM_EMOJI_RE.findall(target_message.content)
-    if not matches:
-        await respond.send(
-            "No custom emoji in that message. Only custom emoji (not Unicode) can be stolen.",
-            ephemeral=True,
-        )
-        return
-    if len(matches) > 1:
-        await respond.send(
-            f"That message has **{len(matches)}** custom emojis — pick a message with exactly one.",
-            ephemeral=True,
-        )
-        return
-
-    animated_flag, name, emoji_id = matches[0]
-    is_animated = bool(animated_flag)
-
-    # Duplicate check
-    if original_emoji_exists(db_conn, emoji_id):
-        await respond.send(
-            f"`:{name}:` is already in the collection. Use **/emojis** to see what's stored.",
-            ephemeral=True,
-        )
-        return
-
-    extension = "gif" if is_animated else "png"
-    cdn_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{extension}"
-
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(cdn_url) as resp:
-                if resp.status != 200:
-                    await respond.send(
-                        f"Could not download the emoji image (CDN returned {resp.status}).",
-                        ephemeral=True,
-                    )
-                    return
-                image_bytes = await resp.read()
-    except Exception as exc:
-        logger.error("Failed to download emoji %s from CDN: %s", emoji_id, exc)
-        await respond.send("Failed to download the emoji image.", ephemeral=True)
-        return
-
-    try:
-        existing_emojis = await bot.fetch_application_emojis()
-        if len(existing_emojis) >= _APP_EMOJI_MAX:
-            oldest = get_oldest_app_emoji(db_conn)
-            if oldest:
-                for e in existing_emojis:
-                    if str(e.id) == oldest["emoji_id"]:
-                        await e.delete()
-                        break
-                delete_app_emoji_record(db_conn, oldest["emoji_id"])
-                logger.info("LRU evicted '%s' (id=%s) — cap=%d", oldest["name"], oldest["emoji_id"], _APP_EMOJI_MAX)
-
-        new_emoji = await bot.create_application_emoji(name=name, image=image_bytes)
-        save_app_emoji(db_conn, str(new_emoji.id), name, original_id=emoji_id, animated=is_animated)
-
-        preview = _emoji_format(name, str(new_emoji.id), is_animated)
-        await respond.send(
-            f"Stolen! {preview} `:{name}:` added to the collection.\n"
-            f"-# Use **/emojis** to browse the collection and reply to messages with it.",
-            ephemeral=True,
-        )
-        logger.info("%s stole '%s' (id=%s, animated=%s).", invoker_name, name, emoji_id, is_animated)
-    except discord.HTTPException as exc:
-        logger.error("Discord API error stealing '%s': %s", name, exc)
-        await respond.send(f"Discord rejected the upload: {exc.text}", ephemeral=True)
-    except Exception as exc:
-        logger.error("Unexpected error in _do_steal_emoji: %s", exc)
-        await respond.send("Something went wrong. Check the logs.", ephemeral=True)
-
-
-@tree.context_menu(name="Steal Emoji")
-async def steal_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Steal Emoji: uploads the sole custom emoji in the message as an app emoji."""
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    await _do_steal_emoji(message, interaction.followup, interaction.user.display_name)
-
-
 # ---------------------------------------------------------------------------
 # Emoji picker UI (Select menu for "Reply with Emoji" context menu)
 # ---------------------------------------------------------------------------
@@ -753,7 +666,7 @@ async def reply_with_emoji_context(
     emojis = get_recent_app_emojis(db_conn, limit=_APP_EMOJI_MAX)
     if not emojis:
         await interaction.response.send_message(
-            "No emojis stored yet. Use **Steal Emoji** on a message first.", ephemeral=True
+            "No emojis stored yet. Use **Save as Emoji** on a message first.", ephemeral=True
         )
         return
 
@@ -769,7 +682,7 @@ async def emojis_slash(interaction: discord.Interaction) -> None:
     emojis = get_recent_app_emojis(db_conn, limit=_APP_EMOJI_MAX)
     if not emojis:
         await interaction.response.send_message(
-            "No emojis stored yet. Right-click any message → **Apps** → **Steal Emoji** to add one.",
+            "No emojis stored yet. Right-click any message → **Apps** → **Save as Emoji** to add one.",
             ephemeral=True,
         )
         return
@@ -890,28 +803,44 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
 
 @tree.context_menu(name="Save as Emoji")
 async def save_as_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Save as Emoji: save a custom emoji locally with a ;;name shortcut."""
-    matches = _CUSTOM_EMOJI_RE.findall(message.content)
-    if not matches:
-        await interaction.response.send_message(
-            "No custom emoji in that message. This command only works on messages containing a custom emoji (not Unicode).",
-            ephemeral=True,
-        )
-        return
-    if len(matches) > 1:
-        await interaction.response.send_message(
-            f"That message has **{len(matches)}** custom emojis — pick a message with exactly one.",
-            ephemeral=True,
-        )
-        return
+    """Right-click → Apps → Save as Emoji: save a custom emoji or image attachment locally with a ;;name shortcut."""
+    download_url: str | None = None
+    file_ext = "png"
+    media_type = "emoji"
 
-    animated_flag, name, emoji_id = matches[0]
-    is_animated = bool(animated_flag)
-    ext = "gif" if is_animated else "png"
-    cdn_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+    # Prefer a custom emoji in the message text
+    matches = _CUSTOM_EMOJI_RE.findall(message.content)
+    if matches:
+        if len(matches) > 1:
+            await interaction.response.send_message(
+                f"That message has **{len(matches)}** custom emojis — pick a message with exactly one.",
+                ephemeral=True,
+            )
+            return
+        animated_flag, _name, emoji_id = matches[0]
+        ext = "gif" if animated_flag else "png"
+        download_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
+        file_ext = ext
+
+    # Fall back to image attachments
+    if download_url is None:
+        for att in message.attachments:
+            if att.content_type and att.content_type.startswith("image/"):
+                ext_guess = att.filename.rsplit(".", 1)[-1].lower()
+                file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
+                media_type = "gif" if file_ext == "gif" else "image"
+                download_url = att.url
+                break
+
+    if download_url is None:
+        await interaction.response.send_message(
+            "No custom emoji or image attachment found in that message.",
+            ephemeral=True,
+        )
+        return
 
     await interaction.response.send_modal(
-        ShortcutModal(download_url=cdn_url, media_type="emoji", file_ext=ext, invoker_id=interaction.user.id)
+        ShortcutModal(download_url=download_url, media_type=media_type, file_ext=file_ext, invoker_id=interaction.user.id)
     )
 
 
@@ -975,6 +904,67 @@ async def my_media_slash(interaction: discord.Interaction) -> None:
     )
     embed.set_footer(text=f"{len(entries)}/{max_per_user} slots used")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class LocalMediaPickerView(discord.ui.View):
+    """Select menu for 'Reply with Media' — lets user pick one of their saved ;;shortcuts."""
+
+    def __init__(self, target_message: discord.Message, entries: list[dict]) -> None:
+        super().__init__(timeout=60)
+        self._target = target_message
+
+        options = [
+            discord.SelectOption(
+                label=f";;{e['shortcut']}",
+                value=e["shortcut"],
+                description=e["media_type"],
+            )
+            for e in entries[:25]  # Discord select cap
+        ]
+        select = discord.ui.Select(placeholder="Pick a saved shortcut to reply with…", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        shortcut_key = interaction.data["values"][0]
+        media_entry = get_local_media(db_conn, shortcut_key)
+        if media_entry is None:
+            await interaction.response.edit_message(content="That shortcut no longer exists.", view=None)
+            return
+
+        import os as _os
+        if not _os.path.isfile(media_entry["file_path"]):
+            await interaction.response.edit_message(
+                content=f"File for `;;{shortcut_key}` is missing from disk.", view=None
+            )
+            return
+
+        try:
+            await self._target.reply(file=discord.File(media_entry["file_path"]))
+            await interaction.response.edit_message(content=f"Replied with `;;{shortcut_key}`!", view=None)
+        except discord.HTTPException as exc:
+            await interaction.response.edit_message(content=f"Could not send: {exc.text}", view=None)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
+@tree.context_menu(name="Reply with Media")
+async def reply_with_media_context(interaction: discord.Interaction, message: discord.Message) -> None:
+    """Right-click → Apps → Reply with Media: pick a saved ;;shortcut and reply to this message with it."""
+    entries = list_user_local_media(db_conn, interaction.user.id)
+    if not entries:
+        await interaction.response.send_message(
+            "You have no saved media. Right-click a message → **Apps** → **Save as Emoji** or **Save as Sticker** first.",
+            ephemeral=True,
+        )
+        return
+
+    view = LocalMediaPickerView(target_message=message, entries=entries)
+    await interaction.response.send_message(
+        "Which saved media should I reply with?", view=view, ephemeral=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1125,7 +1115,11 @@ async def on_message(message: discord.Message) -> None:
         if media_entry:
             import os as _os
             if _os.path.isfile(media_entry["file_path"]):
-                await message.channel.send(file=discord.File(media_entry["file_path"]))
+                # If the user's ;;shortcut message is itself a reply, mirror that reply chain
+                if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
+                    await message.reference.resolved.reply(file=discord.File(media_entry["file_path"]))
+                else:
+                    await message.channel.send(file=discord.File(media_entry["file_path"]))
             else:
                 await message.reply(f"Media file for `;;{shortcut_key}` is missing from disk.")
         return  # shortcut messages don't trigger any other processing
