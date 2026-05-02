@@ -880,207 +880,146 @@ async def _evict_and_upload_app_emoji(
         return None
 
 
-class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
-    """Modal asking the user for a ;;name shortcut when stealing media.
+async def _auto_save_media(
+    interaction: discord.Interaction,
+    storage_type: str,
+    media_type: str,
+    suggested_name: str,
+    download_url: str,
+    file_ext: str = "png",
+) -> None:
+    """Fully-automated save: defer → resolve name → download → upload → confirm.
 
-    storage_type controls the save path:
-      'local'          — download to disk (images saved locally)
-      'native_emoji'   — store Discord emoji ID directly (no upload)
-      'native_sticker' — store Discord sticker ID/URL (no upload)
-      'app_emoji'      — upload image as Application Emoji, media_type='emoji'
-      'app_emoji_sticker' — upload image as Application Emoji, media_type='sticker'
+    No modal is shown. The name is taken from the source (emoji/sticker name) and
+    a numeric suffix is appended automatically if the shortcut is already taken.
+    Users type ;;name in chat to replay the saved media; the ;; is just the chat
+    trigger prefix and is never entered by the user during saving.
     """
+    user_id = interaction.user.id
 
-    shortcut_name = discord.ui.TextInput(
-        label="Shortcut name (type ;;name to use later)",
-        placeholder="e.g. stolen_meme",
-        min_length=2,
-        max_length=30,
+    # ---- Limits ----
+    user_count = get_user_local_media_count(db_conn, user_id)
+    max_per_user = get_config_int(db_conn, "local_media_max_per_user", 20)
+    if user_count >= max_per_user:
+        await interaction.followup.send(
+            f"⚠️ You’ve hit your media limit ({max_per_user} items). "
+            f"Delete some with `/my_media` first.",
+            ephemeral=True,
+        )
+        return
+
+    global_count = get_global_local_media_count(db_conn)
+    max_global = get_config_int(db_conn, "local_media_max_global", 200)
+    if global_count >= max_global:
+        await interaction.followup.send(
+            f"⚠️ The global media storage is full ({max_global} items). Contact an admin.",
+            ephemeral=True,
+        )
+        return
+
+    # ---- Resolve unique name (auto-suffix on collision) ----
+    base = _sanitize_shortcut(suggested_name) or "saved_emoji"
+    name = base
+    suffix = 1
+    while get_local_media(db_conn, name):  # name taken by anyone
+        name = f"{base}_{suffix}"
+        suffix += 1
+        if suffix > 99:
+            await interaction.followup.send(
+                "⚠️ Couldn’t find a free shortcut name. "
+                f"Try deleting an old `;;{base}*` entry with `/my_media`.",
+                ephemeral=True,
+            )
+            return
+
+    # ---- Download ----
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(download_url) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(
+                        f"⚠️ Couldn’t download the media (CDN returned {resp.status}).",
+                        ephemeral=True,
+                    )
+                    return
+                data = await resp.read()
+    except Exception as exc:
+        logger.error("_auto_save_media: download failed for %s: %s", download_url, exc)
+        await interaction.followup.send("⚠️ Download failed. Check the logs.", ephemeral=True)
+        return
+
+    # ---- Upload as Application Emoji ----
+    result = await _evict_and_upload_app_emoji(name, data, animated=(file_ext == "gif"))
+    if result is None:
+        await interaction.followup.send(
+            "⚠️ Failed to upload as a Discord emoji. "
+            "The image may be too large (max 256 KB) or an unsupported format.",
+            ephemeral=True,
+        )
+        return
+
+    emoji_id, emoji_name = result
+    save_local_media(
+        db_conn,
+        user_id=user_id,
+        shortcut=name,
+        file_path="",
+        media_type=media_type,
+        source_url=download_url,
+        storage_type=storage_type,
+        discord_id=emoji_id,
+        discord_name=emoji_name,
+        animated=(file_ext == "gif"),
     )
 
-    def __init__(
-        self,
-        storage_type: str,
-        media_type: str,
-        invoker_id: int,
-        suggested_name: str | None = None,
-        # local / app_emoji / app_emoji_sticker
-        download_url: str | None = None,
-        file_ext: str = "png",
-        # native_emoji
-        native_emoji_id: str | None = None,
-        native_emoji_name: str | None = None,
-        native_emoji_animated: bool = False,
-        # native_sticker
-        native_sticker_id: str | None = None,
-        native_sticker_name: str | None = None,
-        native_sticker_url: str | None = None,
-    ) -> None:
-        super().__init__()
-        self._storage_type = storage_type
-        self._media_type = media_type
-        self._invoker_id = invoker_id
-        self._download_url = download_url
-        self._ext = file_ext
-        self._native_emoji_id = native_emoji_id
-        self._native_emoji_name = native_emoji_name
-        self._native_emoji_animated = native_emoji_animated
-        self._native_sticker_id = native_sticker_id
-        self._native_sticker_name = native_sticker_name
-        self._native_sticker_url = native_sticker_url
-        if suggested_name:
-            self.shortcut_name.default = suggested_name
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        raw = self.shortcut_name.value.strip().lstrip(";")
-        if not re.match(r"^\w+$", raw):
-            await interaction.response.send_message(
-                "Shortcut name can only contain letters, numbers, and underscores.", ephemeral=True
-            )
-            return
-
-        name = raw.lower()
-
-        # Per-user and global limits
-        user_count = get_user_local_media_count(db_conn, self._invoker_id)
-        max_per_user = get_config_int(db_conn, "local_media_max_per_user", 20)
-        if user_count >= max_per_user:
-            await interaction.response.send_message(
-                f"You've hit your local media limit ({max_per_user} items). Delete some with `/my_media` first.",
-                ephemeral=True,
-            )
-            return
-
-        global_count = get_global_local_media_count(db_conn)
-        max_global = get_config_int(db_conn, "local_media_max_global", 200)
-        if global_count >= max_global:
-            await interaction.response.send_message(
-                f"The global media storage is full ({max_global} items). Contact an admin.",
-                ephemeral=True,
-            )
-            return
-
-        existing = get_local_media(db_conn, name)
-        if existing:
-            await interaction.response.send_message(
-                f"`;;{name}` is already taken by someone. Pick a different name.", ephemeral=True
-            )
-            return
-
-        # --- native_emoji / native_sticker paths removed ---
-        # All saves now go through app_emoji / app_emoji_sticker so they render
-        # on every server regardless of where the emoji/sticker originated.
-        # The _storage_type should always be 'app_emoji' or 'app_emoji_sticker' at this point.
-
-        # --- App emoji or app emoji sticker: download then upload ---
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        import aiohttp
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(self._download_url) as resp:
-                    if resp.status != 200:
-                        await interaction.followup.send(
-                            f"Could not download the media (CDN returned {resp.status}).", ephemeral=True
-                        )
-                        return
-                    data = await resp.read()
-        except Exception as exc:
-            logger.error("ShortcutModal: download failed for %s: %s", self._download_url, exc)
-            await interaction.followup.send("Download failed. Check the logs.", ephemeral=True)
-            return
-
-        if self._storage_type in ("app_emoji", "app_emoji_sticker"):
-            result = await _evict_and_upload_app_emoji(name, data, animated=(self._ext == "gif"))
-            if result is None:
-                await interaction.followup.send(
-                    "Failed to upload as a Discord Application Emoji. The image may be too large (max 256KB) "
-                    "or an invalid format. Try a smaller PNG.",
-                    ephemeral=True,
-                )
-                return
-            emoji_id, emoji_name = result
-            actual_media_type = "sticker" if self._storage_type == "app_emoji_sticker" else "emoji"
-            save_local_media(
-                db_conn,
-                user_id=self._invoker_id,
-                shortcut=name,
-                file_path="",
-                media_type=actual_media_type,
-                source_url=self._download_url,
-                storage_type=self._storage_type,
-                discord_id=emoji_id,
-                discord_name=emoji_name,
-                animated=(self._ext == "gif"),
-            )
-            emoji_str = f"<:{emoji_name}:{emoji_id}>"
-            await interaction.followup.send(
-                f"✅ Uploaded as app emoji {emoji_str} → `;;{name}`! Type it in any channel to post it.",
-                ephemeral=True,
-            )
-            logger.info(
-                "User %s saved app emoji shortcut ';;%s' (%s, id=%s)",
-                self._invoker_id, name, actual_media_type, emoji_id,
-            )
-            return
-
-        # --- Local file fallback (original behavior) ---
-        import os as _os
-        _os.makedirs(_LOCAL_MEDIA_DIR, exist_ok=True)
-        file_path = f"{_LOCAL_MEDIA_DIR}/{name}.{self._ext}"
-
-        try:
-            with open(file_path, "wb") as f:
-                f.write(data)
-        except Exception as exc:
-            logger.error("ShortcutModal: file write failed for %s: %s", file_path, exc)
-            await interaction.followup.send("Could not save the file locally. Check disk space.", ephemeral=True)
-            return
-
-        save_local_media(
-            db_conn,
-            user_id=self._invoker_id,
-            shortcut=name,
-            file_path=file_path,
-            media_type=self._media_type,
-            source_url=self._download_url,
-        )
-        await interaction.followup.send(
-            f"✅ Saved! Type `;;{name}` in any channel and I'll post it.", ephemeral=True
-        )
-        logger.info("User %s saved local media shortcut ';;%s' (%s)", self._invoker_id, name, self._media_type)
+    animated = file_ext == "gif"
+    emoji_str = f"<{'a' if animated else ''}:{emoji_name}:{emoji_id}>"
+    await interaction.followup.send(
+        f"✅ Saved {emoji_str} as `;;{name}` — "
+        f"type `;;{name}` in any channel and I’ll post it!",
+        ephemeral=True,
+    )
+    logger.info(
+        "User %d auto-saved %s ';;%s' (emoji_id=%s)",
+        user_id, media_type, name, emoji_id,
+    )
 
 
 @tree.context_menu(name="Save Emoji/Sticker")
 async def save_emoji_sticker_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Save Emoji/Sticker: auto-detects emoji or sticker and saves it."""
+    """Right-click → Apps → Save Emoji/Sticker.
+
+    Auto-detects emoji or sticker from the message, downloads it, uploads it as
+    a Discord Application Emoji, and saves it under an auto-generated shortcut
+    name — no modal, no user input required. Users type ;;name in chat to replay.
+    """
     if not _feat("feature_local_media"):
         await interaction.response.send_message("Local media shortcuts are currently disabled.", ephemeral=True)
         return
+
+    # Defer immediately — download + upload can take a second
+    await interaction.response.defer(ephemeral=True, thinking=True)
 
     # --- Detect: custom emoji in message content ---
     matches = _CUSTOM_EMOJI_RE.findall(message.content)
     if matches:
         if len(matches) > 1:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"That message has **{len(matches)}** custom emojis — pick a message with exactly one.",
                 ephemeral=True,
             )
             return
         animated_flag, emoji_name, emoji_id = matches[0]
-        # Resolve image URL for the emoji
         ext = "gif" if animated_flag else "png"
         emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}?size=128"
-        suggested = _sanitize_shortcut(emoji_name)
-        await interaction.response.send_modal(
-            ShortcutModal(
-                storage_type="app_emoji",
-                media_type="emoji",
-                invoker_id=interaction.user.id,
-                suggested_name=suggested,
-                download_url=emoji_url,
-                file_ext=ext,
-            )
+        await _auto_save_media(
+            interaction,
+            storage_type="app_emoji",
+            media_type="emoji",
+            suggested_name=emoji_name,
+            download_url=emoji_url,
+            file_ext=ext,
         )
         return
 
@@ -1088,31 +1027,25 @@ async def save_emoji_sticker_context(interaction: discord.Interaction, message: 
     if message.stickers:
         sticker = message.stickers[0]
         sticker_url = str(sticker.url)
-        # Determine file extension from URL
         ext_part = sticker_url.rsplit(".", 1)[-1].split("?")[0].lower()
-        ext = ext_part if ext_part in ("png", "gif", "apng", "json") else "png"
-        # Lottie JSON stickers can't be used as Discord emojis — skip them
-        if ext == "json":
-            await interaction.response.send_message(
-                "That sticker uses an animated Lottie format which can't be saved as a bot emoji. "
+        if ext_part == "json":
+            await interaction.followup.send(
+                "⚠️ That sticker uses an animated Lottie format which can’t be saved as a bot emoji. "
                 "Try a standard PNG or GIF sticker.",
                 ephemeral=True,
             )
             return
-        suggested = _sanitize_shortcut(sticker.name)
-        await interaction.response.send_modal(
-            ShortcutModal(
-                storage_type="app_emoji_sticker",
-                media_type="sticker",
-                invoker_id=interaction.user.id,
-                suggested_name=suggested,
-                download_url=sticker_url,
-                file_ext="png",  # re-upload as png regardless
-            )
+        await _auto_save_media(
+            interaction,
+            storage_type="app_emoji_sticker",
+            media_type="sticker",
+            suggested_name=sticker.name,
+            download_url=sticker_url,
+            file_ext="png",
         )
         return
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "No custom emoji or sticker found in that message.\n"
         "*Tip: The emoji must be a **custom** emoji (not a standard Unicode one).*",
         ephemeral=True,
