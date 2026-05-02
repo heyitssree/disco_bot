@@ -1,6 +1,8 @@
 import sys
 import os
 import sqlite3
+from dotenv import load_dotenv
+load_dotenv()
 
 # Add parent directory to path so we can import schema.py
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
