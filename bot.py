@@ -3264,7 +3264,7 @@ _SLOTS_SYMBOLS: list[str] = ["🍎", "🍒", "🍋", "🔔", "⭐", "💎", "7�
 _SLOTS_WEIGHTS: list[int]  = [ 30,   25,   20,   15,   7,    5,    3  ]
 
 
-@tree.command(name="slots", description="Spin the cosmic slot machine — 2-match 3:1, 3-match 10:1, jackpot 50:1")
+@tree.command(name="slots", description="Spin the cosmic slot machine — first 2 match 2:1, 3-match 10:1, jackpot 50:1")
 @app_commands.describe(bet="How many Boli to wager")
 async def slots_slash(
     interaction: discord.Interaction,
@@ -3301,7 +3301,7 @@ async def slots_slash(
 
     jackpot = r1 == r2 == r3 == "7️⃣"
     three_match = r1 == r2 == r3
-    two_match = (r1 == r2) or (r2 == r3) or (r1 == r3)
+    two_match = r1 == r2
 
     if jackpot:
         payout_mult = 51  # 50:1 → 51x return
@@ -3310,8 +3310,8 @@ async def slots_slash(
         payout_mult = 11  # 10:1 → 11x return
         outcome_str = f"✅ **Three of a kind!** +**{bet * payout_mult - bet} Boli**"
     elif two_match:
-        payout_mult = 4   # 3:1 → 4x return
-        outcome_str = f"✅ **Two of a kind!** +**{bet * payout_mult - bet} Boli**"
+        payout_mult = 3   # 2:1 → 3x return
+        outcome_str = f"✅ **Two of a kind (first two)!** +**{bet * payout_mult - bet} Boli**"
     else:
         payout_mult = 0
         outcome_str = f"❌ **No match.** -{bet} Boli"
