@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-import duckdb
+import sqlite3
 
 from schema import get_cached_prediction
 from services.gemini_service import GeminiService
@@ -19,19 +19,19 @@ _WINDOW_SECONDS = 60
 class ApiManager:
     """Fixed Window rate limiter sitting in front of GeminiService.
 
-    If the per-minute request budget is exhausted, falls back to DuckDB cache
+    If the per-minute request budget is exhausted, falls back to SQLite cache
     without touching the Gemini API at all.
 
     Request flow:
         bot.py → ApiManager → GeminiService (dual-key) → Gemini API
                     ↓ (if rate-limited or circuit open)
-                DuckDB cache → FALLBACK_MESSAGE
+                SQLite cache → FALLBACK_MESSAGE
     """
 
     def __init__(
         self,
         gemini_service: GeminiService,
-        db_conn: duckdb.DuckDBPyConnection,
+        db_conn: sqlite3.Connection,
         rpm_limit: int = _DEFAULT_RPM_LIMIT,
         free_tier_mode: bool = True,
     ) -> None:
@@ -116,7 +116,7 @@ class ApiManager:
         name: str,
         curse_used: str | None = None,
     ) -> str | None:
-        """Pull a random template from DuckDB cache and personalise it."""
+        """Pull a random template from SQLite cache and personalise it."""
         template = get_cached_prediction(self._db_conn, cache_type, min_count=20)
         if not template:
             return None
@@ -132,7 +132,7 @@ class ApiManager:
         fallback_message: str = "Navi-nte glow went off. KSEB took the current. Even fairies need electricity mone. Try again.",
         curse_used: str | None = None,
     ) -> tuple[str, bool]:
-        """Serve directly from DuckDB cache pool without touching Gemini API at all.
+        """Serve directly from SQLite cache pool without touching Gemini API at all.
 
         Used for 3rd+ usage in a single minute — guaranteed no API cost.
         Returns (response_text, is_from_cache=True).

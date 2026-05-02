@@ -12,7 +12,7 @@ Restart after:
     sudo systemctl start navi
 """
 
-import duckdb
+import sqlite3
 import os
 import sys
 
@@ -31,7 +31,8 @@ VALID_RASHIS = [
 # ---------------------------------------------------------------------------
 DB_PATH = os.getenv("DB_PATH", "data/astro_bot.db")
 
-conn = duckdb.connect(DB_PATH)
+conn = sqlite3.connect(DB_PATH)
+conn.row_factory = sqlite3.Row
 print(f"[+] Connected to: {DB_PATH}\n")
 
 # ---------------------------------------------------------------------------
@@ -146,7 +147,7 @@ for name, entries in duplicates.items():
     conn.execute(
         """
         UPDATE user_stats
-        SET rashi=?, boli_points=?, prediction_count=?, strikes=?, last_seen=NOW()
+        SET rashi=?, boli_points=?, prediction_count=?, strikes=?, last_seen=CURRENT_TIMESTAMP
         WHERE user_id=?
         """,
         [correct_rashi, total_points, total_preds, total_strikes, keep_id],
@@ -155,7 +156,6 @@ for name, entries in duplicates.items():
         conn.execute("DELETE FROM user_stats WHERE user_id=?", [rid])
 
     conn.commit()
-    conn.execute("CHECKPOINT")
     print(f"  [✓] Merged. user_id={keep_id} now has {total_points} pts, rashi={correct_rashi!r}\n")
 
 # ---------------------------------------------------------------------------

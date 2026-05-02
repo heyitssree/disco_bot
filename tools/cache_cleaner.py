@@ -1,22 +1,21 @@
-# tools/cache_cleaner.py - Periodic DuckDB cache generalizer for AstRobot
+# tools/cache_cleaner.py - Periodic cache generalizer for AstRobot
 #
 # Run manually: python tools/cache_cleaner.py
 # Or via cron on GCP VM (weekly, Sunday 2am IST):
 #   30 20 * * 6 cd ~/disco_bot && source .venv/bin/activate && python tools/cache_cleaner.py
 #
-# NOTE: Run this only when the bot is NOT running (or use DuckDB read_only for the bot).
+# NOTE: Safe to run while the bot is running (SQLite WAL mode handles concurrent access).
 
 from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import sys
 from pathlib import Path
 
 # Allow running from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-import duckdb
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +27,7 @@ logger = logging.getLogger("cache_cleaner")
 DB_PATH = Path("data") / "astro_bot.db"
 
 
-def load_known_names(conn: duckdb.DuckDBPyConnection) -> list[str]:
+def load_known_names(conn: sqlite3.Connection) -> list[str]:
     """Load all known usernames from user_stats."""
     rows = conn.execute("SELECT DISTINCT username FROM user_stats").fetchall()
     # Sort longest first to avoid partial replacements (e.g. "Sree" before "Sreekanth")
@@ -38,7 +37,7 @@ def load_known_names(conn: duckdb.DuckDBPyConnection) -> list[str]:
 
 
 def generalize_cache(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     known_names: list[str],
 ) -> int:
     """Replace known usernames in template_text with {user} placeholder.
@@ -69,7 +68,7 @@ def generalize_cache(
     return updated
 
 
-def remove_duplicate_templates(conn: duckdb.DuckDBPyConnection) -> int:
+def remove_duplicate_templates(conn: sqlite3.Connection) -> int:
     """Delete exact duplicate template_text entries per cache_type, keeping the oldest."""
     before = conn.execute("SELECT COUNT(*) FROM predictions_cache").fetchone()[0]
     conn.execute("""
@@ -85,7 +84,7 @@ def remove_duplicate_templates(conn: duckdb.DuckDBPyConnection) -> int:
     return before - after
 
 
-def report_cache_stats(conn: duckdb.DuckDBPyConnection) -> None:
+def report_cache_stats(conn: sqlite3.Connection) -> None:
     """Print cache stats per type."""
     rows = conn.execute(
         "SELECT cache_type, COUNT(*) as cnt FROM predictions_cache GROUP BY cache_type"
@@ -100,8 +99,8 @@ def main() -> None:
         logger.error("Database not found at %s. Run the bot first.", DB_PATH)
         sys.exit(1)
 
-    logger.info("Opening DuckDB at %s", DB_PATH)
-    conn = duckdb.connect(str(DB_PATH))
+    logger.info("Opening SQLite at %s", DB_PATH)
+    conn = sqlite3.connect(str(DB_PATH))
 
     known_names = load_known_names(conn)
 

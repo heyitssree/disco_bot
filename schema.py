@@ -1,4 +1,4 @@
-# schema.py - DuckDB schema management for Navi (disco_bot)
+# schema.py - SQLite schema management for Navi (disco_bot)
 # Creates and manages all tables. Call init_db() at bot startup.
 
 from __future__ import annotations
@@ -6,13 +6,13 @@ from __future__ import annotations
 import csv
 import logging
 import math
+import sqlite3
 import time
 import functools
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, TypeVar
 
-import duckdb
 import os
 
 logger = logging.getLogger("navi.schema")
@@ -28,11 +28,9 @@ _DB_RETRY_BASE_DELAY = 0.1  # seconds
 
 
 def _db_write(fn: Callable[[], _T]) -> _T:
-    """Execute a DuckDB write callable with exponential backoff on lock errors.
+    """Execute a SQLite write callable with exponential backoff on lock errors.
 
     Retries up to _DB_RETRY_ATTEMPTS times (0.1s, 0.2s, 0.4s, 0.8s, 1.6s).
-    Checkpoints after every successful write so data is always in the main .db
-    file and never only in the WAL — prevents data loss on unclean shutdown.
     Re-raises the last exception if all attempts fail.
     """
     last_exc: Exception | None = None
@@ -42,18 +40,18 @@ def _db_write(fn: Callable[[], _T]) -> _T:
             return result
         except Exception as exc:
             msg = str(exc).lower()
-            if "database is locked" not in msg and "conflicting lock" not in msg:
+            if "database is locked" not in msg:
                 raise
             last_exc = exc
             delay = _DB_RETRY_BASE_DELAY * (2 ** attempt)
             logger.warning(
-                "DuckDB locked (attempt %d/%d) — retrying in %.2fs", attempt + 1, _DB_RETRY_ATTEMPTS, delay
+                "SQLite locked (attempt %d/%d) — retrying in %.2fs", attempt + 1, _DB_RETRY_ATTEMPTS, delay
             )
             time.sleep(delay)
     raise last_exc  # type: ignore[misc]
 
 
-_conn_ref: "duckdb.DuckDBPyConnection | None" = None
+_conn_ref: "sqlite3.Connection | None" = None
 
 
 _db_path_env = os.getenv("DB_PATH")
@@ -63,42 +61,48 @@ DB_PATH = Path(_db_path_env) if _db_path_env else Path("data") / "astro_bot.db"
 # Initialisation
 # ---------------------------------------------------------------------------
 
-def init_db() -> duckdb.DuckDBPyConnection:
-    """Create the DuckDB database and all tables if they don't exist.
+def init_db() -> sqlite3.Connection:
+    """Create the SQLite database and all tables if they don't exist.
 
     Returns an open connection that should be reused for the bot's lifetime.
+    WAL mode enables crash-safe concurrent reads without locking corruption.
     """
     global _conn_ref
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(DB_PATH))
+    conn = sqlite3.connect(
+        str(DB_PATH),
+        check_same_thread=False,
+        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     _conn_ref = conn
     _create_tables(conn)
-    logger.info("DuckDB initialised at %s", DB_PATH)
+    logger.info("SQLite initialised at %s", DB_PATH)
     return conn
 
 
-def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
+def _create_tables(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS predictions_cache (
             id          INTEGER PRIMARY KEY,
-            cache_type  VARCHAR NOT NULL,
-            user_id     BIGINT,
-            original_prompt VARCHAR,
-            template_text   VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT NOW()
+            cache_type  TEXT NOT NULL,
+            user_id     INTEGER,
+            original_prompt TEXT,
+            template_text   TEXT NOT NULL,
+            timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS predictions_cache_seq START 1
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_stats (
-            user_id         BIGINT PRIMARY KEY,
-            username        VARCHAR NOT NULL,
-            rashi           VARCHAR,
+            user_id         INTEGER PRIMARY KEY,
+            username        TEXT NOT NULL,
+            rashi           TEXT,
             boli_points     INTEGER DEFAULT 0,
-            last_seen       TIMESTAMP DEFAULT NOW(),
+            last_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             prediction_count INTEGER DEFAULT 0,
             extra_actions   INTEGER DEFAULT 0
         )
@@ -107,53 +111,44 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_prediction_history (
             id          INTEGER PRIMARY KEY,
-            user_id     BIGINT NOT NULL,
-            prediction_text VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT NOW()
+            user_id     INTEGER NOT NULL,
+            prediction_text TEXT NOT NULL,
+            timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS prediction_history_seq START 1
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS curse_logs (
             id          INTEGER PRIMARY KEY,
-            user_id     BIGINT NOT NULL,
-            username    VARCHAR NOT NULL,
-            curse_used  VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT NOW()
+            user_id     INTEGER NOT NULL,
+            username    TEXT NOT NULL,
+            curse_used  TEXT NOT NULL,
+            timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    """)
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS curse_logs_seq START 1
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_omens (
             id              INTEGER PRIMARY KEY,
-            generated_text  VARCHAR NOT NULL,
-            landmark        VARCHAR NOT NULL,
+            generated_text  TEXT NOT NULL,
+            landmark        TEXT NOT NULL,
             omen_date       DATE NOT NULL UNIQUE
         )
-    """)
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS daily_omens_seq START 1
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bot_config (
-            key VARCHAR PRIMARY KEY,
-            value_str VARCHAR,
-            value_float DOUBLE,
+            key TEXT PRIMARY KEY,
+            value_str TEXT,
+            value_float REAL,
             value_int INTEGER
         )
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_perks (
-            user_id     BIGINT NOT NULL,
-            perk_type   VARCHAR NOT NULL,
+            user_id     INTEGER NOT NULL,
+            perk_type   TEXT NOT NULL,
             expires_at  TIMESTAMP NOT NULL,
             PRIMARY KEY (user_id, perk_type)
         )
@@ -168,42 +163,73 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
             tags        TEXT DEFAULT ''
         )
     """)
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS local_knowledge_seq START 1
-    """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS app_emojis (
-            emoji_id    VARCHAR PRIMARY KEY,
-            name        VARCHAR NOT NULL,
-            last_used   TIMESTAMP DEFAULT NOW(),
-            original_id VARCHAR,
-            animated    BOOLEAN DEFAULT FALSE
+            emoji_id    TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            last_used   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            original_id TEXT,
+            animated    INTEGER DEFAULT 0
         )
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS local_media (
-            shortcut    VARCHAR PRIMARY KEY,
-            user_id     BIGINT NOT NULL,
-            file_path   VARCHAR NOT NULL,
-            media_type  VARCHAR NOT NULL,
-            source_url  VARCHAR,
-            created_at  TIMESTAMP DEFAULT NOW()
+            shortcut    TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            file_path   TEXT NOT NULL,
+            media_type  TEXT NOT NULL,
+            source_url  TEXT,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS bless_logs (
             id          INTEGER PRIMARY KEY,
-            user_id     BIGINT NOT NULL,
-            username    VARCHAR NOT NULL,
-            bless_used  VARCHAR NOT NULL,
-            timestamp   TIMESTAMP DEFAULT NOW()
+            user_id     INTEGER NOT NULL,
+            username    TEXT NOT NULL,
+            bless_used  TEXT NOT NULL,
+            timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Analytics tables
     conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS bless_logs_seq START 1
+        CREATE TABLE IF NOT EXISTS command_events (
+            id          INTEGER PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            username    TEXT NOT NULL,
+            command     TEXT NOT NULL,
+            subcommand  TEXT,
+            channel_id  INTEGER,
+            guild_id    INTEGER,
+            latency_ms  INTEGER,
+            used_cache  INTEGER DEFAULT 0,
+            timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_events (
+            id          INTEGER PRIMARY KEY,
+            event_type  TEXT NOT NULL,
+            detail      TEXT,
+            timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_call_log (
+            id          INTEGER PRIMARY KEY,
+            key_used    TEXT NOT NULL,
+            cache_hit   INTEGER DEFAULT 0,
+            command     TEXT,
+            latency_ms  INTEGER,
+            error       TEXT,
+            timestamp   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     """)
 
     # Insert default config if empty
@@ -273,14 +299,24 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
         WHERE NOT EXISTS (SELECT 1 FROM bot_config WHERE key = 'link_summary_emoji');
     """)
 
-    # Safe ALTER TABLE migrations — add new columns to existing tables if absent
-    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS strikes INTEGER DEFAULT 0")
-    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS daily_action_count INTEGER DEFAULT 0")
-    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS last_action_date DATE")
-    conn.execute("ALTER TABLE user_stats ADD COLUMN IF NOT EXISTS extra_actions INTEGER DEFAULT 0")
+    # Safe ALTER TABLE migrations — SQLite does not support IF NOT EXISTS on ALTER TABLE
+    for col_sql in (
+        "ALTER TABLE user_stats ADD COLUMN strikes INTEGER DEFAULT 0",
+        "ALTER TABLE user_stats ADD COLUMN daily_action_count INTEGER DEFAULT 0",
+        "ALTER TABLE user_stats ADD COLUMN last_action_date DATE",
+        "ALTER TABLE user_stats ADD COLUMN extra_actions INTEGER DEFAULT 0",
+        # local_media: extended storage type support
+        "ALTER TABLE local_media ADD COLUMN storage_type TEXT DEFAULT 'local'",
+        "ALTER TABLE local_media ADD COLUMN discord_id TEXT",
+        "ALTER TABLE local_media ADD COLUMN discord_name TEXT",
+        "ALTER TABLE local_media ADD COLUMN animated INTEGER DEFAULT 0",
+    ):
+        try:
+            conn.execute(col_sql)
+        except Exception:
+            pass  # column already exists
 
     conn.commit()
-    conn.execute("CHECKPOINT")
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +324,7 @@ def _create_tables(conn: duckdb.DuckDBPyConnection) -> None:
 # ---------------------------------------------------------------------------
 
 def get_cached_prediction(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     cache_type: str,
     min_count: int = 50,
 ) -> str | None:
@@ -317,7 +353,7 @@ def get_cached_prediction(
 
 
 def save_prediction(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     cache_type: str,
     template_text: str,
     user_id: int | None = None,
@@ -335,7 +371,7 @@ def save_prediction(
         conn.execute(
             """
             INSERT INTO predictions_cache (id, cache_type, user_id, original_prompt, template_text)
-            VALUES (nextval('predictions_cache_seq'), ?, ?, ?, ?)
+            VALUES (NULL, ?, ?, ?, ?)
             """,
             [cache_type, user_id, original_prompt, template_text],
         )
@@ -348,7 +384,7 @@ def save_prediction(
 # ---------------------------------------------------------------------------
 
 def get_user_profile(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
 ) -> dict | None:
     """Return user profile dict or None if user doesn't exist."""
@@ -374,7 +410,7 @@ def get_user_profile(
 
 
 def upsert_user(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     username: str,
     rashi: str | None = None,
@@ -387,18 +423,18 @@ def upsert_user(
             conn.execute(
                 """
                 INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count)
-                VALUES (?, ?, ?, 0, NOW(), 0)
+                VALUES (?, ?, ?, 0, CURRENT_TIMESTAMP, 0)
                 """,
                 [user_id, username, rashi],
             )
         elif rashi:
             conn.execute(
-                "UPDATE user_stats SET username=?, rashi=?, last_seen=NOW() WHERE user_id=?",
+                "UPDATE user_stats SET username=?, rashi=?, last_seen=CURRENT_TIMESTAMP WHERE user_id=?",
                 [username, rashi, user_id],
             )
         else:
             conn.execute(
-                "UPDATE user_stats SET username=?, last_seen=NOW() WHERE user_id=?",
+                "UPDATE user_stats SET username=?, last_seen=CURRENT_TIMESTAMP WHERE user_id=?",
                 [username, user_id],
             )
         conn.commit()
@@ -406,7 +442,7 @@ def upsert_user(
 
 
 def update_boli_points(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     delta: int,
 ) -> None:
@@ -421,7 +457,7 @@ def update_boli_points(
 
 
 def increment_prediction_count(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
 ) -> None:
     _db_write(lambda: (
@@ -434,7 +470,7 @@ def increment_prediction_count(
 
 
 def get_leaderboard(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     limit: int = 10,
     offset: int = 0,
 ) -> list[dict]:
@@ -450,7 +486,7 @@ def get_leaderboard(
     ]
 
 
-def count_leaderboard_entries(conn: duckdb.DuckDBPyConnection) -> int:
+def count_leaderboard_entries(conn: sqlite3.Connection) -> int:
     """Return total number of users with a stats record."""
     row = conn.execute("SELECT COUNT(*) FROM user_stats").fetchone()
     return row[0] if row else 0
@@ -461,7 +497,7 @@ def count_leaderboard_entries(conn: duckdb.DuckDBPyConnection) -> int:
 # ---------------------------------------------------------------------------
 
 def get_last_n_predictions(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     n: int = 3,
 ) -> list[str]:
@@ -478,7 +514,7 @@ def get_last_n_predictions(
 
 
 def save_user_prediction(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     prediction_text: str,
 ) -> None:
@@ -487,7 +523,7 @@ def save_user_prediction(
         conn.execute(
             """
             INSERT INTO user_prediction_history (id, user_id, prediction_text)
-            VALUES (nextval('prediction_history_seq'), ?, ?)
+            VALUES (NULL, ?, ?)
             """,
             [user_id, prediction_text],
         )
@@ -496,14 +532,14 @@ def save_user_prediction(
 
 
 def get_todays_user_prediction(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
 ) -> str | None:
     """Check if the user already received a prediction today, return it if so."""
     row = conn.execute(
         """
         SELECT prediction_text FROM user_prediction_history
-        WHERE user_id = ? AND CAST(timestamp AS DATE) = current_date
+        WHERE user_id = ? AND DATE(timestamp) = DATE('now')
         ORDER BY timestamp DESC LIMIT 1
         """,
         [user_id]
@@ -516,7 +552,7 @@ def get_todays_user_prediction(
 # ---------------------------------------------------------------------------
 
 def log_curse(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     username: str,
     curse_used: str,
@@ -525,7 +561,7 @@ def log_curse(
         conn.execute(
             """
             INSERT INTO curse_logs (id, user_id, username, curse_used)
-            VALUES (nextval('curse_logs_seq'), ?, ?, ?)
+            VALUES (NULL, ?, ?, ?)
             """,
             [user_id, username, curse_used],
         )
@@ -537,7 +573,7 @@ def log_curse(
 # Daily omens
 # ---------------------------------------------------------------------------
 
-def get_todays_omen(conn: duckdb.DuckDBPyConnection) -> str | None:
+def get_todays_omen(conn: sqlite3.Connection) -> str | None:
     """Return today's cached omen text, or None if not yet generated."""
     row = conn.execute(
         "SELECT generated_text FROM daily_omens WHERE omen_date = ?",
@@ -547,7 +583,7 @@ def get_todays_omen(conn: duckdb.DuckDBPyConnection) -> str | None:
 
 
 def save_daily_omen(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     text: str,
     landmark: str,
 ) -> None:
@@ -566,7 +602,7 @@ def save_daily_omen(
             conn.execute(
                 """
                 INSERT INTO daily_omens (id, generated_text, landmark, omen_date)
-                VALUES (nextval('daily_omens_seq'), ?, ?, ?)
+                VALUES (NULL, ?, ?, ?)
                 """,
                 [text, landmark, today],
             )
@@ -578,31 +614,31 @@ def save_daily_omen(
 # Bot Config
 # ---------------------------------------------------------------------------
 
-def get_config_float(conn: duckdb.DuckDBPyConnection, key: str, default: float) -> float:
+def get_config_float(conn: sqlite3.Connection, key: str, default: float) -> float:
     row = conn.execute("SELECT value_float FROM bot_config WHERE key = ?", [key]).fetchone()
     return float(row[0]) if row and row[0] is not None else default
 
-def get_config_int(conn: duckdb.DuckDBPyConnection, key: str, default: int) -> int:
+def get_config_int(conn: sqlite3.Connection, key: str, default: int) -> int:
     row = conn.execute("SELECT value_int FROM bot_config WHERE key = ?", [key]).fetchone()
     return int(row[0]) if row and row[0] is not None else default
 
-def set_config_float(conn: duckdb.DuckDBPyConnection, key: str, value: float) -> None:
+def set_config_float(conn: sqlite3.Connection, key: str, value: float) -> None:
     _db_write(lambda: (
         conn.execute("UPDATE bot_config SET value_float = ? WHERE key = ?", [value, key]),
         conn.commit(),
     ))
 
-def set_config_int(conn: duckdb.DuckDBPyConnection, key: str, value: int) -> None:
+def set_config_int(conn: sqlite3.Connection, key: str, value: int) -> None:
     _db_write(lambda: (
         conn.execute("UPDATE bot_config SET value_int = ? WHERE key = ?", [value, key]),
         conn.commit(),
     ))
 
-def get_config_str(conn: duckdb.DuckDBPyConnection, key: str, default: str = "") -> str:
+def get_config_str(conn: sqlite3.Connection, key: str, default: str = "") -> str:
     row = conn.execute("SELECT value_str FROM bot_config WHERE key = ?", [key]).fetchone()
     return str(row[0]) if row and row[0] is not None else default
 
-def set_config_str(conn: duckdb.DuckDBPyConnection, key: str, value: str) -> None:
+def set_config_str(conn: sqlite3.Connection, key: str, value: str) -> None:
     _db_write(lambda: (
         conn.execute(
             "INSERT INTO bot_config (key, value_str) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value_str = excluded.value_str",
@@ -611,7 +647,7 @@ def set_config_str(conn: duckdb.DuckDBPyConnection, key: str, value: str) -> Non
         conn.commit(),
     ))
 
-def get_all_configs(conn: duckdb.DuckDBPyConnection) -> dict:
+def get_all_configs(conn: sqlite3.Connection) -> dict:
     rows = conn.execute("SELECT key, value_str, value_float, value_int FROM bot_config").fetchall()
     config = {}
     for r in rows:
@@ -629,7 +665,7 @@ def get_all_configs(conn: duckdb.DuckDBPyConnection) -> dict:
 # Strike system (Feature 7)
 # ---------------------------------------------------------------------------
 
-def get_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+def get_user_strikes(conn: sqlite3.Connection, user_id: int) -> int:
     """Return the current strike count for a user (0 if not found)."""
     row = conn.execute(
         "SELECT strikes FROM user_stats WHERE user_id = ?", [user_id]
@@ -637,7 +673,7 @@ def get_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
     return int(row[0]) if row and row[0] is not None else 0
 
 
-def increment_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+def increment_user_strikes(conn: sqlite3.Connection, user_id: int) -> int:
     """Increment strikes by 1 and return the new count."""
     _db_write(lambda: (
         conn.execute(
@@ -648,7 +684,7 @@ def increment_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> int
     return get_user_strikes(conn, user_id)
 
 
-def reset_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> None:
+def reset_user_strikes(conn: sqlite3.Connection, user_id: int) -> None:
     """Reset a user's strikes to 0."""
     _db_write(lambda: (
         conn.execute("UPDATE user_stats SET strikes = 0 WHERE user_id = ?", [user_id]),
@@ -656,13 +692,13 @@ def reset_user_strikes(conn: duckdb.DuckDBPyConnection, user_id: int) -> None:
     ))
 
 
-def set_user_points(conn: duckdb.DuckDBPyConnection, user_id: int, username: str, points: int, prediction_count: int = 0, rashi: str | None = None) -> None:
+def set_user_points(conn: sqlite3.Connection, user_id: int, username: str, points: int, prediction_count: int = 0, rashi: str | None = None) -> None:
     """Upsert a user's Boli Points directly — used for manual data restore."""
     existing = get_user_profile(conn, user_id)
     def _write() -> None:
         if existing is None:
             conn.execute(
-                "INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count) VALUES (?, ?, ?, ?, NOW(), ?)",
+                "INSERT INTO user_stats (user_id, username, rashi, boli_points, last_seen, prediction_count) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
                 [user_id, username, rashi, points, prediction_count],
             )
         else:
@@ -674,7 +710,7 @@ def set_user_points(conn: duckdb.DuckDBPyConnection, user_id: int, username: str
     _db_write(_write)
 
 
-def reset_all_strikes(conn: duckdb.DuckDBPyConnection) -> int:
+def reset_all_strikes(conn: sqlite3.Connection) -> int:
     """Reset strikes to 0 for every user. Returns the number of rows affected."""
     count = conn.execute("SELECT COUNT(*) FROM user_stats WHERE strikes > 0").fetchone()[0]
     _db_write(lambda: (
@@ -782,7 +818,7 @@ _LOCAL_KNOWLEDGE_DATA: list[tuple[str, str, str, str]] = [
 ]
 
 
-def seed_local_knowledge(conn: duckdb.DuckDBPyConnection, force: bool = False) -> None:
+def seed_local_knowledge(conn: sqlite3.Connection, force: bool = False) -> None:
     """Populate local_knowledge table from curated data. Skips if already seeded unless force=True."""
     count = conn.execute("SELECT COUNT(*) FROM local_knowledge").fetchone()[0]
     if count > 0 and not force:
@@ -794,7 +830,7 @@ def seed_local_knowledge(conn: duckdb.DuckDBPyConnection, force: bool = False) -
         conn.executemany(
             """
             INSERT INTO local_knowledge (id, category, term, description, tags)
-            VALUES (nextval('local_knowledge_seq'), ?, ?, ?, ?)
+            VALUES (NULL, ?, ?, ?, ?)
             """,
             [(cat, term, desc, tags) for cat, term, desc, tags in _LOCAL_KNOWLEDGE_DATA],
         )
@@ -809,7 +845,7 @@ def seed_local_knowledge(conn: duckdb.DuckDBPyConnection, force: bool = False) -
 # ---------------------------------------------------------------------------
 
 def export_stats_csv(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     path: str = "data/user_stats_backup.csv",
 ) -> None:
     """Export user_stats to CSV. Useful before wiping the DB."""
@@ -823,7 +859,7 @@ def export_stats_csv(
     logger.info("Exported %d user records to %s", len(rows), path)
 
 
-def get_table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
+def get_table_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """Return row counts for all tables. Used by /health command."""
     tables = ["predictions_cache", "user_stats", "user_prediction_history", "curse_logs", "daily_omens"]
     counts = {}
@@ -833,7 +869,7 @@ def get_table_counts(conn: duckdb.DuckDBPyConnection) -> dict[str, int]:
     return counts
 
 
-def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
+def get_health_stats(conn: sqlite3.Connection) -> dict:
     """Return a rich set of runtime statistics for the /health command."""
     stats: dict = {}
 
@@ -843,12 +879,12 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     )[0]
     stats["active_today"] = (
         conn.execute(
-            "SELECT COUNT(*) FROM user_stats WHERE CAST(last_seen AS DATE) = current_date"
+            "SELECT COUNT(*) FROM user_stats WHERE DATE(last_seen) = DATE('now')"
         ).fetchone() or (0,)
     )[0]
     stats["active_week"] = (
         conn.execute(
-            "SELECT COUNT(*) FROM user_stats WHERE last_seen >= NOW() - INTERVAL 7 DAY"
+            "SELECT COUNT(*) FROM user_stats WHERE last_seen >= datetime('now', '-7 days')"
         ).fetchone() or (0,)
     )[0]
     stats["total_boli_points"] = (
@@ -862,7 +898,7 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     # --- Prediction activity ---
     stats["predictions_today"] = (
         conn.execute(
-            "SELECT COUNT(*) FROM user_prediction_history WHERE CAST(timestamp AS DATE) = current_date"
+            "SELECT COUNT(*) FROM user_prediction_history WHERE DATE(timestamp) = DATE('now')"
         ).fetchone() or (0,)
     )[0]
     cache_rows = conn.execute(
@@ -873,7 +909,7 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     # --- Curse log ---
     stats["curses_today"] = (
         conn.execute(
-            "SELECT COUNT(*) FROM curse_logs WHERE CAST(timestamp AS DATE) = current_date"
+            "SELECT COUNT(*) FROM curse_logs WHERE DATE(timestamp) = DATE('now')"
         ).fetchone() or (0,)
     )[0]
     stats["curses_total"] = (
@@ -887,7 +923,7 @@ def get_health_stats(conn: duckdb.DuckDBPyConnection) -> dict:
     # --- Active perks ---
     stats["active_perks"] = (
         conn.execute(
-            "SELECT COUNT(*) FROM user_perks WHERE expires_at > NOW()"
+            "SELECT COUNT(*) FROM user_perks WHERE expires_at > CURRENT_TIMESTAMP"
         ).fetchone() or (0,)
     )[0]
 
@@ -906,7 +942,7 @@ def _today_ist() -> date:
     return datetime.now(_IST).date()
 
 
-def get_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+def get_daily_action_count(conn: sqlite3.Connection, user_id: int) -> int:
     """Return today's combined curse/bless action count. Returns 0 if the record is from a previous day."""
     row = conn.execute(
         "SELECT daily_action_count, last_action_date FROM user_stats WHERE user_id = ?",
@@ -920,7 +956,7 @@ def get_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int
     return int(count) if count else 0
 
 
-def increment_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+def increment_daily_action_count(conn: sqlite3.Connection, user_id: int) -> int:
     """Increment daily action count (resetting to 1 if it's a new day). Returns new count."""
     today = _today_ist()
     _db_write(lambda: (
@@ -942,7 +978,7 @@ def increment_daily_action_count(conn: duckdb.DuckDBPyConnection, user_id: int) 
     return int(row[0]) if row and row[0] else 1
 
 
-def get_extra_actions(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+def get_extra_actions(conn: sqlite3.Connection, user_id: int) -> int:
     """Return the number of purchased extra actions remaining for a user."""
     row = conn.execute(
         "SELECT extra_actions FROM user_stats WHERE user_id = ?", [user_id]
@@ -950,18 +986,18 @@ def get_extra_actions(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
     return int(row[0]) if row and row[0] else 0
 
 
-def decrement_extra_actions(conn: duckdb.DuckDBPyConnection, user_id: int) -> None:
+def decrement_extra_actions(conn: sqlite3.Connection, user_id: int) -> None:
     """Consume one extra action token, flooring at 0."""
     _db_write(lambda: (
         conn.execute(
-            "UPDATE user_stats SET extra_actions = GREATEST(extra_actions - 1, 0) WHERE user_id = ?",
+            "UPDATE user_stats SET extra_actions = CASE WHEN extra_actions > 0 THEN extra_actions - 1 ELSE 0 END WHERE user_id = ?",
             [user_id],
         ),
         conn.commit(),
     ))
 
 
-def add_extra_actions(conn: duckdb.DuckDBPyConnection, user_id: int, amount: int) -> None:
+def add_extra_actions(conn: sqlite3.Connection, user_id: int, amount: int) -> None:
     """Add purchased extra action tokens to a user's balance."""
     _db_write(lambda: (
         conn.execute(
@@ -997,20 +1033,20 @@ def points_for_level(level: int) -> int:
 # ---------------------------------------------------------------------------
 
 def has_active_perk(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     perk_type: str,
 ) -> bool:
     """Return True if the user has a non-expired perk of the given type."""
     row = conn.execute(
-        "SELECT 1 FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > NOW()",
+        "SELECT 1 FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > CURRENT_TIMESTAMP",
         [user_id, perk_type],
     ).fetchone()
     return row is not None
 
 
 def grant_perk(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     perk_type: str,
     duration_hours: float = 24,
@@ -1025,9 +1061,13 @@ def grant_perk(
         conn.execute(
             """
             INSERT INTO user_perks (user_id, perk_type, expires_at)
-            VALUES (?, ?, NOW() + INTERVAL (?) SECOND)
+            VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))
             ON CONFLICT (user_id, perk_type) DO UPDATE SET
-                expires_at = GREATEST(user_perks.expires_at, excluded.expires_at)
+                expires_at = CASE
+                    WHEN user_perks.expires_at > excluded.expires_at
+                    THEN user_perks.expires_at
+                    ELSE excluded.expires_at
+                END
             """,
             [user_id, perk_type, duration_seconds],
         )
@@ -1036,16 +1076,26 @@ def grant_perk(
 
 
 def get_perk_expiry(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     perk_type: str,
 ) -> datetime | None:
     """Return the expiry datetime of a perk, or None if not active."""
     row = conn.execute(
-        "SELECT expires_at FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > NOW()",
+        "SELECT expires_at FROM user_perks WHERE user_id = ? AND perk_type = ? AND expires_at > CURRENT_TIMESTAMP",
         [user_id, perk_type],
     ).fetchone()
-    return row[0] if row else None
+    if not row:
+        return None
+    val = row[0]
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val)
+        except ValueError:
+            return None
+    return None
 
 
 def get_level_from_points(points: int) -> int:
@@ -1060,46 +1110,57 @@ def get_level_from_points(points: int) -> int:
     return min(max(n, 0), 100)
 
 
-
-
 # ---------------------------------------------------------------------------
 # Local Media (user-stolen emojis/stickers stored on disk)
 # ---------------------------------------------------------------------------
 
 def save_local_media(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     shortcut: str,
     file_path: str,
     media_type: str,
     source_url: str | None = None,
+    storage_type: str = "local",
+    discord_id: str | None = None,
+    discord_name: str | None = None,
+    animated: bool = False,
 ) -> None:
     """Insert a local media entry, replacing any existing entry for the same shortcut."""
     def _write() -> None:
         conn.execute(
             """
-            INSERT INTO local_media (shortcut, user_id, file_path, media_type, source_url, created_at)
-            VALUES (?, ?, ?, ?, ?, NOW())
+            INSERT INTO local_media
+                (shortcut, user_id, file_path, media_type, source_url, created_at,
+                 storage_type, discord_id, discord_name, animated)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
             ON CONFLICT (shortcut) DO UPDATE SET
                 user_id = excluded.user_id,
                 file_path = excluded.file_path,
                 media_type = excluded.media_type,
                 source_url = excluded.source_url,
-                created_at = NOW()
+                created_at = CURRENT_TIMESTAMP,
+                storage_type = excluded.storage_type,
+                discord_id = excluded.discord_id,
+                discord_name = excluded.discord_name,
+                animated = excluded.animated
             """,
-            [shortcut, user_id, file_path, media_type, source_url],
+            [shortcut, user_id, file_path, media_type, source_url,
+             storage_type, discord_id, discord_name, int(animated)],
         )
         conn.commit()
     _db_write(_write)
 
 
 def get_local_media(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     shortcut: str,
 ) -> dict | None:
     """Return local media entry for the given shortcut, or None if not found."""
     row = conn.execute(
-        "SELECT shortcut, user_id, file_path, media_type, source_url, created_at FROM local_media WHERE shortcut = ?",
+        """SELECT shortcut, user_id, file_path, media_type, source_url, created_at,
+                  storage_type, discord_id, discord_name, animated
+           FROM local_media WHERE shortcut = ?""",
         [shortcut],
     ).fetchone()
     if not row:
@@ -1111,10 +1172,14 @@ def get_local_media(
         "media_type": row[3],
         "source_url": row[4],
         "created_at": row[5],
+        "storage_type": row[6] or "local",
+        "discord_id": row[7],
+        "discord_name": row[8],
+        "animated": bool(row[9]) if row[9] is not None else False,
     }
 
 
-def get_user_local_media_count(conn: duckdb.DuckDBPyConnection, user_id: int) -> int:
+def get_user_local_media_count(conn: sqlite3.Connection, user_id: int) -> int:
     """Return how many local media entries the user has saved."""
     row = conn.execute(
         "SELECT COUNT(*) FROM local_media WHERE user_id = ?", [user_id]
@@ -1122,14 +1187,14 @@ def get_user_local_media_count(conn: duckdb.DuckDBPyConnection, user_id: int) ->
     return row[0] if row else 0
 
 
-def get_global_local_media_count(conn: duckdb.DuckDBPyConnection) -> int:
+def get_global_local_media_count(conn: sqlite3.Connection) -> int:
     """Return total number of local media entries stored globally."""
     row = conn.execute("SELECT COUNT(*) FROM local_media").fetchone()
     return row[0] if row else 0
 
 
 def list_user_local_media(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     media_type: str | None = None,
 ) -> list[dict]:
@@ -1147,7 +1212,7 @@ def list_user_local_media(
     return [{"shortcut": r[0], "file_path": r[1], "media_type": r[2], "created_at": r[3]} for r in rows]
 
 
-def delete_local_media(conn: duckdb.DuckDBPyConnection, shortcut: str) -> bool:
+def delete_local_media(conn: sqlite3.Connection, shortcut: str) -> bool:
     """Delete a local media entry by shortcut. Returns True if a row was deleted."""
     existing = conn.execute(
         "SELECT 1 FROM local_media WHERE shortcut = ?", [shortcut]
@@ -1166,7 +1231,7 @@ def delete_local_media(conn: duckdb.DuckDBPyConnection, shortcut: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def log_bless(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     user_id: int,
     username: str,
     bless_used: str,
@@ -1176,7 +1241,7 @@ def log_bless(
         conn.execute(
             """
             INSERT INTO bless_logs (id, user_id, username, bless_used)
-            VALUES (nextval('bless_logs_seq'), ?, ?, ?)
+            VALUES (NULL, ?, ?, ?)
             """,
             [user_id, username, bless_used],
         )
@@ -1189,7 +1254,7 @@ def log_bless(
 # ---------------------------------------------------------------------------
 
 def get_curse_leaderboard(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     limit: int = 5,
 ) -> list[dict]:
     """Return the most-cursed users (excluding backfires from the count)."""
@@ -1208,7 +1273,7 @@ def get_curse_leaderboard(
 
 
 def get_bless_leaderboard(
-    conn: duckdb.DuckDBPyConnection,
+    conn: sqlite3.Connection,
     limit: int = 5,
 ) -> list[dict]:
     """Return the most-blessed users."""
@@ -1223,3 +1288,135 @@ def get_bless_leaderboard(
         [limit],
     ).fetchall()
     return [{"user_id": r[0], "username": r[1], "hits": r[2]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Analytics
+# ---------------------------------------------------------------------------
+
+def log_command_event(
+    conn: sqlite3.Connection,
+    user_id: int,
+    username: str,
+    command: str,
+    subcommand: str | None = None,
+    channel_id: int | None = None,
+    guild_id: int | None = None,
+    latency_ms: int | None = None,
+    used_cache: int = 0,
+) -> None:
+    """Record a single command invocation for usage analytics."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO command_events
+                (id, user_id, username, command, subcommand, channel_id, guild_id, latency_ms, used_cache)
+            VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [user_id, username, command, subcommand, channel_id, guild_id, latency_ms, used_cache],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def log_session_event(
+    conn: sqlite3.Connection,
+    event_type: str,
+    detail: str | None = None,
+) -> None:
+    """Record a bot lifecycle event (start, stop, ready, error)."""
+    def _write() -> None:
+        conn.execute(
+            "INSERT INTO session_events (id, event_type, detail) VALUES (NULL, ?, ?)",
+            [event_type, detail],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+# ---------------------------------------------------------------------------
+# Application Emoji management (LRU cache for uploaded images)
+# ---------------------------------------------------------------------------
+
+_APP_EMOJI_LIMIT = 2000
+_APP_EMOJI_EVICT_THRESHOLD = 1900
+
+
+def save_app_emoji(
+    conn: sqlite3.Connection,
+    emoji_id: str,
+    name: str,
+    animated: bool = False,
+    original_id: str | None = None,
+) -> None:
+    """Record a newly uploaded application emoji in the DB."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO app_emojis (emoji_id, name, last_used, original_id, animated)
+            VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)
+            ON CONFLICT (emoji_id) DO UPDATE SET
+                name = excluded.name,
+                last_used = CURRENT_TIMESTAMP,
+                animated = excluded.animated
+            """,
+            [emoji_id, name, original_id, int(animated)],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_oldest_app_emoji(conn: sqlite3.Connection) -> dict | None:
+    """Return the least-recently-used application emoji record, or None if none exist."""
+    row = conn.execute(
+        "SELECT emoji_id, name, animated FROM app_emojis ORDER BY last_used ASC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {"emoji_id": row[0], "name": row[1], "animated": bool(row[2])}
+
+
+def delete_app_emoji_record(conn: sqlite3.Connection, emoji_id: str) -> None:
+    """Remove an application emoji record from the DB."""
+    _db_write(lambda: (
+        conn.execute("DELETE FROM app_emojis WHERE emoji_id = ?", [emoji_id]),
+        conn.commit(),
+    ))
+
+
+def update_app_emoji_last_used(conn: sqlite3.Connection, emoji_id: str) -> None:
+    """Bump the last_used timestamp for an application emoji (LRU refresh)."""
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE app_emojis SET last_used = CURRENT_TIMESTAMP WHERE emoji_id = ?",
+            [emoji_id],
+        ),
+        conn.commit(),
+    ))
+
+
+def count_app_emojis(conn: sqlite3.Connection) -> int:
+    """Return the number of application emojis tracked in the DB."""
+    row = conn.execute("SELECT COUNT(*) FROM app_emojis").fetchone()
+    return row[0] if row else 0
+
+
+def log_api_call(
+    conn: sqlite3.Connection,
+    key_used: str,
+    cache_hit: bool = False,
+    command: str | None = None,
+    latency_ms: int | None = None,
+    error: str | None = None,
+) -> None:
+    """Record a Gemini API call for cost and cache visibility."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO api_call_log (id, key_used, cache_hit, command, latency_ms, error)
+            VALUES (NULL, ?, ?, ?, ?, ?)
+            """,
+            [key_used, int(cache_hit), command, latency_ms, error],
+        )
+        conn.commit()
+    _db_write(_write)

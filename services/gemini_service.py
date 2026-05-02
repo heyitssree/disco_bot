@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
-import duckdb
+import sqlite3
 from google import genai
 
 logger = logging.getLogger("navi.gemini")
@@ -24,7 +24,7 @@ class GeminiService:
         self,
         free_api_key: str | None,
         paid_api_key: str | None,
-        db_conn: duckdb.DuckDBPyConnection,
+        db_conn: sqlite3.Connection,
     ) -> None:
         if not free_api_key and not paid_api_key:
             raise ValueError(

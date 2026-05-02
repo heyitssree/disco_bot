@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import math
 import os
@@ -64,6 +65,15 @@ from schema import (
     log_bless,
     get_curse_leaderboard,
     get_bless_leaderboard,
+    log_command_event,
+    log_session_event,
+    log_api_call,
+    save_app_emoji,
+    get_oldest_app_emoji,
+    delete_app_emoji_record,
+    update_app_emoji_last_used,
+    count_app_emojis,
+    _APP_EMOJI_EVICT_THRESHOLD,
 )
 from glossary import RASHIS
 from prompts import (
@@ -312,7 +322,7 @@ tree = _NaviTree(bot)
 # Globals
 # ---------------------------------------------------------------------------
 
-db_conn = None          # duckdb.DuckDBPyConnection
+db_conn = None          # sqlite3.Connection
 gemini_svc = None       # GeminiService
 api_mgr = None          # ApiManager
 _BOT_START_TIME = datetime.now(timezone.utc)
@@ -616,8 +626,51 @@ def _sanitize_shortcut(raw: str) -> str | None:
     cleaned = re.sub(r"[^\w]", "", cleaned).strip("_")
     return cleaned if len(cleaned) >= 2 else None
 
+async def _evict_and_upload_app_emoji(
+    name: str,
+    image_bytes: bytes,
+    animated: bool = False,
+) -> tuple[str, str] | None:
+    """Upload image_bytes as a Discord Application Emoji, evicting LRU if at limit.
+
+    Returns (emoji_id, emoji_name) on success, or None on failure.
+    The name is sanitized to comply with Discord's emoji name rules.
+    """
+    # Sanitize: only word chars, 2-32 length
+    safe_name = re.sub(r"[^\w]", "_", name)[:32]
+    if len(safe_name) < 2:
+        safe_name = "emoji_" + safe_name
+
+    # Evict if at limit
+    if count_app_emojis(db_conn) >= _APP_EMOJI_EVICT_THRESHOLD:
+        oldest = get_oldest_app_emoji(db_conn)
+        if oldest:
+            try:
+                await bot.delete_application_emoji(int(oldest["emoji_id"]))
+                logger.info("Evicted LRU app emoji %s (%s)", oldest["emoji_id"], oldest["name"])
+            except Exception as exc:
+                logger.warning("Could not delete app emoji %s: %s", oldest["emoji_id"], exc)
+            delete_app_emoji_record(db_conn, oldest["emoji_id"])
+
+    try:
+        new_emoji = await bot.create_application_emoji(name=safe_name, image=image_bytes)
+        save_app_emoji(db_conn, str(new_emoji.id), new_emoji.name, animated=animated)
+        return str(new_emoji.id), new_emoji.name
+    except Exception as exc:
+        logger.error("Failed to create application emoji '%s': %s", safe_name, exc)
+        return None
+
+
 class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
-    """Modal asking the user for a ;;name shortcut when stealing media."""
+    """Modal asking the user for a ;;name shortcut when stealing media.
+
+    storage_type controls the save path:
+      'local'          — download to disk (images saved locally)
+      'native_emoji'   — store Discord emoji ID directly (no upload)
+      'native_sticker' — store Discord sticker ID/URL (no upload)
+      'app_emoji'      — upload image as Application Emoji, media_type='emoji'
+      'app_emoji_sticker' — upload image as Application Emoji, media_type='sticker'
+    """
 
     shortcut_name = discord.ui.TextInput(
         label="Shortcut name (type ;;name to use later)",
@@ -628,17 +681,34 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
 
     def __init__(
         self,
-        download_url: str,
+        storage_type: str,
         media_type: str,
-        file_ext: str,
         invoker_id: int,
         suggested_name: str | None = None,
+        # local / app_emoji / app_emoji_sticker
+        download_url: str | None = None,
+        file_ext: str = "png",
+        # native_emoji
+        native_emoji_id: str | None = None,
+        native_emoji_name: str | None = None,
+        native_emoji_animated: bool = False,
+        # native_sticker
+        native_sticker_id: str | None = None,
+        native_sticker_name: str | None = None,
+        native_sticker_url: str | None = None,
     ) -> None:
         super().__init__()
-        self._url = download_url
+        self._storage_type = storage_type
         self._media_type = media_type
-        self._ext = file_ext
         self._invoker_id = invoker_id
+        self._download_url = download_url
+        self._ext = file_ext
+        self._native_emoji_id = native_emoji_id
+        self._native_emoji_name = native_emoji_name
+        self._native_emoji_animated = native_emoji_animated
+        self._native_sticker_id = native_sticker_id
+        self._native_sticker_name = native_sticker_name
+        self._native_sticker_url = native_sticker_url
         if suggested_name:
             self.shortcut_name.default = suggested_name
 
@@ -678,16 +748,55 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
             )
             return
 
+        # --- Native emoji: just record the Discord emoji ID, no download needed ---
+        if self._storage_type == "native_emoji":
+            save_local_media(
+                db_conn,
+                user_id=self._invoker_id,
+                shortcut=name,
+                file_path="",
+                media_type="emoji",
+                source_url=None,
+                storage_type="native_emoji",
+                discord_id=self._native_emoji_id,
+                discord_name=self._native_emoji_name,
+                animated=self._native_emoji_animated,
+            )
+            emoji_str = (
+                f"<a:{self._native_emoji_name}:{self._native_emoji_id}>"
+                if self._native_emoji_animated
+                else f"<:{self._native_emoji_name}:{self._native_emoji_id}>"
+            )
+            await interaction.response.send_message(
+                f"✅ Saved native emoji {emoji_str} as `;;{name}`!", ephemeral=True
+            )
+            return
+
+        # --- Native sticker: record sticker ID + URL, no download needed ---
+        if self._storage_type == "native_sticker":
+            save_local_media(
+                db_conn,
+                user_id=self._invoker_id,
+                shortcut=name,
+                file_path="",
+                media_type="sticker",
+                source_url=self._native_sticker_url,
+                storage_type="native_sticker",
+                discord_id=self._native_sticker_id,
+                discord_name=self._native_sticker_name,
+            )
+            await interaction.response.send_message(
+                f"✅ Saved sticker **{self._native_sticker_name}** as `;;{name}`!", ephemeral=True
+            )
+            return
+
+        # --- App emoji or app emoji sticker: download then upload ---
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         import aiohttp
-        import os as _os
-        _os.makedirs(_LOCAL_MEDIA_DIR, exist_ok=True)
-        file_path = f"{_LOCAL_MEDIA_DIR}/{name}.{self._ext}"
-
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(self._url) as resp:
+                async with session.get(self._download_url) as resp:
                     if resp.status != 200:
                         await interaction.followup.send(
                             f"Could not download the media (CDN returned {resp.status}).", ephemeral=True
@@ -695,9 +804,48 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
                         return
                     data = await resp.read()
         except Exception as exc:
-            logger.error("ShortcutModal: download failed for %s: %s", self._url, exc)
+            logger.error("ShortcutModal: download failed for %s: %s", self._download_url, exc)
             await interaction.followup.send("Download failed. Check the logs.", ephemeral=True)
             return
+
+        if self._storage_type in ("app_emoji", "app_emoji_sticker"):
+            result = await _evict_and_upload_app_emoji(name, data, animated=(self._ext == "gif"))
+            if result is None:
+                await interaction.followup.send(
+                    "Failed to upload as a Discord Application Emoji. The image may be too large (max 256KB) "
+                    "or an invalid format. Try a smaller PNG.",
+                    ephemeral=True,
+                )
+                return
+            emoji_id, emoji_name = result
+            actual_media_type = "sticker" if self._storage_type == "app_emoji_sticker" else "emoji"
+            save_local_media(
+                db_conn,
+                user_id=self._invoker_id,
+                shortcut=name,
+                file_path="",
+                media_type=actual_media_type,
+                source_url=self._download_url,
+                storage_type=self._storage_type,
+                discord_id=emoji_id,
+                discord_name=emoji_name,
+                animated=(self._ext == "gif"),
+            )
+            emoji_str = f"<:{emoji_name}:{emoji_id}>"
+            await interaction.followup.send(
+                f"✅ Uploaded as app emoji {emoji_str} → `;;{name}`! Type it in any channel to post it.",
+                ephemeral=True,
+            )
+            logger.info(
+                "User %s saved app emoji shortcut ';;%s' (%s, id=%s)",
+                self._invoker_id, name, actual_media_type, emoji_id,
+            )
+            return
+
+        # --- Local file fallback (original behavior) ---
+        import os as _os
+        _os.makedirs(_LOCAL_MEDIA_DIR, exist_ok=True)
+        file_path = f"{_LOCAL_MEDIA_DIR}/{name}.{self._ext}"
 
         try:
             with open(file_path, "wb") as f:
@@ -713,7 +861,7 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
             shortcut=name,
             file_path=file_path,
             media_type=self._media_type,
-            source_url=self._url,
+            source_url=self._download_url,
         )
         await interaction.followup.send(
             f"✅ Saved! Type `;;{name}` in any channel and I'll post it.", ephemeral=True
@@ -723,17 +871,12 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
 
 @tree.context_menu(name="Save as Emoji")
 async def save_as_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Save as Emoji: save a custom emoji or image attachment locally with a ;;name shortcut."""
+    """Right-click → Apps → Save as Emoji: saves a custom emoji natively or uploads an image as an Application Emoji."""
     if not _feat("feature_local_media"):
         await interaction.response.send_message("Local media shortcuts are currently disabled.", ephemeral=True)
         return
-    download_url: str | None = None
-    file_ext = "png"
-    media_type = "emoji"
 
-    suggested_name: str | None = None
-
-    # Prefer a custom emoji in the message text
+    # Prefer a custom emoji in the message text → store its native ID
     matches = _CUSTOM_EMOJI_RE.findall(message.content)
     if matches:
         if len(matches) > 1:
@@ -743,91 +886,86 @@ async def save_as_emoji_context(interaction: discord.Interaction, message: disco
             )
             return
         animated_flag, emoji_name, emoji_id = matches[0]
-        ext = "gif" if animated_flag else "png"
-        download_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}"
-        file_ext = ext
-        suggested_name = _sanitize_shortcut(emoji_name)
-
-    # Fall back to image attachments
-    if download_url is None:
-        for att in message.attachments:
-            if att.content_type and att.content_type.startswith("image/"):
-                ext_guess = att.filename.rsplit(".", 1)[-1].lower()
-                file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
-                media_type = "emoji"
-                download_url = att.url
-                stem = att.filename.rsplit(".", 1)[0]
-                suggested_name = _sanitize_shortcut(stem)
-                break
-
-    if download_url is None:
-        await interaction.response.send_message(
-            "No custom emoji or image attachment found in that message.",
-            ephemeral=True,
+        await interaction.response.send_modal(
+            ShortcutModal(
+                storage_type="native_emoji",
+                media_type="emoji",
+                invoker_id=interaction.user.id,
+                suggested_name=_sanitize_shortcut(emoji_name),
+                native_emoji_id=emoji_id,
+                native_emoji_name=emoji_name,
+                native_emoji_animated=bool(animated_flag),
+            )
         )
         return
 
-    await interaction.response.send_modal(
-        ShortcutModal(
-            download_url=download_url,
-            media_type=media_type,
-            file_ext=file_ext,
-            invoker_id=interaction.user.id,
-            suggested_name=suggested_name,
-        )
+    # Fall back to image attachments → upload as Application Emoji
+    for att in message.attachments:
+        if att.content_type and att.content_type.startswith("image/"):
+            ext_guess = att.filename.rsplit(".", 1)[-1].lower()
+            file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
+            stem = att.filename.rsplit(".", 1)[0]
+            await interaction.response.send_modal(
+                ShortcutModal(
+                    storage_type="app_emoji",
+                    media_type="emoji",
+                    invoker_id=interaction.user.id,
+                    suggested_name=_sanitize_shortcut(stem),
+                    download_url=att.url,
+                    file_ext=file_ext,
+                )
+            )
+            return
+
+    await interaction.response.send_message(
+        "No custom emoji or image attachment found in that message.",
+        ephemeral=True,
     )
 
 
 @tree.context_menu(name="Save as Sticker")
 async def save_as_sticker_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Save as Sticker: save a sticker or image attachment locally with a ;;name shortcut."""
+    """Right-click → Apps → Save as Sticker: saves a native sticker by ID, or uploads an image as an Application Emoji."""
     if not _feat("feature_local_media"):
         await interaction.response.send_message("Local media shortcuts are currently disabled.", ephemeral=True)
         return
-    download_url: str | None = None
-    file_ext = "png"
-    media_type = "sticker"
-    suggested_name: str | None = None
 
-    # Prefer stickers attached to the message
+    # Prefer stickers attached to the message → store natively by ID
     if message.stickers:
         sticker = message.stickers[0]
-        fmt = sticker.format
-        if fmt == discord.StickerFormatType.apng:
-            file_ext = "png"
-        elif fmt == discord.StickerFormatType.gif:
-            file_ext = "gif"
-        else:
-            file_ext = "png"
-        download_url = str(sticker.url)
-        suggested_name = _sanitize_shortcut(sticker.name)
-
-    # Fall back to image/GIF attachments
-    if download_url is None:
-        for att in message.attachments:
-            if att.content_type and att.content_type.startswith("image/"):
-                ext_guess = att.filename.rsplit(".", 1)[-1].lower()
-                file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
-                media_type = "sticker"
-                download_url = att.url
-                stem = att.filename.rsplit(".", 1)[0]
-                suggested_name = _sanitize_shortcut(stem)
-                break
-
-    if download_url is None:
-        await interaction.response.send_message(
-            "No sticker or image attachment found in that message.", ephemeral=True
+        await interaction.response.send_modal(
+            ShortcutModal(
+                storage_type="native_sticker",
+                media_type="sticker",
+                invoker_id=interaction.user.id,
+                suggested_name=_sanitize_shortcut(sticker.name),
+                native_sticker_id=str(sticker.id),
+                native_sticker_name=sticker.name,
+                native_sticker_url=str(sticker.url),
+            )
         )
         return
 
-    await interaction.response.send_modal(
-        ShortcutModal(
-            download_url=download_url,
-            media_type=media_type,
-            file_ext=file_ext,
-            invoker_id=interaction.user.id,
-            suggested_name=suggested_name,
-        )
+    # Fall back to image/GIF attachments → upload as Application Emoji (lone emoji = sticker look)
+    for att in message.attachments:
+        if att.content_type and att.content_type.startswith("image/"):
+            ext_guess = att.filename.rsplit(".", 1)[-1].lower()
+            file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
+            stem = att.filename.rsplit(".", 1)[0]
+            await interaction.response.send_modal(
+                ShortcutModal(
+                    storage_type="app_emoji_sticker",
+                    media_type="sticker",
+                    invoker_id=interaction.user.id,
+                    suggested_name=_sanitize_shortcut(stem),
+                    download_url=att.url,
+                    file_ext=file_ext,
+                )
+            )
+            return
+
+    await interaction.response.send_message(
+        "No sticker or image attachment found in that message.", ephemeral=True
     )
 
 
@@ -882,21 +1020,67 @@ class LocalMediaPickerView(discord.ui.View):
             await interaction.response.edit_message(content="That shortcut no longer exists.", view=None)
             return
 
-        import os as _os
-        if not _os.path.isfile(media_entry["file_path"]):
-            await interaction.response.edit_message(
-                content=f"File for `;;{shortcut_key}` is missing from disk.", view=None
-            )
-            return
+        storage_type = media_entry.get("storage_type", "local")
+        attribution = f"-# Sent by {interaction.user.display_name}"
 
         try:
-            await self._target.reply(
-                content=f"-# {interaction.user.display_name}",
-                file=discord.File(media_entry["file_path"]),
-            )
+            if storage_type in ("native_emoji", "app_emoji"):
+                animated = media_entry.get("animated", False)
+                dname = media_entry.get("discord_name") or shortcut_key
+                did = media_entry.get("discord_id")
+                emoji_str = f"<{'a' if animated else ''}:{dname}:{did}>"
+                if storage_type == "app_emoji" and did:
+                    update_app_emoji_last_used(db_conn, did)
+                await self._target.reply(content=f"{emoji_str}\n{attribution}")
+            elif storage_type == "app_emoji_sticker":
+                animated = media_entry.get("animated", False)
+                dname = media_entry.get("discord_name") or shortcut_key
+                did = media_entry.get("discord_id")
+                emoji_str = f"<{'a' if animated else ''}:{dname}:{did}>"
+                if did:
+                    update_app_emoji_last_used(db_conn, did)
+                # Send emoji alone first so Discord enlarges it, then attribution
+                await self._target.reply(content=emoji_str)
+                await self._target.channel.send(attribution)
+            elif storage_type == "native_sticker":
+                sticker_url = media_entry.get("source_url")
+                if sticker_url:
+                    import aiohttp as _aiohttp
+                    async with _aiohttp.ClientSession() as session:
+                        async with session.get(sticker_url) as resp:
+                            if resp.status == 200:
+                                data = await resp.read()
+                                ext = sticker_url.rsplit(".", 1)[-1].split("?")[0] or "png"
+                                await self._target.reply(
+                                    content=attribution,
+                                    file=discord.File(
+                                        io.BytesIO(data),
+                                        filename=f"{shortcut_key}.{ext}",
+                                    ),
+                                )
+                            else:
+                                await self._target.reply(content=f"Sticker CDN unavailable ({resp.status}).")
+                else:
+                    await interaction.response.edit_message(
+                        content=f"Sticker URL for `;;{shortcut_key}` is missing.", view=None
+                    )
+                    return
+            else:
+                # local file
+                import os as _os
+                if not _os.path.isfile(media_entry["file_path"]):
+                    await interaction.response.edit_message(
+                        content=f"File for `;;{shortcut_key}` is missing from disk.", view=None
+                    )
+                    return
+                await self._target.reply(
+                    content=attribution,
+                    file=discord.File(media_entry["file_path"]),
+                )
             await interaction.response.edit_message(content=f"Replied with `;;{shortcut_key}`!", view=None)
-        except discord.HTTPException as exc:
-            await interaction.response.edit_message(content=f"Could not send: {exc.text}", view=None)
+        except Exception as exc:
+            err_text = getattr(exc, "text", None) or str(exc)
+            await interaction.response.edit_message(content=f"Could not send: {err_text}", view=None)
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -953,14 +1137,12 @@ _BACKUP_INTERVAL_HOURS = 1
 
 
 def _do_backup() -> str:
-    """Checkpoint the WAL then copy the DB file. Returns the backup path. Runs in executor."""
+    """Copy the DB file. Returns the backup path. Runs in executor.
+
+    SQLite WAL mode makes live file copies safe — no manual checkpoint needed.
+    """
     import pathlib
     pathlib.Path(_BACKUP_DIR).mkdir(parents=True, exist_ok=True)
-    if db_conn is not None:
-        try:
-            db_conn.execute("CHECKPOINT")
-        except Exception as exc:
-            logger.warning("CHECKPOINT before backup failed: %s", exc)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     dest = os.path.join(_BACKUP_DIR, f"astro_bot_{ts}.db")
     shutil.copy2(str(DB_PATH), dest)
@@ -997,6 +1179,7 @@ async def on_ready() -> None:
     # Initialise database
     db_conn = init_db()
     seed_local_knowledge(db_conn)
+    log_session_event(db_conn, "start")
 
     # Initialise Gemini service (free key first, paid as fallback)
     gemini_svc = GeminiService(
@@ -1033,8 +1216,12 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_close() -> None:
-    """Backup then close the DB cleanly so DuckDB flushes the WAL on shutdown."""
+    """Backup then close the DB cleanly on shutdown."""
     if db_conn is not None:
+        try:
+            log_session_event(db_conn, "stop")
+        except Exception:
+            pass
         try:
             loop = asyncio.get_event_loop()
             path = await loop.run_in_executor(None, _do_backup)
@@ -1043,12 +1230,32 @@ async def on_close() -> None:
             logger.warning("Shutdown backup failed: %s", exc)
         try:
             db_conn.close()
-            logger.info("DuckDB connection closed cleanly.")
+            logger.info("SQLite connection closed cleanly.")
         except Exception as exc:
-            logger.warning("Error closing DuckDB on shutdown: %s", exc)
+            logger.warning("Error closing SQLite on shutdown: %s", exc)
 
 
 # MODA_INTROS, BOT_SELF_CURSE_REPLIES, BOT_LOOP_CURSE_REPLIES imported from prompts.py
+
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction) -> None:
+    """Log every slash command invocation to command_events for analytics."""
+    if interaction.type != discord.InteractionType.application_command:
+        return
+    if db_conn is None or not interaction.data:
+        return
+    try:
+        log_command_event(
+            db_conn,
+            interaction.user.id,
+            str(interaction.user),
+            interaction.data.get("name", "unknown"),
+            channel_id=interaction.channel_id,
+            guild_id=interaction.guild_id,
+        )
+    except Exception:
+        pass
 
 
 @bot.event
@@ -1134,15 +1341,73 @@ async def on_message(message: discord.Message) -> None:
         shortcut_key = shortcut_match.group(1).lower()
         media_entry = get_local_media(db_conn, shortcut_key)
         if media_entry:
-            import os as _os
-            if _os.path.isfile(media_entry["file_path"]):
-                # If the user's ;;shortcut message is itself a reply, mirror that reply chain
-                if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
-                    await message.reference.resolved.reply(file=discord.File(media_entry["file_path"]))
+            storage_type = media_entry.get("storage_type", "local")
+            # Mirror reply chain if the ;;shortcut message is itself a reply
+            reply_target = (
+                message.reference.resolved
+                if message.reference and isinstance(message.reference.resolved, discord.Message)
+                else None
+            )
+
+            if storage_type in ("native_emoji", "app_emoji"):
+                animated = media_entry.get("animated", False)
+                dname = media_entry.get("discord_name") or shortcut_key
+                did = media_entry.get("discord_id")
+                emoji_str = f"<{'a' if animated else ''}:{dname}:{did}>"
+                if storage_type == "app_emoji" and did:
+                    update_app_emoji_last_used(db_conn, did)
+                if reply_target:
+                    await reply_target.reply(content=emoji_str)
                 else:
-                    await message.channel.send(file=discord.File(media_entry["file_path"]))
+                    await message.channel.send(content=emoji_str)
+
+            elif storage_type == "app_emoji_sticker":
+                animated = media_entry.get("animated", False)
+                dname = media_entry.get("discord_name") or shortcut_key
+                did = media_entry.get("discord_id")
+                emoji_str = f"<{'a' if animated else ''}:{dname}:{did}>"
+                if did:
+                    update_app_emoji_last_used(db_conn, did)
+                if reply_target:
+                    await reply_target.reply(content=emoji_str)
+                else:
+                    await message.channel.send(content=emoji_str)
+
+            elif storage_type == "native_sticker":
+                sticker_url = media_entry.get("source_url")
+                if sticker_url:
+                    import aiohttp as _aiohttp
+                    try:
+                        async with _aiohttp.ClientSession() as session:
+                            async with session.get(sticker_url) as resp:
+                                if resp.status == 200:
+                                    data = await resp.read()
+                                    ext = sticker_url.rsplit(".", 1)[-1].split("?")[0] or "png"
+                                    f = discord.File(
+                                        io.BytesIO(data),
+                                        filename=f"{shortcut_key}.{ext}",
+                                    )
+                                    if reply_target:
+                                        await reply_target.reply(file=f)
+                                    else:
+                                        await message.channel.send(file=f)
+                    except Exception as exc:
+                        logger.warning(";;%s sticker fetch failed: %s", shortcut_key, exc)
+                        await message.reply(f"Could not fetch sticker for `;;{shortcut_key}`.")
+                else:
+                    await message.reply(f"Sticker URL for `;;{shortcut_key}` is missing.")
+
             else:
-                await message.reply(f"Media file for `;;{shortcut_key}` is missing from disk.")
+                # local file (original behavior)
+                import os as _os
+                if _os.path.isfile(media_entry["file_path"]):
+                    if reply_target:
+                        await reply_target.reply(file=discord.File(media_entry["file_path"]))
+                    else:
+                        await message.channel.send(file=discord.File(media_entry["file_path"]))
+                else:
+                    await message.reply(f"Media file for `;;{shortcut_key}` is missing from disk.")
+
         return  # shortcut messages don't trigger any other processing
 
     # ---- Vibe Check: lightweight heat tracker — no API cost unless triggered ----
@@ -1234,6 +1499,14 @@ async def on_message(message: discord.Message) -> None:
     # ---- Legacy prefix "navi" command — only triggers on the exact word "navi" ----
     if _feat("feature_curses") and re.match(r'^navi\b', message.content, re.IGNORECASE):
         invoker = message.author
+        try:
+            log_command_event(
+                db_conn, invoker.id, str(invoker), "curse",
+                channel_id=message.channel.id,
+                guild_id=message.guild.id if message.guild else None,
+            )
+        except Exception:
+            pass
 
         # "navi @username" → curse the mentioned user (tiered points, quota-tracked)
         if message.mentions:
@@ -1420,6 +1693,14 @@ async def on_message(message: discord.Message) -> None:
     # ---- "chunk @user" — bless command (quota-tracked, no target mention) ----
     if _feat("feature_curses") and re.match(r'^chunk\b', message.content, re.IGNORECASE):
         invoker = message.author
+        try:
+            log_command_event(
+                db_conn, invoker.id, str(invoker), "bless",
+                channel_id=message.channel.id,
+                guild_id=message.guild.id if message.guild else None,
+            )
+        except Exception:
+            pass
 
         def _bless_target(target: discord.Member | discord.User, award_points: bool) -> tuple[str, int, int, str]:
             """Returns (reply_text, target_pts, caster_pts, word)."""
@@ -2357,8 +2638,9 @@ async def help_slash(interaction: discord.Interaction) -> None:
             name="🎰 Gambling *(uses cosmic actions)*",
             value=(
                 "`/flip heads|tails bet` — Coin flip, 1:1 payout\n"
-                "`/roll_dice over7|under7|exact7 bet` — Dice: over/under 1:1, exact 7 pays 4:1\n"
-                "`/roulette red|black|1-36 bet` — 39-pocket wheel: colors ~46% (1:1), numbers ~2.6% (35:1)\n"
+                "`/roll_dice bet` — Dice: over/under 1:1, exact 7 pays 4:1, specific sums up to 35:1\n"
+                "`/roulette bet` — 39-pocket wheel: color/odd/even 1:1, dozen 2:1, number 35:1\n"
+                "`/slots bet` — Slot machine: 2-match 3:1, 3-match 10:1, jackpot (7️⃣7️⃣7️⃣) 50:1\n"
                 "Max bet **50,000 Boli** per game."
             ),
             inline=False,
@@ -2382,9 +2664,10 @@ async def help_slash(interaction: discord.Interaction) -> None:
             name="🖼️ Media Shortcuts",
             value=(
                 "Right-click a message → **Apps** → **Save as Emoji** or **Save as Sticker**\n"
-                "Name is pre-filled from the emoji/sticker name — just confirm or edit it.\n"
-                "Type `;;name` in any channel to post the saved file.\n"
-                "Right-click → **Apps** → **Reply with Emoji / Reply with Sticker** to pick from your saves.\n"
+                "Custom emojis are saved natively. Images are uploaded as **Application Emojis** (auto-managed, up to 2,000).\n"
+                "Saved stickers sent alone appear enlarged — just like a real sticker!\n"
+                "Type `;;name` in any channel to post the saved emoji/sticker.\n"
+                "Right-click → **Apps** → **Reply with Emoji / Reply with Sticker** to reply with one of your saves.\n"
                 "`/my_media` — List all your saved shortcuts (max 20 per user)."
             ),
             inline=False,
@@ -2496,7 +2779,7 @@ class AdminGroup(app_commands.Group):
     @app_commands.choices(feature=[
         app_commands.Choice(name="Navi Predictions", value="feature_navi"),
         app_commands.Choice(name="Curses & Blessings (navi/chunk)", value="feature_curses"),
-        app_commands.Choice(name="Gambling (/flip, /roll_dice, /roulette)", value="feature_gambling"),
+        app_commands.Choice(name="Gambling (/flip, /roll_dice, /roulette, /slots)", value="feature_gambling"),
         app_commands.Choice(name="Local Media Shortcuts (;;name)", value="feature_local_media"),
         app_commands.Choice(name="Boli Points Tracking", value="feature_boli_points"),
         app_commands.Choice(name="Kochi Slang Detection", value="feature_kochi_replies"),
@@ -2694,6 +2977,13 @@ async def strike_slash(
 
 _ROULETTE_RED: frozenset[int] = frozenset({1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36})
 
+# Dice exact-number payout multipliers (total return including stake)
+# Probability: 1/36 for 2&12, 2/36 for 3&11, 3/36 for 4&10, 4/36 for 5&9, 5/36 for 6&8
+_DICE_EXACT_PAYOUT: dict[int, int] = {
+    2: 36, 3: 18, 4: 12, 5: 9, 6: 7,
+    8: 7, 9: 9, 10: 12, 11: 18, 12: 36,
+}
+
 
 def _gambling_guard(
     profile: dict | None,
@@ -2767,12 +3057,22 @@ async def flip_slash(
     )
 
 
-@tree.command(name="roll_dice", description="Roll two dice — bet on over 7, under 7, or exact 7")
+@tree.command(name="roll_dice", description="Roll two dice — bet on over/under/exact 7, or call a specific sum")
 @app_commands.describe(bet_type="Your prediction", bet="How many Boli to wager")
 @app_commands.choices(bet_type=[
     app_commands.Choice(name="Over 7 (1:1 payout)", value="over7"),
     app_commands.Choice(name="Under 7 (1:1 payout)", value="under7"),
     app_commands.Choice(name="Exact 7 (4:1 payout)", value="exact7"),
+    app_commands.Choice(name="Exact 2 — 35:1 payout", value="2"),
+    app_commands.Choice(name="Exact 3 — 17:1 payout", value="3"),
+    app_commands.Choice(name="Exact 4 — 11:1 payout", value="4"),
+    app_commands.Choice(name="Exact 5 — 8:1 payout", value="5"),
+    app_commands.Choice(name="Exact 6 — 6:1 payout", value="6"),
+    app_commands.Choice(name="Exact 8 — 6:1 payout", value="8"),
+    app_commands.Choice(name="Exact 9 — 8:1 payout", value="9"),
+    app_commands.Choice(name="Exact 10 — 11:1 payout", value="10"),
+    app_commands.Choice(name="Exact 11 — 17:1 payout", value="11"),
+    app_commands.Choice(name="Exact 12 — 35:1 payout", value="12"),
 ])
 async def roll_dice_slash(
     interaction: discord.Interaction,
@@ -2810,12 +3110,20 @@ async def roll_dice_slash(
     if bet_type == "over7":
         won = total > 7
         payout_mult = 2
+        bet_label = "Over 7"
     elif bet_type == "under7":
         won = total < 7
         payout_mult = 2
-    else:  # exact7
+        bet_label = "Under 7"
+    elif bet_type == "exact7":
         won = total == 7
         payout_mult = 5
+        bet_label = "Exact 7"
+    else:
+        target = int(bet_type)
+        won = total == target
+        payout_mult = _DICE_EXACT_PAYOUT[target]
+        bet_label = f"Exact {target}"
 
     winnings = bet * payout_mult if won else 0
     if won:
@@ -2826,7 +3134,7 @@ async def roll_dice_slash(
     embed = discord.Embed(
         title="🎲 Cosmic Dice",
         description=(
-            f"{interaction.user.mention} bet **{bet} Boli** on **{bet_type}**.\n\n"
+            f"{interaction.user.mention} bet **{bet} Boli** on **{bet_label}**.\n\n"
             f"{dice_display}\n\n{outcome_str}"
         ),
         color=discord.Color.green() if won else discord.Color.red(),
@@ -2840,9 +3148,14 @@ async def roll_dice_slash(
     )
 
 
-@tree.command(name="roulette", description="Space roulette — bet on a color (1:1) or number 1-36 (35:1)")
+_ROULETTE_DOZENS: dict[str, tuple[int, int]] = {
+    "dozen1": (1, 12), "dozen2": (13, 24), "dozen3": (25, 36)
+}
+
+
+@tree.command(name="roulette", description="Space roulette — color (1:1), dozen (2:1), odd/even (1:1), or number 1-36 (35:1)")
 @app_commands.describe(
-    choice="red, black, or a number 1-36",
+    choice="red/black, odd/even, dozen1/dozen2/dozen3, or a number 1-36",
     bet="How many Boli to wager",
 )
 async def roulette_slash(
@@ -2855,11 +3168,15 @@ async def roulette_slash(
         return
     choice = choice.strip().lower()
     valid_colors = {"red", "black"}
+    valid_evenodd = {"odd", "even"}
     is_color = choice in valid_colors
+    is_evenodd = choice in valid_evenodd
+    is_dozen = choice in _ROULETTE_DOZENS
     is_number = choice.isdigit() and 1 <= int(choice) <= 36
-    if not is_color and not is_number:
+    if not (is_color or is_evenodd or is_dozen or is_number):
         await interaction.response.send_message(
-            "Invalid choice. Use `red`, `black`, or a number `1`–`36`.", ephemeral=True
+            "Invalid choice. Use `red`/`black`, `odd`/`even`, `dozen1`/`dozen2`/`dozen3`, or a number `1`–`36`.",
+            ephemeral=True,
         )
         return
 
@@ -2903,6 +3220,15 @@ async def roulette_slash(
     if is_color:
         won = landed not in _green_pockets and landed_color == choice
         payout_mult = 2
+    elif is_evenodd:
+        won = landed not in _green_pockets and (
+            landed % 2 == 0 if choice == "even" else landed % 2 == 1
+        )
+        payout_mult = 2
+    elif is_dozen:
+        lo, hi = _ROULETTE_DOZENS[choice]
+        won = landed not in _green_pockets and lo <= landed <= hi
+        payout_mult = 3
     else:
         won = landed == int(choice)
         payout_mult = 36
@@ -2927,6 +3253,88 @@ async def roulette_slash(
     logger.info(
         "%s roulette: bet %d on '%s', landed %d (%s) → %s",
         interaction.user.display_name, bet, choice, landed, landed_color, "win" if won else "lose",
+    )
+
+
+# ---------------------------------------------------------------------------
+# /slots — slot machine
+# ---------------------------------------------------------------------------
+
+_SLOTS_SYMBOLS: list[str] = ["🍎", "🍒", "🍋", "🔔", "⭐", "💎", "7️⃣"]
+_SLOTS_WEIGHTS: list[int]  = [ 30,   25,   20,   15,   7,    5,    3  ]
+
+
+@tree.command(name="slots", description="Spin the cosmic slot machine — 2-match 3:1, 3-match 10:1, jackpot 50:1")
+@app_commands.describe(bet="How many Boli to wager")
+async def slots_slash(
+    interaction: discord.Interaction,
+    bet: app_commands.Range[int, 1, 50000],
+) -> None:
+    if not _feat("feature_gambling"):
+        await interaction.response.send_message("Gambling is currently disabled.", ephemeral=True)
+        return
+    profile = get_user_profile(db_conn, interaction.user.id)
+    err = _gambling_guard(profile, bet)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    daily_count = get_daily_action_count(db_conn, interaction.user.id)
+    extra_actions = get_extra_actions(db_conn, interaction.user.id)
+    if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
+        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
+            user=interaction.user.display_name, quota=_DAILY_QUOTA
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    new_daily = increment_daily_action_count(db_conn, interaction.user.id)
+    if new_daily > _DAILY_QUOTA:
+        decrement_extra_actions(db_conn, interaction.user.id)
+    update_boli_points(db_conn, interaction.user.id, -bet)
+    await asyncio.sleep(1.5)
+
+    reels = random.choices(_SLOTS_SYMBOLS, weights=_SLOTS_WEIGHTS, k=3)
+    r1, r2, r3 = reels
+    reel_display = f"[ {r1} | {r2} | {r3} ]"
+
+    jackpot = r1 == r2 == r3 == "7️⃣"
+    three_match = r1 == r2 == r3
+    two_match = (r1 == r2) or (r2 == r3) or (r1 == r3)
+
+    if jackpot:
+        payout_mult = 51  # 50:1 → 51x return
+        outcome_str = f"🎰 **JACKPOT!!!** +**{bet * payout_mult - bet} Boli**"
+    elif three_match:
+        payout_mult = 11  # 10:1 → 11x return
+        outcome_str = f"✅ **Three of a kind!** +**{bet * payout_mult - bet} Boli**"
+    elif two_match:
+        payout_mult = 4   # 3:1 → 4x return
+        outcome_str = f"✅ **Two of a kind!** +**{bet * payout_mult - bet} Boli**"
+    else:
+        payout_mult = 0
+        outcome_str = f"❌ **No match.** -{bet} Boli"
+
+    winnings = bet * payout_mult
+    if winnings:
+        update_boli_points(db_conn, interaction.user.id, winnings)
+
+    embed = discord.Embed(
+        title="🎰 Cosmic Slots",
+        description=(
+            f"{interaction.user.mention} bet **{bet} Boli**.\n\n"
+            f"## {reel_display}\n\n{outcome_str}"
+        ),
+        color=discord.Color.gold() if jackpot else (discord.Color.green() if payout_mult else discord.Color.red()),
+    )
+    new_pts = (profile["boli_points"] - bet) + winnings
+    embed.set_footer(text=f"Balance: 🍮 {new_pts} Boli")
+    await interaction.followup.send(embed=embed)
+    logger.info(
+        "%s slots: bet=%d reels=[%s|%s|%s] → %s",
+        interaction.user.display_name, bet, r1, r2, r3,
+        "jackpot" if jackpot else ("3match" if three_match else ("2match" if two_match else "lose")),
     )
 
 
