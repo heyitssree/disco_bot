@@ -7,10 +7,6 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger("navi.slang_scorer")
 

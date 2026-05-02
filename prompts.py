@@ -365,8 +365,6 @@ FALLBACK_MESSAGES: list[str] = [
     "Network shokam. The universe isn't responding right now.",
 ]
 
-# Keep single-string alias for backward-compatible comparisons.
-FALLBACK_MESSAGE = FALLBACK_MESSAGES[0]
 
 # ---------------------------------------------------------------------------
 # Welcome messages — short, English, funny (no prediction, always include Moda)

@@ -195,6 +195,17 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Per-game daily play counts (Feature: gambling decoupled from cosmic actions)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS game_daily_counts (
+            user_id     INTEGER NOT NULL,
+            game_name   TEXT NOT NULL,
+            play_date   DATE NOT NULL,
+            play_count  INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, game_name, play_date)
+        )
+    """)
+
     # Analytics tables
     conn.execute("""
         CREATE TABLE IF NOT EXISTS command_events (
@@ -305,6 +316,9 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         "ALTER TABLE user_stats ADD COLUMN daily_action_count INTEGER DEFAULT 0",
         "ALTER TABLE user_stats ADD COLUMN last_action_date DATE",
         "ALTER TABLE user_stats ADD COLUMN extra_actions INTEGER DEFAULT 0",
+        # Tiered action refill tracking (Feature: tiered shop pricing)
+        "ALTER TABLE user_stats ADD COLUMN daily_refill_count INTEGER DEFAULT 0",
+        "ALTER TABLE user_stats ADD COLUMN last_refill_date DATE",
         # local_media: extended storage type support
         "ALTER TABLE local_media ADD COLUMN storage_type TEXT DEFAULT 'local'",
         "ALTER TABLE local_media ADD COLUMN discord_id TEXT",
@@ -1006,6 +1020,131 @@ def add_extra_actions(conn: sqlite3.Connection, user_id: int, amount: int) -> No
         ),
         conn.commit(),
     ))
+
+
+# ---------------------------------------------------------------------------
+# Daily action refill tracking (tiered shop pricing: 30 Boli → 50 Boli → blocked)
+# ---------------------------------------------------------------------------
+
+def get_daily_refill_count(conn: sqlite3.Connection, user_id: int) -> int:
+    """Return how many action refills the user has bought today (IST). 0 if a different day."""
+    row = conn.execute(
+        "SELECT daily_refill_count, last_refill_date FROM user_stats WHERE user_id = ?",
+        [user_id],
+    ).fetchone()
+    if not row:
+        return 0
+    count, last_date = row
+    if last_date != _today_ist():
+        return 0
+    return int(count) if count else 0
+
+
+def increment_daily_refill_count(conn: sqlite3.Connection, user_id: int) -> int:
+    """Increment today's refill count (resetting to 1 if it's a new day). Returns new count."""
+    today = _today_ist()
+    _db_write(lambda: (
+        conn.execute(
+            """
+            UPDATE user_stats
+            SET
+                daily_refill_count = CASE WHEN last_refill_date = ? THEN daily_refill_count + 1 ELSE 1 END,
+                last_refill_date = ?
+            WHERE user_id = ?
+            """,
+            [today, today, user_id],
+        ),
+        conn.commit(),
+    ))
+    row = conn.execute(
+        "SELECT daily_refill_count FROM user_stats WHERE user_id = ?", [user_id]
+    ).fetchone()
+    return int(row[0]) if row and row[0] else 1
+
+
+# ---------------------------------------------------------------------------
+# Per-game daily play quota (5 plays per game per day, independent per game)
+# ---------------------------------------------------------------------------
+
+_GAME_DAILY_LIMIT = 5
+
+
+def get_game_daily_count(conn: sqlite3.Connection, user_id: int, game_name: str) -> int:
+    """Return today's play count for the given game (IST). Returns 0 if no record today."""
+    today = _today_ist()
+    row = conn.execute(
+        "SELECT play_count FROM game_daily_counts WHERE user_id = ? AND game_name = ? AND play_date = ?",
+        [user_id, game_name, today],
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def increment_game_daily_count(conn: sqlite3.Connection, user_id: int, game_name: str) -> int:
+    """Increment today's play count for the given game. Returns the new count."""
+    today = _today_ist()
+    _db_write(lambda: (
+        conn.execute(
+            """
+            INSERT INTO game_daily_counts (user_id, game_name, play_date, play_count)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT (user_id, game_name, play_date) DO UPDATE SET
+                play_count = play_count + 1
+            """,
+            [user_id, game_name, today],
+        ),
+        conn.commit(),
+    ))
+    row = conn.execute(
+        "SELECT play_count FROM game_daily_counts WHERE user_id = ? AND game_name = ? AND play_date = ?",
+        [user_id, game_name, today],
+    ).fetchone()
+    return int(row[0]) if row else 1
+
+
+# ---------------------------------------------------------------------------
+# Lucky draw: users active previous day (7am IST prev → 6:59am IST today)
+# ---------------------------------------------------------------------------
+
+def get_active_user_ids_previous_day(conn: sqlite3.Connection) -> list[int]:
+    """Return user_ids active during the previous IST day window (7am–6:59am).
+
+    'Active' means last_seen fell within that window.
+    Used for the daily lucky draw at 7am IST.
+    """
+    # Previous day window in UTC:
+    # 7:00am IST = 1:30am UTC, so window = yesterday 01:30:00 UTC → today 01:29:59 UTC
+    rows = conn.execute(
+        """
+        SELECT user_id FROM user_stats
+        WHERE last_seen >= datetime('now', '-1 day', 'start of day', '+1 hours', '+30 minutes')
+          AND last_seen <  datetime('now', 'start of day', '+1 hours', '+30 minutes')
+        """,
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_top_n_from_user_ids(
+    conn: sqlite3.Connection,
+    user_ids: list[int],
+    n: int = 10,
+) -> list[dict]:
+    """Return up to n users sorted by boli_points DESC, filtered to the given user_id list.
+
+    Returns list of dicts with user_id, username, boli_points.
+    """
+    if not user_ids:
+        return []
+    placeholders = ",".join("?" * len(user_ids))
+    rows = conn.execute(
+        f"""
+        SELECT user_id, username, boli_points FROM user_stats
+        WHERE user_id IN ({placeholders})
+        ORDER BY boli_points DESC
+        LIMIT ?
+        """,
+        [*user_ids, n],
+    ).fetchall()
+    return [{"user_id": r[0], "username": r[1], "boli_points": r[2]} for r in rows]
 
 
 # ---------------------------------------------------------------------------

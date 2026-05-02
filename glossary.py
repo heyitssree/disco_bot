@@ -331,7 +331,7 @@ def get_contextual_sample(
 def get_glossary_text(db_conn) -> str:
     """Return a formatted glossary snippet for prompt injection.
 
-    Pulls a time-aware random sample from the local_knowledge DuckDB table.
+    Pulls a time-aware random sample from the local_knowledge SQLite table.
     Each line includes the term name and its usage description so Gemini has
     actionable context, not just a bare list of names.
     """

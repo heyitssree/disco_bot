@@ -74,6 +74,14 @@ from schema import (
     update_app_emoji_last_used,
     count_app_emojis,
     _APP_EMOJI_EVICT_THRESHOLD,
+    # New feature imports
+    get_daily_refill_count,
+    increment_daily_refill_count,
+    get_game_daily_count,
+    increment_game_daily_count,
+    _GAME_DAILY_LIMIT,
+    get_active_user_ids_previous_day,
+    get_top_n_from_user_ids,
 )
 from glossary import RASHIS
 from prompts import (
@@ -155,7 +163,7 @@ OWNER_ID: int | None = int(_raw_owner_id) if _raw_owner_id.isdigit() else None
 # ---------------------------------------------------------------------------
 # In-Memory Rate Limiting (rolling 60-second window per user)
 # ---------------------------------------------------------------------------
-from datetime import timedelta
+
 
 _user_usage: dict[int, list[datetime]] = {}  # user_id -> list of timestamps
 _RATE_WINDOW_SECONDS = 60
@@ -439,19 +447,19 @@ def get_level_title(level: int) -> str:
 _DAILY_QUOTA = 20  # combined cosmic actions per day (curses + blessings + games)
 
 _OVER_QUOTA_CURSE_MESSAGES: list[str] = [
-    "The universe is tired of your curses, {invoker}. You've been reverse-cursed for overindulgence. (-5 pts)",
-    "20 cosmic actions a day is the limit, {invoker}. The excess comes straight back on you. (-5 pts)",
-    "Quota exceeded, {invoker}. The cosmos doesn't appreciate the overtime — curse redirected. (-5 pts)",
-    "Too many curses from {invoker} today. The universe is sending one back as a reminder. (-5 pts)",
-    "{invoker}, even the stars have limits. You've been billed for the extra curse. (-5 pts)",
+    "The universe is tired of your curses, {invoker}. You've used all your cosmic actions for today. Take a 30-minute cosmic breather.",
+    "20 cosmic actions a day is the limit, {invoker}. The cosmos is sending you to the waiting room for 30 minutes.",
+    "Quota exceeded, {invoker}. The cosmos doesn't appreciate the overtime — wait 30 minutes before buying more actions.",
+    "Too many curses from {invoker} today. The universe is putting you on hold for 30 minutes.",
+    "{invoker}, even the stars have limits. Cooling down for 30 minutes.",
 ]
 
 _OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES: list[str] = [
-    "{invoker}, you've burned through your daily quota. Even blessings have a limit — the cosmos fines you for the excess.",
-    "Over the {quota}/day limit, {invoker}. The universe curses you for pushing it.",
-    "{invoker} tried to bless one too many people today. The stars respond with a curse of their own.",
-    "Daily action quota exceeded, {invoker}. The cosmos sends its regards — in curse form.",
-    "{quota} cosmic actions per day, {invoker}. You hit the wall — the universe takes note. And points.",
+    "{invoker}, you've burned through your daily quota. Take a 30-minute cosmic cooldown before buying more.",
+    "Over the {quota}/day limit, {invoker}. Wait 30 minutes, then you can extend your actions from the shop.",
+    "{invoker} tried to bless one too many people today. The stars put you on a 30-minute timeout.",
+    "Daily action quota exceeded, {invoker}. The cosmos says: chill for 30 minutes.",
+    "{quota} cosmic actions per day, {invoker}. Buy more after your 30-minute cooldown.",
 ]
 
 _UNIVERSAL_BLESSING_MESSAGES: list[str] = [
@@ -462,13 +470,224 @@ _UNIVERSAL_BLESSING_MESSAGES: list[str] = [
     "🎀 The heavens noticed! {caster} blessed {receiver} with such sincerity that the cosmos rewarded them both. **100 Boli** each!",
 ]
 
-_OVER_QUOTA_GAME_MESSAGES: list[str] = [
-    "The cosmic casino is closed for you today, {user}. You've used up all {quota} daily actions.",
-    "{user}, the stars refuse to roll the dice — your {quota} cosmic actions for today are spent.",
-    "Out of cosmic energy, {user}. The universe won't let you gamble until midnight IST.",
-    "{user}, you've burned through your daily {quota} actions. Come back after midnight IST.",
-    "The cosmos has had enough, {user}. No more games until your quota resets at midnight IST.",
+
+# Messages shown while a user is in the action-purchase cooldown
+_COOLDOWN_ACTIVE_MESSAGES: list[str] = [
+    "🌀 {invoker}, you're in cosmic cooldown mode. The universe needs a moment. Come back {when}.",
+    "⏳ {invoker}, the cosmos is catching its breath. Your cooldown lifts {when}.",
+    "🔮 Slow down, {invoker}. The stars are aligning again. Try again {when}.",
+    "☁️ {invoker}, cosmic energy is recharging. Available for purchase {when}.",
 ]
+
+# Messages shown when a user can't buy because they have unused purchased actions
+_HAS_EXTRAS_MESSAGES: list[str] = [
+    "🔋 {invoker}, you still have **{extra}** purchased action(s) left. Spend those first before buying more.",
+    "You haven't used your purchased actions yet, {invoker}. You have **{extra}** remaining. Use them first!",
+    "⚡ {invoker}, **{extra}** extra cosmic action(s) left in your tank. Burn through them before refilling.",
+]
+
+# Over-quota game messages (now with countdown)
+_OVER_QUOTA_GAME_MESSAGES: list[str] = [
+    "You've used all 5 plays for **{game}** today, {user}. Come back after midnight IST!",
+    "{user}, the cosmic {game} table is closed for you today. 5 plays max. Reset at midnight IST.",
+    "Out of {game} tries, {user}. You've hit the 5/day limit. See you after midnight IST!",
+    "{user}, 5 games of {game} per day max. The dealer has cut you off until midnight IST.",
+    "The cosmic {game} machine won't spin for you anymore today, {user}. Come back after midnight IST.",
+]
+
+
+async def _check_cosmic_quota(
+    invoker: discord.Member | discord.User,
+    reply_target: discord.Message,
+    action_type: str = "curse",  # for log labelling only
+) -> bool:
+    """Check if the invoker can perform a cosmic action (curse or bless).
+
+    Handles the three-state gate:
+      1. Active cooldown perk (action_cooldown): block, show time remaining.
+      2. Purchased extra actions > 0: block purchase flow (must spend first).
+         This is NOT called for actual actions — those still consume extras normally.
+      3. Quota exceeded + no extras: grant 30-min cooldown, show message.
+
+    Returns True if the action is BLOCKED (caller should return early).
+    Returns False if the action is ALLOWED (caller may proceed).
+    """
+    daily_count = get_daily_action_count(db_conn, invoker.id)
+    extra_actions = get_extra_actions(db_conn, invoker.id)
+
+    # Already cooling down from a previous exhaust?
+    if has_active_perk(db_conn, invoker.id, "action_cooldown"):
+        expiry = get_perk_expiry(db_conn, invoker.id, "action_cooldown")
+        expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
+        ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "soon"
+        msg = random.choice(_COOLDOWN_ACTIVE_MESSAGES).format(invoker=invoker.display_name, when=ts)
+        await reply_target.reply(msg)
+        return True
+
+    # Quota OK — action is allowed
+    if daily_count < _DAILY_QUOTA or extra_actions > 0:
+        return False
+
+    # Quota just exhausted — enter 30-minute cooldown
+    grant_perk(db_conn, invoker.id, "action_cooldown", duration_hours=0.5)
+    expiry = get_perk_expiry(db_conn, invoker.id, "action_cooldown")
+    expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
+    ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "in 30 minutes"
+    over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(
+        invoker=invoker.display_name, quota=_DAILY_QUOTA
+    )
+    await reply_target.reply(f"{over_msg}\n*You can buy extra actions from `/shop buy` after {ts}.*")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Slang spam prevention
+# ---------------------------------------------------------------------------
+# Once a user sends 3+ short standalone messages within 60s (regardless of
+# whether they change words), they enter a 5-minute slang cooldown during
+# which NO Boli points are awarded for any slang message.
+# ---------------------------------------------------------------------------
+
+# user_id -> (consecutive_short_msg_count, last_message_time)
+_slang_spam_tracker: dict[int, tuple[int, datetime]] = {}
+# user_id -> datetime when the cooldown expires (5 minutes after spam triggered)
+_slang_cooldown: dict[int, datetime] = {}
+
+_SLANG_SPAM_WINDOW_SECONDS = 60   # window for consecutive short-message counting
+_SLANG_SPAM_THRESHOLD = 2          # trigger cooldown after this many (3rd message = index 2)
+_SLANG_COOLDOWN_MINUTES = 5        # how long points are suppressed after trigger
+_SLANG_SPAM_MAX_WORDS = 2          # only track messages with ≤ this many words
+_SLANG_SPAM_MAX_CHARS = 20         # and ≤ this many chars
+
+
+def _check_slang_spam(user_id: int, content: str) -> bool:
+    """Track short standalone messages regardless of word change.
+
+    Returns True (suppress Boli points) if:
+    - The user is currently in a 5-minute slang cooldown, OR
+    - This message is the 3rd+ consecutive short message within 60s,
+      which also starts the 5-minute cooldown.
+
+    Counter increments for ANY short message within the 60s window,
+    even if the user switches to a different word.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Check if already in cooldown
+    cooldown_until = _slang_cooldown.get(user_id)
+    if cooldown_until and now < cooldown_until:
+        return True  # still cooling down — suppress points
+
+    # Count consecutive short messages within the window
+    count, last_time = _slang_spam_tracker.get(user_id, (0, now))
+    within_window = (now - last_time).total_seconds() <= _SLANG_SPAM_WINDOW_SECONDS
+
+    new_count = count + 1 if within_window else 1
+    _slang_spam_tracker[user_id] = (new_count, now)
+
+    if new_count >= _SLANG_SPAM_THRESHOLD + 1:
+        # Enter 5-minute cooldown
+        _slang_cooldown[user_id] = now + timedelta(minutes=_SLANG_COOLDOWN_MINUTES)
+        logger.debug(
+            "Slang spam cooldown set for user_id=%d — '%s' was the %d-th short msg in window.",
+            user_id, content.strip()[:20], new_count,
+        )
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Daily Lucky Draw (7am IST — 200 Boli to a random top-10 active user)
+# ---------------------------------------------------------------------------
+
+_LUCKY_DRAW_AMOUNT = 200
+_LUCKY_DRAW_MESSAGES: list[str] = [
+    "🪐 **Daily Navi Lucky Draw!** The cosmos took one look at the leaderboard, scratched its head, and said: {winner_mention}, it's your lucky day! **+{amount} Boli** for doing absolutely nothing productive. 🎉",
+    "🎰 **Ding ding ding!** Today's cosmic jackpot winner is {winner_mention}! The stars rolled the dice, picked a name, and landed on yours. Congrats, you beautifully undeserving human. **+{amount} Boli** added! 🦄",
+    "🌈 **Navi Lucky Draw Results:** After careful scientific analysis (aka pure random chance), the universe has decided {winner_mention} deserves **{amount} free Boli**. No skill required. The cosmos is chaotic like that. 🍀",
+    "✨ **Lucky Draw o’clock!** {winner_mention} woke up, existed, and was randomly chosen by Navi. The reward? **+{amount} Boli**. The lesson? Sometimes just being here is enough. Spend it on something silly. 🪄",
+    "💫 **Breaking news from the Cosmic Lottery Bureau:** {winner_mention} is today’s winner! Out of everyone who was active yesterday, Navi spun the wheel and — yep, it’s you. **{amount} Boli** deposited into your cosmic wallet. Go gamble it immediately. 🎨",
+    "🔮 **The oracle has spoken!** Navi closed her eyes, pointed at the leaderboard, and her finger landed on {winner_mention}. **+{amount} Boli** for being in the right chat at the right time. May the Boli bless your evening. 🙏",
+]
+
+
+async def _lucky_draw_loop() -> None:
+    """Background loop that fires a lucky draw at 7:00am IST every day.
+
+    Picks one random user from the top-10 most-active previous day members
+    and awards _LUCKY_DRAW_AMOUNT Boli Points. Announced in the general channel.
+    """
+    _IST = timezone(timedelta(hours=5, minutes=30))
+
+    while True:
+        # Calculate seconds until next 7:00am IST
+        now_ist = datetime.now(_IST)
+        target = now_ist.replace(hour=7, minute=0, second=0, microsecond=0)
+        if now_ist >= target:
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now_ist).total_seconds()
+        logger.info("Lucky draw sleeping for %.0f seconds (until 7:00am IST).", wait_seconds)
+        await asyncio.sleep(wait_seconds)
+
+        try:
+            # Deduplicate: check we haven't already run today
+            today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+            last_run = get_config_str(db_conn, "lucky_draw_last_date", "")
+            if last_run == today_str:
+                logger.info("Lucky draw already ran today (%s) — skipping.", today_str)
+                await asyncio.sleep(60)  # small extra sleep to avoid re-triggering
+                continue
+
+            # Get candidates: top 10 from yesterday's active users
+            active_ids = get_active_user_ids_previous_day(db_conn)
+            if not active_ids:
+                logger.info("Lucky draw: no active users from previous day — skipping.")
+                set_config_str(db_conn, "lucky_draw_last_date", today_str)
+                continue
+
+            candidates = get_top_n_from_user_ids(db_conn, active_ids, n=10)
+            if not candidates:
+                logger.info("Lucky draw: no top-10 candidates found — skipping.")
+                set_config_str(db_conn, "lucky_draw_last_date", today_str)
+                continue
+
+            winner = random.choice(candidates)
+            update_boli_points(db_conn, winner["user_id"], _LUCKY_DRAW_AMOUNT)
+            set_config_str(db_conn, "lucky_draw_last_date", today_str)
+
+            # Resolve winner mention across all guilds
+            winner_mention = f"<@{winner['user_id']}>"
+            msg = random.choice(_LUCKY_DRAW_MESSAGES).format(
+                winner_mention=winner_mention,
+                amount=_LUCKY_DRAW_AMOUNT,
+            )
+
+            # Resolve announce channel: ID first, then name, then fallback ID
+            _NAVI_GAMES_ID = 1499827359585665104
+            _BOT_COMMANDS_ID = 1372128042058780783
+            announce_ch = (
+                bot.get_channel(_NAVI_GAMES_ID)
+                or discord.utils.find(
+                    lambda c: c.name == "navi-games",
+                    (ch for g in bot.guilds for ch in g.text_channels),
+                )
+                or bot.get_channel(_BOT_COMMANDS_ID)
+            )
+
+            if announce_ch:
+                await announce_ch.send(msg)
+                logger.info(
+                    "Lucky draw winner: %s (user_id=%d) +%d Boli — announced in #%s.",
+                    winner["username"], winner["user_id"], _LUCKY_DRAW_AMOUNT, announce_ch.name,
+                )
+            else:
+                logger.warning("Lucky draw: could not find any announce channel.")
+
+        except Exception as exc:
+            logger.error("Lucky draw loop error: %s", exc)
+
+        await asyncio.sleep(60)  # small buffer before recalculating next target
 
 
 async def _maybe_announce_levelup(
@@ -748,47 +967,10 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
             )
             return
 
-        # --- Native emoji: just record the Discord emoji ID, no download needed ---
-        if self._storage_type == "native_emoji":
-            save_local_media(
-                db_conn,
-                user_id=self._invoker_id,
-                shortcut=name,
-                file_path="",
-                media_type="emoji",
-                source_url=None,
-                storage_type="native_emoji",
-                discord_id=self._native_emoji_id,
-                discord_name=self._native_emoji_name,
-                animated=self._native_emoji_animated,
-            )
-            emoji_str = (
-                f"<a:{self._native_emoji_name}:{self._native_emoji_id}>"
-                if self._native_emoji_animated
-                else f"<:{self._native_emoji_name}:{self._native_emoji_id}>"
-            )
-            await interaction.response.send_message(
-                f"✅ Saved native emoji {emoji_str} as `;;{name}`!", ephemeral=True
-            )
-            return
-
-        # --- Native sticker: record sticker ID + URL, no download needed ---
-        if self._storage_type == "native_sticker":
-            save_local_media(
-                db_conn,
-                user_id=self._invoker_id,
-                shortcut=name,
-                file_path="",
-                media_type="sticker",
-                source_url=self._native_sticker_url,
-                storage_type="native_sticker",
-                discord_id=self._native_sticker_id,
-                discord_name=self._native_sticker_name,
-            )
-            await interaction.response.send_message(
-                f"✅ Saved sticker **{self._native_sticker_name}** as `;;{name}`!", ephemeral=True
-            )
-            return
+        # --- native_emoji / native_sticker paths removed ---
+        # All saves now go through app_emoji / app_emoji_sticker so they render
+        # on every server regardless of where the emoji/sticker originated.
+        # The _storage_type should always be 'app_emoji' or 'app_emoji_sticker' at this point.
 
         # --- App emoji or app emoji sticker: download then upload ---
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -869,14 +1051,14 @@ class ShortcutModal(discord.ui.Modal, title="Save Media Shortcut"):
         logger.info("User %s saved local media shortcut ';;%s' (%s)", self._invoker_id, name, self._media_type)
 
 
-@tree.context_menu(name="Save as Emoji")
-async def save_as_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Save as Emoji: saves a custom emoji natively or uploads an image as an Application Emoji."""
+@tree.context_menu(name="Save Emoji/Sticker")
+async def save_emoji_sticker_context(interaction: discord.Interaction, message: discord.Message) -> None:
+    """Right-click → Apps → Save Emoji/Sticker: auto-detects emoji or sticker and saves it."""
     if not _feat("feature_local_media"):
         await interaction.response.send_message("Local media shortcuts are currently disabled.", ephemeral=True)
         return
 
-    # Prefer a custom emoji in the message text → store its native ID
+    # --- Detect: custom emoji in message content ---
     matches = _CUSTOM_EMOJI_RE.findall(message.content)
     if matches:
         if len(matches) > 1:
@@ -886,86 +1068,54 @@ async def save_as_emoji_context(interaction: discord.Interaction, message: disco
             )
             return
         animated_flag, emoji_name, emoji_id = matches[0]
+        # Resolve image URL for the emoji
+        ext = "gif" if animated_flag else "png"
+        emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{ext}?size=128"
+        suggested = _sanitize_shortcut(emoji_name)
         await interaction.response.send_modal(
             ShortcutModal(
-                storage_type="native_emoji",
+                storage_type="app_emoji",
                 media_type="emoji",
                 invoker_id=interaction.user.id,
-                suggested_name=_sanitize_shortcut(emoji_name),
-                native_emoji_id=emoji_id,
-                native_emoji_name=emoji_name,
-                native_emoji_animated=bool(animated_flag),
+                suggested_name=suggested,
+                download_url=emoji_url,
+                file_ext=ext,
             )
         )
         return
 
-    # Fall back to image attachments → upload as Application Emoji
-    for att in message.attachments:
-        if att.content_type and att.content_type.startswith("image/"):
-            ext_guess = att.filename.rsplit(".", 1)[-1].lower()
-            file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
-            stem = att.filename.rsplit(".", 1)[0]
-            await interaction.response.send_modal(
-                ShortcutModal(
-                    storage_type="app_emoji",
-                    media_type="emoji",
-                    invoker_id=interaction.user.id,
-                    suggested_name=_sanitize_shortcut(stem),
-                    download_url=att.url,
-                    file_ext=file_ext,
-                )
-            )
-            return
-
-    await interaction.response.send_message(
-        "No custom emoji or image attachment found in that message.",
-        ephemeral=True,
-    )
-
-
-@tree.context_menu(name="Save as Sticker")
-async def save_as_sticker_context(interaction: discord.Interaction, message: discord.Message) -> None:
-    """Right-click → Apps → Save as Sticker: saves a native sticker by ID, or uploads an image as an Application Emoji."""
-    if not _feat("feature_local_media"):
-        await interaction.response.send_message("Local media shortcuts are currently disabled.", ephemeral=True)
-        return
-
-    # Prefer stickers attached to the message → store natively by ID
+    # --- Detect: sticker on the message ---
     if message.stickers:
         sticker = message.stickers[0]
+        sticker_url = str(sticker.url)
+        # Determine file extension from URL
+        ext_part = sticker_url.rsplit(".", 1)[-1].split("?")[0].lower()
+        ext = ext_part if ext_part in ("png", "gif", "apng", "json") else "png"
+        # Lottie JSON stickers can't be used as Discord emojis — skip them
+        if ext == "json":
+            await interaction.response.send_message(
+                "That sticker uses an animated Lottie format which can't be saved as a bot emoji. "
+                "Try a standard PNG or GIF sticker.",
+                ephemeral=True,
+            )
+            return
+        suggested = _sanitize_shortcut(sticker.name)
         await interaction.response.send_modal(
             ShortcutModal(
-                storage_type="native_sticker",
+                storage_type="app_emoji_sticker",
                 media_type="sticker",
                 invoker_id=interaction.user.id,
-                suggested_name=_sanitize_shortcut(sticker.name),
-                native_sticker_id=str(sticker.id),
-                native_sticker_name=sticker.name,
-                native_sticker_url=str(sticker.url),
+                suggested_name=suggested,
+                download_url=sticker_url,
+                file_ext="png",  # re-upload as png regardless
             )
         )
         return
 
-    # Fall back to image/GIF attachments → upload as Application Emoji (lone emoji = sticker look)
-    for att in message.attachments:
-        if att.content_type and att.content_type.startswith("image/"):
-            ext_guess = att.filename.rsplit(".", 1)[-1].lower()
-            file_ext = ext_guess if ext_guess in ("png", "gif", "jpg", "jpeg", "webp") else "png"
-            stem = att.filename.rsplit(".", 1)[0]
-            await interaction.response.send_modal(
-                ShortcutModal(
-                    storage_type="app_emoji_sticker",
-                    media_type="sticker",
-                    invoker_id=interaction.user.id,
-                    suggested_name=_sanitize_shortcut(stem),
-                    download_url=att.url,
-                    file_ext=file_ext,
-                )
-            )
-            return
-
     await interaction.response.send_message(
-        "No sticker or image attachment found in that message.", ephemeral=True
+        "No custom emoji or sticker found in that message.\n"
+        "*Tip: The emoji must be a **custom** emoji (not a standard Unicode one).*",
+        ephemeral=True,
     )
 
 
@@ -978,13 +1128,25 @@ async def my_media_slash(interaction: discord.Interaction) -> None:
     entries = list_user_local_media(db_conn, interaction.user.id)
     if not entries:
         await interaction.response.send_message(
-            "You have no saved media. Right-click a message → **Apps** → **Save as Emoji** or **Save as Sticker**.",
+            "You have no saved media. Right-click a message → **Apps** → **Save Emoji/Sticker**.",
             ephemeral=True,
         )
         return
 
     max_per_user = get_config_int(db_conn, "local_media_max_per_user", 20)
-    lines = [f"`;;{e['shortcut']}` — {e['media_type']}" for e in entries]
+    lines = []
+    for e in entries:
+        st = e.get("storage_type", "local")
+        preview = ""
+        if st in ("app_emoji", "app_emoji_sticker"):
+            full = get_local_media(db_conn, e["shortcut"])
+            if full and full.get("discord_id"):
+                did = full["discord_id"]
+                dname = full.get("discord_name", e["shortcut"])
+                animated = full.get("animated", False)
+                preview = f"<{'a' if animated else ''}:{dname}:{did}> "
+        lines.append(f"{preview}`;;{e['shortcut']}` — {e['media_type']}")
+
     embed = discord.Embed(
         title="Your Saved Media",
         description="\n".join(lines),
@@ -1001,14 +1163,29 @@ class LocalMediaPickerView(discord.ui.View):
         super().__init__(timeout=60)
         self._target = target_message
 
-        options = [
-            discord.SelectOption(
-                label=f";;{e['shortcut']}",
-                value=e["shortcut"],
-                description=e["media_type"],
+        options = []
+        for e in entries[:25]:  # Discord select cap
+            # Build emoji preview for the dropdown
+            st = e.get("storage_type", "local")
+            # Fetch full record to get discord_id/discord_name
+            full = get_local_media(db_conn, e["shortcut"])
+            picker_emoji: discord.PartialEmoji | None = None
+            if full and st in ("app_emoji", "app_emoji_sticker", "native_emoji"):
+                did = full.get("discord_id")
+                dname = full.get("discord_name") or e["shortcut"]
+                animated = full.get("animated", False)
+                if did:
+                    picker_emoji = discord.PartialEmoji(
+                        name=dname, id=int(did), animated=animated
+                    )
+            options.append(
+                discord.SelectOption(
+                    label=f";;{e['shortcut']}",
+                    value=e["shortcut"],
+                    description=e["media_type"],
+                    emoji=picker_emoji,
+                )
             )
-            for e in entries[:25]  # Discord select cap
-        ]
         select = discord.ui.Select(placeholder="Pick a saved shortcut to reply with…", options=options)
         select.callback = self._on_select
         self.add_item(select)
@@ -1087,6 +1264,7 @@ class LocalMediaPickerView(discord.ui.View):
             item.disabled = True
 
 
+
 @tree.context_menu(name="Reply with Emoji")
 async def reply_with_emoji_context(interaction: discord.Interaction, message: discord.Message) -> None:
     """Right-click → Apps → Reply with Emoji: pick a saved emoji shortcut and reply to this message with it."""
@@ -1096,7 +1274,7 @@ async def reply_with_emoji_context(interaction: discord.Interaction, message: di
     entries = list_user_local_media(db_conn, interaction.user.id, media_type="emoji")
     if not entries:
         await interaction.response.send_message(
-            "You have no saved emojis. Right-click a message → **Apps** → **Save as Emoji** first.",
+            "You have no saved emojis. Right-click a message → **Apps** → **Save Emoji/Sticker** first.",
             ephemeral=True,
         )
         return
@@ -1116,7 +1294,7 @@ async def reply_with_sticker_context(interaction: discord.Interaction, message: 
     entries = list_user_local_media(db_conn, interaction.user.id, media_type="sticker")
     if not entries:
         await interaction.response.send_message(
-            "You have no saved stickers. Right-click a message → **Apps** → **Save as Sticker** first.",
+            "You have no saved stickers. Right-click a message → **Apps** → **Save Emoji/Sticker** first.",
             ephemeral=True,
         )
         return
@@ -1125,6 +1303,7 @@ async def reply_with_sticker_context(interaction: discord.Interaction, message: 
     await interaction.response.send_message(
         "Which saved sticker should I reply with?", view=view, ephemeral=True
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -1209,6 +1388,9 @@ async def on_ready() -> None:
 
     # Start hourly DB backup loop
     asyncio.create_task(_backup_loop())
+
+    # Start daily lucky draw loop (fires at 7:00am IST)
+    asyncio.create_task(_lucky_draw_loop())
 
     await tree.sync()
     logger.info("Slash commands synced. Navi is live. Hey! Listen!")
@@ -1414,9 +1596,21 @@ async def on_message(message: discord.Message) -> None:
     if _feat("feature_vibe_check"):
         await _check_vibe(message)
 
+    # ---- Slang Spam Prevention: gate Boli awards for repeat short messages ----
+    # Check BEFORE awarding points. If this is a repeated standalone word/phrase
+    # (same content, <=2 words, sent 3+ times within 60s), suppress all point awards.
+    _stripped = message.content.strip()
+    _words = _stripped.split()
+    _is_slang_spam = (
+        len(_words) <= _SLANG_SPAM_MAX_WORDS
+        and len(_stripped) <= _SLANG_SPAM_MAX_CHARS
+        and bool(_stripped)
+        and _check_slang_spam(message.author.id, _stripped)
+    )
+
     # ---- Boli Points: local slang triggers ----
     triggered_words = contains_boli_trigger(message.content) if get_config_int(db_conn, "feature_boli_points", 1) else []
-    if triggered_words:
+    if triggered_words and not _is_slang_spam:
         points = len(triggered_words) * 5
         profile = get_user_profile(db_conn, message.author.id)
         old_pts = profile["boli_points"] if profile else 0
@@ -1430,7 +1624,7 @@ async def on_message(message: discord.Message) -> None:
         )
 
     # ---- Slang Dictionary Scoring (TVM +pts / Kochi -pts, tiered) ----
-    if get_config_int(db_conn, "feature_boli_points", 1):
+    if get_config_int(db_conn, "feature_boli_points", 1) and not _is_slang_spam:
         slang_delta = score_message(message.content)
         if slang_delta != 0:
             profile = get_user_profile(db_conn, message.author.id)
@@ -1447,6 +1641,8 @@ async def on_message(message: discord.Message) -> None:
                 slang_delta,
                 [(m["token"], m["region"], m["points"]) for m in matches],
             )
+
+
 
     # ---- Kochi slang detection ----
     kochi_chance = get_config_float(db_conn, "kochi_reply_chance", 0.28)
@@ -1528,14 +1724,8 @@ async def on_message(message: discord.Message) -> None:
                 logger.info("%s tried to curse while timed out — -3 Boli penalty", invoker.display_name)
                 return
 
-            # --- Daily quota check ---
-            daily_count = get_daily_action_count(db_conn, invoker.id)
-            extra_actions = get_extra_actions(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
-                update_boli_points(db_conn, invoker.id, -5)
-                over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
-                await message.reply(over_msg)
-                logger.info("%s exceeded daily curse quota — reverse-cursed (-5 pts)", invoker.display_name)
+            # --- Daily quota check (with cooldown gate) ---
+            if await _check_cosmic_quota(invoker, message, "curse"):
                 return
 
             # --- Vampiric Karma Gamble ---
@@ -1634,12 +1824,7 @@ async def on_message(message: discord.Message) -> None:
             resolved = message.reference.resolved or message.reference.cached_message
             if isinstance(resolved, discord.Message) and not resolved.author.bot:
                 target = resolved.author
-                daily_count = get_daily_action_count(db_conn, invoker.id)
-                extra_actions = get_extra_actions(db_conn, invoker.id)
-                if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
-                    update_boli_points(db_conn, invoker.id, -5)
-                    over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
-                    await message.reply(over_msg)
+                if await _check_cosmic_quota(invoker, message, "curse"):
                     return
                 curse_data = get_random_curse()
                 target_protected = has_active_perk(db_conn, target.id, "curse_protection")
@@ -1673,12 +1858,7 @@ async def on_message(message: discord.Message) -> None:
 
         # "navi" with no mention and no reply → self-curse
         target = invoker
-        daily_count = get_daily_action_count(db_conn, invoker.id)
-        extra_actions = get_extra_actions(db_conn, invoker.id)
-        if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
-            update_boli_points(db_conn, invoker.id, -5)
-            over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(invoker=invoker.display_name)
-            await message.reply(over_msg)
+        if await _check_cosmic_quota(invoker, message, "curse"):
             return
         curse_data = get_random_curse()
         update_boli_points(db_conn, target.id, -curse_data["target_damage"])
@@ -1714,16 +1894,7 @@ async def on_message(message: discord.Message) -> None:
 
         async def _do_bless(target: discord.Member | discord.User) -> None:
             """Apply blessing: quota check → universal blessing roll → normal blessing."""
-            daily_count = get_daily_action_count(db_conn, invoker.id)
-            extra_actions = get_extra_actions(db_conn, invoker.id)
-            if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
-                reply, _, _, _ = _bless_target(target, award_points=False)
-                await message.reply(reply)
-                curse_msg = random.choice(_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES).format(
-                    invoker=invoker.display_name, quota=_DAILY_QUOTA
-                )
-                await message.channel.send(curse_msg)
-                logger.info("%s exceeded daily bless quota — no points awarded", invoker.display_name)
+            if await _check_cosmic_quota(invoker, message, "bless"):
                 return
 
             new_daily = increment_daily_action_count(db_conn, invoker.id)
@@ -2563,10 +2734,10 @@ async def health_slash(interaction: discord.Interaction) -> None:
         inline=False,
     )
 
-    # ── DuckDB ──────────────────────────────────────────────────────────────
+    # ── SQLite ──────────────────────────────────────────────────────────────
     counts_str = "\n".join(f"  `{t}`: {n}" for t, n in table_counts.items())
     embed.add_field(
-        name=f"🗄️ DuckDB  ({db_size_str})",
+        name=f"🗄️ SQLite  ({db_size_str})",
         value=counts_str,
         inline=False,
     )
@@ -2924,6 +3095,7 @@ class AdminGroup(app_commands.Group):
             "backfire_chance_moderate":("Backfire — Moderate tier",     0.15),
             "backfire_chance_severe":  ("Backfire — Severe tier",       0.20),
         }
+        prob_keys = set(_PROB_DEFAULTS.keys())
         prob_lines = []
         for k, (label, default) in _PROB_DEFAULTS.items():
             v = configs.get(k)
@@ -3019,19 +3191,16 @@ async def flip_slash(
         await interaction.response.send_message(err, ephemeral=True)
         return
 
-    daily_count = get_daily_action_count(db_conn, interaction.user.id)
-    extra_actions = get_extra_actions(db_conn, interaction.user.id)
-    if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
+    daily_count = get_game_daily_count(db_conn, interaction.user.id, "flip")
+    if daily_count >= _GAME_DAILY_LIMIT:
         msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, quota=_DAILY_QUOTA
+            user=interaction.user.display_name, game="Coin Flip"
         )
         await interaction.response.send_message(msg, ephemeral=True)
         return
 
     await interaction.response.defer(thinking=True)
-    new_daily = increment_daily_action_count(db_conn, interaction.user.id)
-    if new_daily > _DAILY_QUOTA:
-        decrement_extra_actions(db_conn, interaction.user.id)
+    increment_game_daily_count(db_conn, interaction.user.id, "flip")
     update_boli_points(db_conn, interaction.user.id, -bet)
     await asyncio.sleep(1.5)
 
@@ -3088,19 +3257,16 @@ async def roll_dice_slash(
         await interaction.response.send_message(err, ephemeral=True)
         return
 
-    daily_count = get_daily_action_count(db_conn, interaction.user.id)
-    extra_actions = get_extra_actions(db_conn, interaction.user.id)
-    if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
+    daily_count = get_game_daily_count(db_conn, interaction.user.id, "roll_dice")
+    if daily_count >= _GAME_DAILY_LIMIT:
         msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, quota=_DAILY_QUOTA
+            user=interaction.user.display_name, game="Dice"
         )
         await interaction.response.send_message(msg, ephemeral=True)
         return
 
     await interaction.response.defer(thinking=True)
-    new_daily = increment_daily_action_count(db_conn, interaction.user.id)
-    if new_daily > _DAILY_QUOTA:
-        decrement_extra_actions(db_conn, interaction.user.id)
+    increment_game_daily_count(db_conn, interaction.user.id, "roll_dice")
     update_boli_points(db_conn, interaction.user.id, -bet)
     await asyncio.sleep(1.5)
 
@@ -3186,19 +3352,16 @@ async def roulette_slash(
         await interaction.response.send_message(err, ephemeral=True)
         return
 
-    daily_count = get_daily_action_count(db_conn, interaction.user.id)
-    extra_actions = get_extra_actions(db_conn, interaction.user.id)
-    if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
+    daily_count = get_game_daily_count(db_conn, interaction.user.id, "roulette")
+    if daily_count >= _GAME_DAILY_LIMIT:
         msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, quota=_DAILY_QUOTA
+            user=interaction.user.display_name, game="Roulette"
         )
         await interaction.response.send_message(msg, ephemeral=True)
         return
 
     await interaction.response.defer(thinking=True)
-    new_daily = increment_daily_action_count(db_conn, interaction.user.id)
-    if new_daily > _DAILY_QUOTA:
-        decrement_extra_actions(db_conn, interaction.user.id)
+    increment_game_daily_count(db_conn, interaction.user.id, "roulette")
     update_boli_points(db_conn, interaction.user.id, -bet)
 
     await interaction.followup.send(
@@ -3279,19 +3442,16 @@ async def slots_slash(
         await interaction.response.send_message(err, ephemeral=True)
         return
 
-    daily_count = get_daily_action_count(db_conn, interaction.user.id)
-    extra_actions = get_extra_actions(db_conn, interaction.user.id)
-    if daily_count >= _DAILY_QUOTA and extra_actions <= 0:
+    daily_count = get_game_daily_count(db_conn, interaction.user.id, "slots")
+    if daily_count >= _GAME_DAILY_LIMIT:
         msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, quota=_DAILY_QUOTA
+            user=interaction.user.display_name, game="Slots"
         )
         await interaction.response.send_message(msg, ephemeral=True)
         return
 
     await interaction.response.defer(thinking=True)
-    new_daily = increment_daily_action_count(db_conn, interaction.user.id)
-    if new_daily > _DAILY_QUOTA:
-        decrement_extra_actions(db_conn, interaction.user.id)
+    increment_game_daily_count(db_conn, interaction.user.id, "slots")
     update_boli_points(db_conn, interaction.user.id, -bet)
     await asyncio.sleep(1.5)
 
@@ -3466,7 +3626,6 @@ class ShopGroup(app_commands.Group):
             "multiplier_potion": "multiplier_potion",
         }
         for item_id, item in _SHOP_ITEMS.items():
-            can_afford = "✅" if pts >= item["cost"] else "❌"
             active_note = ""
             perk_key = _perk_map.get(item_id)
             if perk_key:
@@ -3474,11 +3633,40 @@ class ShopGroup(app_commands.Group):
                 if expiry:
                     expiry_utc = expiry.replace(tzinfo=timezone.utc)
                     active_note = f"\n*(Active until <t:{int(expiry_utc.timestamp())}:t>)*"
-            embed.add_field(
-                name=f"{item['emoji']} {item['name']} — 🍮 {item['cost']} pts {can_afford}",
-                value=f"{item['description']}{active_note}",
-                inline=False,
-            )
+
+            # Dynamic pricing for action_refill
+            if item_id == "action_refill":
+                refill_count = get_daily_refill_count(db_conn, interaction.user.id)
+                extra_remaining = get_extra_actions(db_conn, interaction.user.id)
+                in_cooldown = has_active_perk(db_conn, interaction.user.id, "action_cooldown")
+                if refill_count >= 2:
+                    cost_label = "🍮 SOLD OUT (2/2 today)"
+                    can_afford = "❌"
+                elif in_cooldown:
+                    cd_expiry = get_perk_expiry(db_conn, interaction.user.id, "action_cooldown")
+                    cd_utc = cd_expiry.replace(tzinfo=timezone.utc) if cd_expiry else None
+                    ts = f"<t:{int(cd_utc.timestamp())}:R>" if cd_utc else "soon"
+                    cost_label = f"🍮 Available {ts}"
+                    can_afford = "⏳"
+                elif extra_remaining > 0:
+                    cost_label = f"🍮 Spend your {extra_remaining} remaining first"
+                    can_afford = "🔒"
+                else:
+                    dynamic_cost = 30 if refill_count == 0 else 50
+                    can_afford = "✅" if pts >= dynamic_cost else "❌"
+                    cost_label = f"🍮 {dynamic_cost} pts {can_afford}"
+                embed.add_field(
+                    name=f"{item['emoji']} {item['name']} — {cost_label}",
+                    value=f"{item['description']} *(1st buy: 30 pts • 2nd buy: 50 pts • max 2/day)*{active_note}",
+                    inline=False,
+                )
+            else:
+                can_afford = "✅" if pts >= item["cost"] else "❌"
+                embed.add_field(
+                    name=f"{item['emoji']} {item['name']} — 🍮 {item['cost']} pts {can_afford}",
+                    value=f"{item['description']}{active_note}",
+                    inline=False,
+                )
 
         embed.set_footer(text="Earn Boli Points by using /navi and Trivandrum slang.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -3572,16 +3760,63 @@ class ShopGroup(app_commands.Group):
             )
             logger.info("%s purchased Custom Rashi: %s", interaction.user.display_name, matched)
 
-        # --- Action Refill ---
+        # --- Action Refill (tiered pricing: 30 Boli 1st buy, 50 Boli 2nd buy, blocked 3rd+) ---
         elif item == "action_refill":
+            refill_count = get_daily_refill_count(db_conn, interaction.user.id)
+
+            # Max 2 refills per day
+            if refill_count >= 2:
+                await interaction.response.send_message(
+                    "🚫 You've already bought the maximum extra actions for today (2 refills). "
+                    "Come back after midnight IST.",
+                    ephemeral=True,
+                )
+                return
+
+            # Must wait out cooldown before buying
+            if has_active_perk(db_conn, interaction.user.id, "action_cooldown"):
+                cd_expiry = get_perk_expiry(db_conn, interaction.user.id, "action_cooldown")
+                cd_utc = cd_expiry.replace(tzinfo=timezone.utc) if cd_expiry else None
+                ts = f"<t:{int(cd_utc.timestamp())}:R>" if cd_utc else "soon"
+                await interaction.response.send_message(
+                    f"⏳ You're in a cosmic cooldown. Extra actions unlock {ts}. Sit tight.",
+                    ephemeral=True,
+                )
+                return
+
+            # Must spend existing purchased extras before buying more
+            extra_remaining = get_extra_actions(db_conn, interaction.user.id)
+            if extra_remaining > 0:
+                msg = random.choice(_HAS_EXTRAS_MESSAGES).format(
+                    invoker=interaction.user.display_name, extra=extra_remaining
+                )
+                await interaction.response.send_message(msg, ephemeral=True)
+                return
+
+            # Dynamic cost: 30 for 1st purchase, 50 for 2nd
+            cost = 30 if refill_count == 0 else 50
+
+            if pts < cost:
+                await interaction.response.send_message(
+                    f"Not enough Boli Points. You have 🍮 **{pts}** but need **{cost}** for this refill.",
+                    ephemeral=True,
+                )
+                return
+
             update_boli_points(db_conn, interaction.user.id, -cost)
             add_extra_actions(db_conn, interaction.user.id, 10)
+            increment_daily_refill_count(db_conn, interaction.user.id)
+            next_cost = 50 if refill_count == 0 else "N/A (max reached)"
             await interaction.response.send_message(
-                f"🔋 Refill successful! {interaction.user.mention}, you have 10 extra cosmic actions added to your quota. Go cause some chaos.\n"
-                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)",
+                f"🔋 Refill successful! {interaction.user.mention}, **+10 cosmic actions** added to your quota.\n"
+                f"🍮 -{cost} Boli Points (remaining: **{pts - cost}**)\n"
+                f"*(Next refill today costs: {next_cost} Boli • Spend these before buying again)*",
                 ephemeral=True,
             )
-            logger.info("%s purchased Action Refill (+10 extra actions)", interaction.user.display_name)
+            logger.info(
+                "%s purchased Action Refill #%d (+10 extra actions, cost=%d)",
+                interaction.user.display_name, refill_count + 1, cost,
+            )
 
         # --- Deflector Shield ---
         elif item == "deflector_shield":
