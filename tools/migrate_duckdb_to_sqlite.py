@@ -27,16 +27,26 @@ def migrate():
         print(f"Error: Could not find database file at {duck_path}")
         return
         
-    # Check if the file is already sqlite
+    # Check if the file is already a valid SQLite database by reading its magic bytes.
+    # sqlite3.connect() is NOT reliable here — it succeeds on non-SQLite files and only
+    # fails later (e.g. on PRAGMA calls), which caused false-positive "already SQLite" results.
+    SQLITE_MAGIC = b'SQLite format 3\x00'
     try:
-        conn = sqlite3.connect(duck_path)
-        conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        conn.close()
-        print("Database is already in SQLite format. No migration needed.")
-        return
-    except sqlite3.DatabaseError:
-        # File is a duckdb file
-        pass
+        with open(duck_path, 'rb') as f:
+            header = f.read(16)
+        if header == SQLITE_MAGIC:
+            # Confirm the file is actually openable and readable as SQLite
+            try:
+                conn = sqlite3.connect(duck_path)
+                conn.execute("PRAGMA integrity_check")
+                conn.close()
+                print("Database is already in SQLite format. No migration needed.")
+                return
+            except sqlite3.DatabaseError as e:
+                print(f"File has SQLite magic bytes but failed integrity check: {e}")
+                print("Treating as corrupted — will back up and recreate.")
+        else:
+            print(f"File does not have SQLite magic bytes (got: {header[:16]!r}). Treating as DuckDB.")
     except Exception as e:
         print(f"Unexpected error when checking DB format: {e}")
         return

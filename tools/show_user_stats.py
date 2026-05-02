@@ -14,7 +14,7 @@ VALID_RASHIS = [
     "Makaram (Capricorn)", "Kumbham (Aquarius)", "Meenam (Pisces)",
 ]
 
-DB_PATH = os.getenv("DB_PATH", "data/astro_bot.db")
+DB_PATH = os.path.abspath(os.getenv("DB_PATH", "data/astro_bot.db"))
 conn = sqlite3.connect(DB_PATH)
 conn.row_factory = sqlite3.Row
 
