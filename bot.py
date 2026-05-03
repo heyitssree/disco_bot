@@ -44,6 +44,7 @@ from schema import (
     has_active_perk,
     grant_perk,
     get_perk_expiry,
+    clear_perk,
     get_user_strikes,
     increment_user_strikes,
     reset_user_strikes,
@@ -3160,6 +3161,31 @@ class AdminGroup(app_commands.Group):
             embed.add_field(name="⚙️ Other", value="\n".join(other_lines), inline=False)
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="reset_cooldown",
+        description="Clear a member's cosmic action cooldown so they can buy/use actions immediately",
+    )
+    @app_commands.describe(member="The member whose cooldown you want to reset")
+    async def reset_cooldown(self, interaction: discord.Interaction, member: discord.Member) -> None:
+        if not await self.interaction_check(interaction):
+            return
+        removed = clear_perk(db_conn, member.id, "action_cooldown")
+        if removed:
+            await interaction.response.send_message(
+                f"✅ Cosmic cooldown cleared for **{member.display_name}**. "
+                f"They can now buy or use actions immediately.",
+                ephemeral=True,
+            )
+            logger.info(
+                "Admin %s reset action_cooldown for %s (%d).",
+                interaction.user.display_name, member.display_name, member.id,
+            )
+        else:
+            await interaction.response.send_message(
+                f"ℹ️ **{member.display_name}** has no active cooldown record to clear.",
+                ephemeral=True,
+            )
 
 tree.add_command(AdminGroup())
 

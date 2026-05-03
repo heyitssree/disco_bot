@@ -1237,6 +1237,22 @@ def get_perk_expiry(
     return None
 
 
+def clear_perk(
+    conn: sqlite3.Connection,
+    user_id: int,
+    perk_type: str,
+) -> bool:
+    """Delete a perk record (active or expired) for a user. Returns True if a row was removed."""
+    def _write() -> int:
+        cur = conn.execute(
+            "DELETE FROM user_perks WHERE user_id = ? AND perk_type = ?",
+            [user_id, perk_type],
+        )
+        conn.commit()
+        return cur.rowcount
+    return _db_write(_write) > 0
+
+
 def get_level_from_points(points: int) -> int:
     """Compute level (0–100) from total Boli Points.
 
