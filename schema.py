@@ -1337,18 +1337,42 @@ def list_user_local_media(
     user_id: int,
     media_type: str | None = None,
 ) -> list[dict]:
-    """Return all local media entries owned by a user, newest first."""
+    """Return all local media entries owned by a user, newest first.
+
+    Includes storage_type, discord_id, discord_name, and animated so callers
+    can build emoji previews without a second per-row DB fetch.
+    """
     if media_type:
         rows = conn.execute(
-            "SELECT shortcut, file_path, media_type, created_at FROM local_media WHERE user_id = ? AND media_type = ? ORDER BY created_at DESC",
+            """SELECT shortcut, file_path, media_type, created_at,
+                      storage_type, discord_id, discord_name, animated
+               FROM local_media
+               WHERE user_id = ? AND media_type = ?
+               ORDER BY created_at DESC""",
             [user_id, media_type],
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT shortcut, file_path, media_type, created_at FROM local_media WHERE user_id = ? ORDER BY created_at DESC",
+            """SELECT shortcut, file_path, media_type, created_at,
+                      storage_type, discord_id, discord_name, animated
+               FROM local_media
+               WHERE user_id = ?
+               ORDER BY created_at DESC""",
             [user_id],
         ).fetchall()
-    return [{"shortcut": r[0], "file_path": r[1], "media_type": r[2], "created_at": r[3]} for r in rows]
+    return [
+        {
+            "shortcut":     r[0],
+            "file_path":    r[1],
+            "media_type":   r[2],
+            "created_at":   r[3],
+            "storage_type": r[4] or "local",
+            "discord_id":   r[5],
+            "discord_name": r[6],
+            "animated":     bool(r[7]) if r[7] is not None else False,
+        }
+        for r in rows
+    ]
 
 
 def delete_local_media(conn: sqlite3.Connection, shortcut: str) -> bool:

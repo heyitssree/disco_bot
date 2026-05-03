@@ -11,7 +11,7 @@ import re
 import asyncio
 import shutil
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 import discord
@@ -511,13 +511,23 @@ async def _check_cosmic_quota(
 
     Returns True if the action is BLOCKED (caller should return early).
     Returns False if the action is ALLOWED (caller may proceed).
+
+    All DB reads are offloaded to a thread executor to avoid blocking the event loop.
     """
-    daily_count = get_daily_action_count(db_conn, invoker.id)
-    extra_actions = get_extra_actions(db_conn, invoker.id)
+    loop = asyncio.get_running_loop()
+
+    # Run all DB reads in a single executor call to minimise scheduling overhead
+    def _db_reads():
+        daily = get_daily_action_count(db_conn, invoker.id)
+        extras = get_extra_actions(db_conn, invoker.id)
+        in_cooldown = has_active_perk(db_conn, invoker.id, "action_cooldown")
+        expiry = get_perk_expiry(db_conn, invoker.id, "action_cooldown") if in_cooldown else None
+        return daily, extras, in_cooldown, expiry
+
+    daily_count, extra_actions, in_cooldown, expiry = await loop.run_in_executor(None, _db_reads)
 
     # Already cooling down from a previous exhaust?
-    if has_active_perk(db_conn, invoker.id, "action_cooldown"):
-        expiry = get_perk_expiry(db_conn, invoker.id, "action_cooldown")
+    if in_cooldown:
         expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
         ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "soon"
         msg = random.choice(_COOLDOWN_ACTIVE_MESSAGES).format(invoker=invoker.display_name, when=ts)
@@ -529,8 +539,11 @@ async def _check_cosmic_quota(
         return False
 
     # Quota just exhausted — enter 30-minute cooldown
-    grant_perk(db_conn, invoker.id, "action_cooldown", duration_hours=0.5)
-    expiry = get_perk_expiry(db_conn, invoker.id, "action_cooldown")
+    def _grant_cooldown():
+        grant_perk(db_conn, invoker.id, "action_cooldown", duration_hours=0.5)
+        return get_perk_expiry(db_conn, invoker.id, "action_cooldown")
+
+    expiry = await loop.run_in_executor(None, _grant_cooldown)
     expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
     ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "in 30 minutes"
     over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(
@@ -639,55 +652,65 @@ async def _lucky_draw_loop() -> None:
                 await asyncio.sleep(60)  # small extra sleep to avoid re-triggering
                 continue
 
-            # Get candidates: top 10 from yesterday's active users
-            active_ids = get_active_user_ids_previous_day(db_conn)
-            if not active_ids:
-                logger.info("Lucky draw: no active users from previous day — skipping.")
-                set_config_str(db_conn, "lucky_draw_last_date", today_str)
-                continue
-
-            candidates = get_top_n_from_user_ids(db_conn, active_ids, n=10)
-            if not candidates:
-                logger.info("Lucky draw: no top-10 candidates found — skipping.")
-                set_config_str(db_conn, "lucky_draw_last_date", today_str)
-                continue
-
-            winner = random.choice(candidates)
-            update_boli_points(db_conn, winner["user_id"], _LUCKY_DRAW_AMOUNT)
-            set_config_str(db_conn, "lucky_draw_last_date", today_str)
-
-            # Resolve winner mention across all guilds
-            winner_mention = f"<@{winner['user_id']}>"
-            msg = random.choice(_LUCKY_DRAW_MESSAGES).format(
-                winner_mention=winner_mention,
-                amount=_LUCKY_DRAW_AMOUNT,
-            )
-
-            # Resolve announce channel: ID first, then name, then fallback ID
-            _NAVI_GAMES_ID = 1499827359585665104
-            _BOT_COMMANDS_ID = 1372128042058780783
-            announce_ch = (
-                bot.get_channel(_NAVI_GAMES_ID)
-                or discord.utils.find(
-                    lambda c: c.name == "navi-games",
-                    (ch for g in bot.guilds for ch in g.text_channels),
-                )
-                or bot.get_channel(_BOT_COMMANDS_ID)
-            )
-
-            if announce_ch:
-                await announce_ch.send(msg)
-                logger.info(
-                    "Lucky draw winner: %s (user_id=%d) +%d Boli — announced in #%s.",
-                    winner["username"], winner["user_id"], _LUCKY_DRAW_AMOUNT, announce_ch.name,
-                )
-            else:
-                logger.warning("Lucky draw: could not find any announce channel.")
+            result = await _run_lucky_draw()
+            logger.info("Lucky draw loop: %s", result)
 
         except Exception as exc:
             logger.error("Lucky draw loop error: %s", exc)
 
         await asyncio.sleep(60)  # small buffer before recalculating next target
+
+
+async def _run_lucky_draw(announce_channel: discord.abc.Messageable | None = None) -> str:
+    """Core lucky-draw logic. Returns a status string for logging/feedback.
+
+    Can be called from the scheduled loop or the /lucky_draw slash command.
+    If announce_channel is provided it overrides the default channel resolution.
+    """
+    _IST = timezone(timedelta(hours=5, minutes=30))
+    today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+
+    active_ids = get_active_user_ids_previous_day(db_conn)
+    if not active_ids:
+        return "No active users from the previous day — draw skipped."
+
+    candidates = get_top_n_from_user_ids(db_conn, active_ids, n=10)
+    if not candidates:
+        return "No top-10 candidates found — draw skipped."
+
+    winner = random.choice(candidates)
+    update_boli_points(db_conn, winner["user_id"], _LUCKY_DRAW_AMOUNT)
+    set_config_str(db_conn, "lucky_draw_last_date", today_str)
+
+    winner_mention = f"<@{winner['user_id']}>"
+    msg = random.choice(_LUCKY_DRAW_MESSAGES).format(
+        winner_mention=winner_mention,
+        amount=_LUCKY_DRAW_AMOUNT,
+    )
+
+    if announce_channel is None:
+        _NAVI_GAMES_ID = 1499827359585665104
+        _BOT_COMMANDS_ID = 1372128042058780783
+        announce_channel = (
+            bot.get_channel(_NAVI_GAMES_ID)
+            or discord.utils.find(
+                lambda c: c.name == "navi-games",
+                (ch for g in bot.guilds for ch in g.text_channels),
+            )
+            or bot.get_channel(_BOT_COMMANDS_ID)
+        )
+
+    if announce_channel:
+        await announce_channel.send(msg)
+        logger.info(
+            "Lucky draw winner: %s (user_id=%d) +%d Boli — announced in #%s.",
+            winner["username"], winner["user_id"], _LUCKY_DRAW_AMOUNT,
+            getattr(announce_channel, "name", "?"),
+        )
+        return f"Winner: {winner['username']} (+{_LUCKY_DRAW_AMOUNT} Boli)"
+    else:
+        logger.warning("Lucky draw: could not find any announce channel.")
+        return f"Winner: {winner['username']} (+{_LUCKY_DRAW_AMOUNT} Boli) — no announce channel found."
 
 
 async def _maybe_announce_levelup(
@@ -1072,13 +1095,13 @@ async def my_media_slash(interaction: discord.Interaction) -> None:
         st = e.get("storage_type", "local")
         preview = ""
         if st in ("app_emoji", "app_emoji_sticker"):
-            full = get_local_media(db_conn, e["shortcut"])
-            if full and full.get("discord_id"):
-                did = full["discord_id"]
-                dname = full.get("discord_name", e["shortcut"])
-                animated = full.get("animated", False)
+            did = e.get("discord_id")
+            dname = e.get("discord_name") or e["shortcut"]
+            animated = e.get("animated", False)
+            if did:
                 preview = f"<{'a' if animated else ''}:{dname}:{did}> "
-        lines.append(f"{preview}`;;{e['shortcut']}` — {e['media_type']}")
+        type_label = e["media_type"].capitalize()
+        lines.append(f"{preview}`;;{e['shortcut']}` — {type_label}")
 
     embed = discord.Embed(
         title="Your Saved Media",
@@ -1098,24 +1121,26 @@ class LocalMediaPickerView(discord.ui.View):
 
         options = []
         for e in entries[:25]:  # Discord select cap
-            # Build emoji preview for the dropdown
+            # entries now include storage_type, discord_id, discord_name, animated
             st = e.get("storage_type", "local")
-            # Fetch full record to get discord_id/discord_name
-            full = get_local_media(db_conn, e["shortcut"])
             picker_emoji: discord.PartialEmoji | None = None
-            if full and st in ("app_emoji", "app_emoji_sticker", "native_emoji"):
-                did = full.get("discord_id")
-                dname = full.get("discord_name") or e["shortcut"]
-                animated = full.get("animated", False)
+            if st in ("app_emoji", "app_emoji_sticker", "native_emoji"):
+                did = e.get("discord_id")
+                dname = e.get("discord_name") or e["shortcut"]
+                animated = e.get("animated", False)
                 if did:
-                    picker_emoji = discord.PartialEmoji(
-                        name=dname, id=int(did), animated=animated
-                    )
+                    try:
+                        picker_emoji = discord.PartialEmoji(
+                            name=dname, id=int(did), animated=animated
+                        )
+                    except Exception:
+                        picker_emoji = None
+            type_label = e["media_type"].capitalize()  # "Emoji" or "Sticker"
             options.append(
                 discord.SelectOption(
                     label=f";;{e['shortcut']}",
                     value=e["shortcut"],
-                    description=e["media_type"],
+                    description=type_label,
                     emoji=picker_emoji,
                 )
             )
@@ -2145,6 +2170,68 @@ async def ping_slash(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(reply, ephemeral=True)
 
 
+def _build_rank_embed(page: int, total_pages: int, leaders: list, offset: int) -> discord.Embed:
+    """Build the leaderboard embed for a given page."""
+    embed = discord.Embed(
+        title="🍮 Boli Points Leaderboard",
+        description=f"Page {page} of {total_pages}",
+        color=discord.Color.gold(),
+    )
+    medals = ["🥇", "🥈", "🥉"]
+    for i, entry in enumerate(leaders):
+        global_rank = offset + i + 1
+        if page == 1 and i < 3:
+            medal = medals[i]
+        else:
+            medal = f"**{global_rank}.**"
+        rashi_str = f" · {entry['rashi']}" if entry.get("rashi") else ""
+        level = get_level_from_points(entry["boli_points"])
+        title = get_level_title(level)
+        embed.add_field(
+            name=f"{medal} {entry['username']}{rashi_str} · Lv.{level}",
+            value=f"🍮 **{entry['boli_points']} Boli Points** · {entry['prediction_count']} readings · *{title}*",
+            inline=False,
+        )
+    embed.set_footer(text="Use the buttons below to navigate · Earn points via /navi and Trivandrum slang")
+    return embed
+
+
+class RankView(discord.ui.View):
+    """Paginated leaderboard view with Previous / Next buttons."""
+
+    _PAGE_SIZE = 10
+
+    def __init__(self, page: int, total_pages: int) -> None:
+        super().__init__(timeout=120)
+        self.page = page
+        self.total_pages = total_pages
+        # Disable buttons that are not applicable
+        self.prev_button.disabled = page <= 1
+        self.next_button.disabled = page >= total_pages
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page = max(1, self.page - 1)
+        await self._update(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page = min(self.total_pages, self.page + 1)
+        await self._update(interaction)
+
+    async def _update(self, interaction: discord.Interaction) -> None:
+        offset = (self.page - 1) * self._PAGE_SIZE
+        leaders = get_leaderboard(db_conn, limit=self._PAGE_SIZE, offset=offset)
+        embed = _build_rank_embed(self.page, self.total_pages, leaders, offset)
+        self.prev_button.disabled = self.page <= 1
+        self.next_button.disabled = self.page >= self.total_pages
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+
 @tree.command(name="rank", description="See the Boli Points leaderboard")
 @app_commands.describe(page="Page number (10 entries per page, default 1)")
 async def rank_slash(interaction: discord.Interaction, page: int = 1) -> None:
@@ -2163,36 +2250,9 @@ async def rank_slash(interaction: discord.Interaction, page: int = 1) -> None:
 
     await interaction.response.defer(thinking=False)
     leaders = get_leaderboard(db_conn, limit=_PAGE_SIZE, offset=offset)
-
-    embed = discord.Embed(
-        title="🍮 Boli Points Leaderboard",
-        description=f"Page {page} of {total_pages}",
-        color=discord.Color.gold(),
-    )
-
-    medals = ["🥇", "🥈", "🥉"]
-    for i, entry in enumerate(leaders):
-        global_rank = offset + i + 1
-        if page == 1 and i < 3:
-            medal = medals[i]
-        else:
-            medal = f"**{global_rank}.**"
-        rashi_str = f" · {entry['rashi']}" if entry.get("rashi") else ""
-        level = get_level_from_points(entry["boli_points"])
-        title = get_level_title(level)
-        embed.add_field(
-            name=f"{medal} {entry['username']}{rashi_str} · Lv.{level}",
-            value=f"🍮 **{entry['boli_points']} Boli Points** · {entry['prediction_count']} readings · *{title}*",
-            inline=False,
-        )
-
-    nav = ""
-    if page > 1:
-        nav += f"`/rank page:{page - 1}` ← "
-    if page < total_pages:
-        nav += f"→ `/rank page:{page + 1}`"
-    embed.set_footer(text=f"{nav.strip() or 'Earn points by using /navi and Trivandrum slang.'}")
-    await interaction.followup.send(embed=embed)
+    embed = _build_rank_embed(page, total_pages, leaders, offset)
+    view = RankView(page=page, total_pages=total_pages)
+    await interaction.followup.send(embed=embed, view=view)
 
 
 @tree.command(name="leaderboard", description="Fun stats leaderboard: most cursed, most blessed, and richest")
@@ -2233,6 +2293,42 @@ async def leaderboard_slash(interaction: discord.Interaction) -> None:
     embed.set_footer(text="Curse & bless counts update in real time · /rank for full points board")
 
     await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="lucky_draw", description="Manually trigger the daily lucky draw (admin only)")
+@app_commands.default_permissions(administrator=True)
+async def lucky_draw_slash(interaction: discord.Interaction) -> None:
+    """Admin-only manual trigger for the daily lucky draw.
+
+    Checks for duplicate runs within the same IST day and announces the winner
+    in the current channel.
+    """
+    app_info = await bot.application_info()
+    is_owner = (
+        (bool(OWNER_ID) and interaction.user.id == OWNER_ID)
+        or interaction.user.id == app_info.owner.id
+    )
+    is_admin = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
+    if not (is_owner or is_admin):
+        await interaction.response.send_message("This command requires Administrator permission.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    _IST = timezone(timedelta(hours=5, minutes=30))
+    today_str = datetime.now(_IST).strftime("%Y-%m-%d")
+    last_run = get_config_str(db_conn, "lucky_draw_last_date", "")
+    if last_run == today_str:
+        await interaction.followup.send(
+            f"⚠️ Lucky draw already ran today ({today_str}). "
+            "Use `/admin adjust_points` to manually award Boli if needed.",
+            ephemeral=True,
+        )
+        return
+
+    result = await _run_lucky_draw(announce_channel=interaction.channel)
+    await interaction.followup.send(f"✅ Lucky draw triggered: {result}", ephemeral=True)
+    logger.info("Manual lucky draw triggered by %s: %s", interaction.user.display_name, result)
 
 
 @tree.command(name="mypoints", description="Check your own Boli Points and Rashi")
@@ -2576,8 +2672,7 @@ async def health_slash(interaction: discord.Interaction) -> None:
 
     # Unique users active in the in-memory rate-limit window
     now_utc = datetime.now(timezone.utc)
-    from datetime import timedelta as _td
-    cutoff = now_utc - _td(seconds=60)
+    cutoff = now_utc - timedelta(seconds=60)
     active_in_window = sum(
         1 for timestamps in _user_usage.values()
         if any(t > cutoff for t in timestamps)
