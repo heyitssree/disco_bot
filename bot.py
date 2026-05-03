@@ -44,7 +44,6 @@ from schema import (
     has_active_perk,
     grant_perk,
     get_perk_expiry,
-    clear_perk,
     get_user_strikes,
     increment_user_strikes,
     reset_user_strikes,
@@ -447,20 +446,12 @@ def get_level_title(level: int) -> str:
 
 _DAILY_QUOTA = 20  # combined cosmic actions per day (curses + blessings + games)
 
-_OVER_QUOTA_CURSE_MESSAGES: list[str] = [
-    "The universe is tired of your curses, {invoker}. You've used all your cosmic actions for today. Take a 30-minute cosmic breather.",
-    "20 cosmic actions a day is the limit, {invoker}. The cosmos is sending you to the waiting room for 30 minutes.",
-    "Quota exceeded, {invoker}. The cosmos doesn't appreciate the overtime — wait 30 minutes before buying more actions.",
-    "Too many curses from {invoker} today. The universe is putting you on hold for 30 minutes.",
-    "{invoker}, even the stars have limits. Cooling down for 30 minutes.",
-]
-
-_OVER_QUOTA_BLESS_INVOKER_CURSE_MESSAGES: list[str] = [
-    "{invoker}, you've burned through your daily quota. Take a 30-minute cosmic cooldown before buying more.",
-    "Over the {quota}/day limit, {invoker}. Wait 30 minutes, then you can extend your actions from the shop.",
-    "{invoker} tried to bless one too many people today. The stars put you on a 30-minute timeout.",
-    "Daily action quota exceeded, {invoker}. The cosmos says: chill for 30 minutes.",
-    "{quota} cosmic actions per day, {invoker}. Buy more after your 30-minute cooldown.",
+_OVER_QUOTA_MESSAGES: list[str] = [
+    "🌌 {invoker}, you've used all {quota} cosmic actions for today. Head to `/shop buy` to grab a refill (up to 2×10 more).",
+    "⭐ Daily quota hit, {invoker}. The cosmos offers refills — `/shop buy` for up to 20 extra actions today.",
+    "🌠 {quota} cosmic actions used, {invoker}. Buy a refill from `/shop buy` to keep going.",
+    "✨ {invoker}, you're out of free actions for today. Pick up extras in `/shop buy` if you need more.",
+    "🔮 {invoker}, the daily {quota}-action limit is reached. `/shop buy` has refills waiting.",
 ]
 
 _UNIVERSAL_BLESSING_MESSAGES: list[str] = [
@@ -471,14 +462,6 @@ _UNIVERSAL_BLESSING_MESSAGES: list[str] = [
     "🎀 The heavens noticed! {caster} blessed {receiver} with such sincerity that the cosmos rewarded them both. **100 Boli** each!",
 ]
 
-
-# Messages shown while a user is in the action-purchase cooldown
-_COOLDOWN_ACTIVE_MESSAGES: list[str] = [
-    "🌀 {invoker}, you're in cosmic cooldown mode. The universe needs a moment. Come back {when}.",
-    "⏳ {invoker}, the cosmos is catching its breath. Your cooldown lifts {when}.",
-    "🔮 Slow down, {invoker}. The stars are aligning again. Try again {when}.",
-    "☁️ {invoker}, cosmic energy is recharging. Available for purchase {when}.",
-]
 
 # Messages shown when a user can't buy because they have unused purchased actions
 _HAS_EXTRAS_MESSAGES: list[str] = [
@@ -504,12 +487,6 @@ async def _check_cosmic_quota(
 ) -> bool:
     """Check if the invoker can perform a cosmic action (curse or bless).
 
-    Handles the three-state gate:
-      1. Active cooldown perk (action_cooldown): block, show time remaining.
-      2. Purchased extra actions > 0: block purchase flow (must spend first).
-         This is NOT called for actual actions — those still consume extras normally.
-      3. Quota exceeded + no extras: grant 30-min cooldown, show message.
-
     Returns True if the action is BLOCKED (caller should return early).
     Returns False if the action is ALLOWED (caller may proceed).
 
@@ -517,55 +494,21 @@ async def _check_cosmic_quota(
     """
     loop = asyncio.get_running_loop()
 
-    # Run all DB reads in a single executor call to minimise scheduling overhead
     def _db_reads():
         daily = get_daily_action_count(db_conn, invoker.id)
         extras = get_extra_actions(db_conn, invoker.id)
-        in_cooldown = has_active_perk(db_conn, invoker.id, "action_cooldown")
-        expiry = get_perk_expiry(db_conn, invoker.id, "action_cooldown") if in_cooldown else None
-        # True if cooldown was already granted today (active OR already expired) —
-        # prevents re-granting a fresh 30-min cooldown every time the user tries
-        # after their initial cooldown served out.
-        had_cooldown = db_conn.execute(
-            "SELECT 1 FROM user_perks WHERE user_id = ? AND perk_type = ?",
-            [invoker.id, "action_cooldown"],
-        ).fetchone() is not None
-        return daily, extras, in_cooldown, had_cooldown, expiry
+        return daily, extras
 
-    daily_count, extra_actions, in_cooldown, had_cooldown, expiry = await loop.run_in_executor(None, _db_reads)
+    daily_count, extra_actions = await loop.run_in_executor(None, _db_reads)
 
-    # Already cooling down from a previous exhaust?
-    if in_cooldown:
-        expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
-        ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "soon"
-        msg = random.choice(_COOLDOWN_ACTIVE_MESSAGES).format(invoker=invoker.display_name, when=ts)
-        await reply_target.reply(msg)
-        return True
-
-    # Quota OK — action is allowed
     if daily_count < _DAILY_QUOTA or extra_actions > 0:
         return False
 
-    # Quota exhausted and no extras remaining.
-    if not had_cooldown:
-        # First time hitting the limit today — grant the 30-minute cooldown gate.
-        def _grant_cooldown():
-            grant_perk(db_conn, invoker.id, "action_cooldown", duration_hours=0.5)
-            return get_perk_expiry(db_conn, invoker.id, "action_cooldown")
-
-        expiry = await loop.run_in_executor(None, _grant_cooldown)
-        expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
-        ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "in 30 minutes"
-        over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(
-            invoker=invoker.display_name, quota=_DAILY_QUOTA
-        )
-        await reply_target.reply(f"{over_msg}\n*You can buy extra actions from `/shop buy` after {ts}.*")
-    else:
-        # Cooldown already served — user can now buy extras from the shop.
-        await reply_target.reply(
-            f"🌌 {invoker.display_name}, you've used your {_DAILY_QUOTA} daily actions. "
-            f"Head to `/shop buy` to pick up extra actions and keep going."
-        )
+    # Quota exhausted and no extras — direct to shop.
+    msg = random.choice(_OVER_QUOTA_MESSAGES).format(
+        invoker=invoker.display_name, quota=_DAILY_QUOTA
+    )
+    await reply_target.reply(msg)
     return True
 
 
@@ -1698,7 +1641,7 @@ async def on_message(message: discord.Message) -> None:
                 logger.info("%s tried to curse while timed out — -3 Boli penalty", invoker.display_name)
                 return
 
-            # --- Daily quota check (with cooldown gate) ---
+            # --- Daily quota check ---
             if await _check_cosmic_quota(invoker, message, "curse"):
                 return
 
@@ -3162,31 +3105,6 @@ class AdminGroup(app_commands.Group):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(
-        name="reset_cooldown",
-        description="Clear a member's cosmic action cooldown so they can buy/use actions immediately",
-    )
-    @app_commands.describe(member="The member whose cooldown you want to reset")
-    async def reset_cooldown(self, interaction: discord.Interaction, member: discord.Member) -> None:
-        if not await self.interaction_check(interaction):
-            return
-        removed = clear_perk(db_conn, member.id, "action_cooldown")
-        if removed:
-            await interaction.response.send_message(
-                f"✅ Cosmic cooldown cleared for **{member.display_name}**. "
-                f"They can now buy or use actions immediately.",
-                ephemeral=True,
-            )
-            logger.info(
-                "Admin %s reset action_cooldown for %s (%d).",
-                interaction.user.display_name, member.display_name, member.id,
-            )
-        else:
-            await interaction.response.send_message(
-                f"ℹ️ **{member.display_name}** has no active cooldown record to clear.",
-                ephemeral=True,
-            )
-
 tree.add_command(AdminGroup())
 
 
@@ -3707,16 +3625,9 @@ class ShopGroup(app_commands.Group):
             if item_id == "action_refill":
                 refill_count = get_daily_refill_count(db_conn, interaction.user.id)
                 extra_remaining = get_extra_actions(db_conn, interaction.user.id)
-                in_cooldown = has_active_perk(db_conn, interaction.user.id, "action_cooldown")
                 if refill_count >= 2:
                     cost_label = "🍮 SOLD OUT (2/2 today)"
                     can_afford = "❌"
-                elif in_cooldown:
-                    cd_expiry = get_perk_expiry(db_conn, interaction.user.id, "action_cooldown")
-                    cd_utc = cd_expiry.replace(tzinfo=timezone.utc) if cd_expiry else None
-                    ts = f"<t:{int(cd_utc.timestamp())}:R>" if cd_utc else "soon"
-                    cost_label = f"🍮 Available {ts}"
-                    can_afford = "⏳"
                 elif extra_remaining > 0:
                     cost_label = f"🍮 Spend your {extra_remaining} remaining first"
                     can_afford = "🔒"
@@ -3838,17 +3749,6 @@ class ShopGroup(app_commands.Group):
                 await interaction.response.send_message(
                     "🚫 You've already bought the maximum extra actions for today (2 refills). "
                     "Come back after midnight IST.",
-                    ephemeral=True,
-                )
-                return
-
-            # Must wait out cooldown before buying
-            if has_active_perk(db_conn, interaction.user.id, "action_cooldown"):
-                cd_expiry = get_perk_expiry(db_conn, interaction.user.id, "action_cooldown")
-                cd_utc = cd_expiry.replace(tzinfo=timezone.utc) if cd_expiry else None
-                ts = f"<t:{int(cd_utc.timestamp())}:R>" if cd_utc else "soon"
-                await interaction.response.send_message(
-                    f"⏳ You're in a cosmic cooldown. Extra actions unlock {ts}. Sit tight.",
                     ephemeral=True,
                 )
                 return
