@@ -522,9 +522,16 @@ async def _check_cosmic_quota(
         extras = get_extra_actions(db_conn, invoker.id)
         in_cooldown = has_active_perk(db_conn, invoker.id, "action_cooldown")
         expiry = get_perk_expiry(db_conn, invoker.id, "action_cooldown") if in_cooldown else None
-        return daily, extras, in_cooldown, expiry
+        # True if cooldown was already granted today (active OR already expired) —
+        # prevents re-granting a fresh 30-min cooldown every time the user tries
+        # after their initial cooldown served out.
+        had_cooldown = db_conn.execute(
+            "SELECT 1 FROM user_perks WHERE user_id = ? AND perk_type = ?",
+            [invoker.id, "action_cooldown"],
+        ).fetchone() is not None
+        return daily, extras, in_cooldown, had_cooldown, expiry
 
-    daily_count, extra_actions, in_cooldown, expiry = await loop.run_in_executor(None, _db_reads)
+    daily_count, extra_actions, in_cooldown, had_cooldown, expiry = await loop.run_in_executor(None, _db_reads)
 
     # Already cooling down from a previous exhaust?
     if in_cooldown:
@@ -538,18 +545,26 @@ async def _check_cosmic_quota(
     if daily_count < _DAILY_QUOTA or extra_actions > 0:
         return False
 
-    # Quota just exhausted — enter 30-minute cooldown
-    def _grant_cooldown():
-        grant_perk(db_conn, invoker.id, "action_cooldown", duration_hours=0.5)
-        return get_perk_expiry(db_conn, invoker.id, "action_cooldown")
+    # Quota exhausted and no extras remaining.
+    if not had_cooldown:
+        # First time hitting the limit today — grant the 30-minute cooldown gate.
+        def _grant_cooldown():
+            grant_perk(db_conn, invoker.id, "action_cooldown", duration_hours=0.5)
+            return get_perk_expiry(db_conn, invoker.id, "action_cooldown")
 
-    expiry = await loop.run_in_executor(None, _grant_cooldown)
-    expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
-    ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "in 30 minutes"
-    over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(
-        invoker=invoker.display_name, quota=_DAILY_QUOTA
-    )
-    await reply_target.reply(f"{over_msg}\n*You can buy extra actions from `/shop buy` after {ts}.*")
+        expiry = await loop.run_in_executor(None, _grant_cooldown)
+        expiry_utc = expiry.replace(tzinfo=timezone.utc) if expiry else None
+        ts = f"<t:{int(expiry_utc.timestamp())}:R>" if expiry_utc else "in 30 minutes"
+        over_msg = random.choice(_OVER_QUOTA_CURSE_MESSAGES).format(
+            invoker=invoker.display_name, quota=_DAILY_QUOTA
+        )
+        await reply_target.reply(f"{over_msg}\n*You can buy extra actions from `/shop buy` after {ts}.*")
+    else:
+        # Cooldown already served — user can now buy extras from the shop.
+        await reply_target.reply(
+            f"🌌 {invoker.display_name}, you've used your {_DAILY_QUOTA} daily actions. "
+            f"Head to `/shop buy` to pick up extra actions and keep going."
+        )
     return True
 
 
