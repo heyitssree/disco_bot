@@ -45,9 +45,11 @@ SEVERE_CURSE_WORDS: list[str] = [
 # ---------------------------------------------------------------------------
 
 BOLI_TRIGGER_WORDS: list[str] = [
-    "kidilam", "pillacha", "kidu", "appi", "shokam",
-    "chumma", "kili poyi", "vishayam", "mone", "chetta",
+    "kidilam", "kidu", "appi", "shokam",
+    "chumma", "vishayam", "mone", "chetta",
     "thirontharam", "boli", "paal payasam",
+    "moda", "kalippu", "pottan", "sugangalu",
+    "bonji vellam", "adichu"
 ]
 
 # ---------------------------------------------------------------------------
@@ -55,8 +57,7 @@ BOLI_TRIGGER_WORDS: list[str] = [
 # ---------------------------------------------------------------------------
 
 KOCHI_SLANG: list[str] = [
-    "machane", "machi", "sayi", "da scene", "yov", "monae",
-    "adipoli", "njaan", "sheri aano",
+    "machane", "machi", "machu", "pani paali"
 ]
 
 # ---------------------------------------------------------------------------

@@ -26,24 +26,14 @@ from typing import Any
 logger = logging.getLogger("navi.api_server")
 
 # ---------------------------------------------------------------------------
-# Score normalization tables
+# Score normalization
 # ---------------------------------------------------------------------------
 
-# game_type → {raw_score → boli_awarded} mapping
-# raw_score ≤ 0 means the player failed (0 Boli)
-_SCORE_MAP: dict[str, dict[int, int]] = {
-    "wordle": {
-        1: 200,
-        2: 150,
-        3: 100,
-        4:  60,
-        5:  30,
-        6:  10,
-    },
-    # Add more game types here as needed
-}
+# 1:1 passthrough: raw_points (sent by partner bot) → Boli awarded directly.
+# Negative raw_points = player failed → 0 Boli.
+# The partner bot is responsible for sending meaningful point values.
 
-# XP awarded equals half the Boli awarded (rounded), minimum 5 XP for any valid submission
+# XP awarded equals half the Boli awarded (minimum 5 XP for any valid submission)
 _XP_RATIO = 0.5
 _MIN_XP = 5
 
@@ -52,17 +42,8 @@ _RATE_LIMIT_RPM = 10
 _rate_counters: dict[int, list[float]] = defaultdict(list)
 
 
-def _normalize_score(game_type: str, raw_points: int) -> int:
-    """Map raw game score to Boli points using the normalization table.
-
-    Falls back to treating raw_points as a direct Boli delta (clamped ≥ 0).
-    Negative raw_points always → 0 Boli (player failed/lost).
-    """
-    if raw_points <= 0:
-        return 0
-    if game_type in _SCORE_MAP:
-        return _SCORE_MAP[game_type].get(raw_points, 0)
-    # default: raw points = direct Boli delta
+def _normalize_score(raw_points: int) -> int:
+    """1:1 mapping: raw score → Boli. Negative values (fail/loss) → 0."""
     return max(0, int(raw_points))
 
 
@@ -104,6 +85,7 @@ def create_app(db_conn: sqlite3.Connection, allowed_guild_id: int | None) -> Any
         add_experience,
         partner_score_exists,
         log_partner_score,
+        get_config_int,
         get_recent_partner_logs,
     )
 
@@ -143,8 +125,12 @@ def create_app(db_conn: sqlite3.Connection, allowed_guild_id: int | None) -> Any
         if payload.game_id and partner_score_exists(db_conn, payload.game_id):
             raise HTTPException(status_code=409, detail=f"game_id '{payload.game_id}' already processed.")
 
-        # Normalize score → Boli
-        boli = _normalize_score(payload.game_type, payload.points)
+        # Check feature toggle — admin can disable partner point awards via /admin partner_toggle
+        if not get_config_int(db_conn, "feature_partner_api", 1):
+            raise HTTPException(status_code=503, detail="Partner API awards are currently disabled by admin.")
+
+        # Normalize score → Boli (1:1 passthrough)
+        boli = _normalize_score(payload.points)
         xp = max(_MIN_XP, int(boli * _XP_RATIO)) if boli > 0 else 0
 
         # Award points

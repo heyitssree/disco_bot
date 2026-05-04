@@ -88,8 +88,7 @@ from schema import (
     get_gift_daily_total,
     record_gift,
     get_random_recent_user,
-    # Feature 1: partner score log
-    get_recent_partner_logs,
+    # Feature 1: partner score log (log_partner_score used in api_server.py directly)
     # Feature 3: stock market
     get_market_items,
     get_market_item,
@@ -3149,24 +3148,13 @@ class AdminGroup(app_commands.Group):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="partner_logs", description="View last 10 partner bot score submissions")
-    async def partner_logs_cmd(self, interaction: discord.Interaction) -> None:
-        logs = get_recent_partner_logs(db_conn, limit=10)
-        if not logs:
-            await interaction.response.send_message("No partner score logs yet.", ephemeral=True)
-            return
-        lines = []
-        for log in logs:
-            lines.append(
-                f"`{log['game_id'][:16]}…` · **{log['username']}** · {log['game_type']} · "
-                f"raw={log['raw_points']} → 🍮{log['boli_awarded']} · {log['received_at']}"
-            )
-        embed = discord.Embed(
-            title="🤝 Partner Score Log (last 10)",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    @app_commands.command(name="partner_toggle", description="Enable or disable Boli/XP awards from the partner bot API")
+    @app_commands.describe(enabled="True = awards ON, False = awards paused")
+    async def partner_toggle_cmd(self, interaction: discord.Interaction, enabled: bool) -> None:
+        set_config_int(db_conn, "feature_partner_api", int(enabled))
+        status = "✅ **Enabled** — partner bot point awards are active." if enabled else "⛔ **Disabled** — partner bot submissions will be logged but no points awarded."
+        await interaction.response.send_message(f"Partner API: {status}", ephemeral=True)
+        logger.info("Partner API toggle: %s by %s", "ON" if enabled else "OFF", interaction.user.display_name)
 
 
 tree.add_command(AdminGroup())

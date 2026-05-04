@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Recurse -Filter \"*.py\")",
+      "Bash(Sort-Object FullName)",
+      "Bash(awk '{print $NF}')"
+    ]
+  }
+}
