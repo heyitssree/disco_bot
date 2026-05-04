@@ -5,3 +5,6 @@ duckdb
 requests
 aiohttp
 beautifulsoup4
+fastapi
+uvicorn[standard]
+pydantic

@@ -82,7 +82,26 @@ from schema import (
     _GAME_DAILY_LIMIT,
     get_active_user_ids_previous_day,
     get_top_n_from_user_ids,
+    # Feature 2: XP decoupling
+    add_experience,
+    get_experience,
+    get_gift_daily_total,
+    record_gift,
+    get_random_recent_user,
+    # Feature 1: partner score log
+    get_recent_partner_logs,
+    # Feature 3: stock market
+    get_market_items,
+    get_market_item,
+    get_user_holdings,
+    get_user_holding_for_item,
+    buy_holding,
+    reduce_holding,
+    expire_stale_holdings,
+    get_price_history,
 )
+from market_engine import update_all_prices, get_trend_arrow
+from api_server import run_api_server
 from glossary import RASHIS
 from prompts import (
     get_time_aware_system_prompt,
@@ -366,6 +385,10 @@ _FEATURE_DEFAULTS: dict[str, int] = {
 # Populated in on_ready() after db_conn is available
 _feature_cache: dict[str, int] = dict(_FEATURE_DEFAULTS)
 
+# In-memory cache of last-known level per user_id — used by _maybe_announce_levelup
+# to detect level-ups without re-reading DB on every message.
+_user_level_cache: dict[int, int] = {}
+
 
 def _feat(key: str) -> bool:
     """Return True if the feature is enabled in the in-memory cache."""
@@ -639,6 +662,7 @@ async def _run_lucky_draw(announce_channel: discord.abc.Messageable | None = Non
 
     winner = random.choice(candidates)
     update_boli_points(db_conn, winner["user_id"], _LUCKY_DRAW_AMOUNT)
+    add_experience(db_conn, winner["user_id"], _LUCKY_DRAW_AMOUNT)
     set_config_str(db_conn, "lucky_draw_last_date", today_str)
 
     winner_mention = f"<@{winner['user_id']}>"
@@ -674,27 +698,32 @@ async def _run_lucky_draw(announce_channel: discord.abc.Messageable | None = Non
 
 async def _maybe_announce_levelup(
     mention: str,
-    old_points: int,
-    new_points: int,
+    user_id: int,
     channel: discord.abc.Messageable,
 ) -> None:
-    """Send a level-up notification if the points delta crossed a level or tier boundary."""
-    old_level = get_level_from_points(old_points)
-    new_level = get_level_from_points(new_points)
-    if new_level <= old_level:
+    """Send a level-up notification if the user just crossed a level threshold.
+
+    Level is now derived from XP (experience column), never from boli_points.
+    """
+    xp = get_experience(db_conn, user_id)
+    level = get_level_from_points(xp)
+
+    # Check if we've crossed a new level since last time (stored in-memory)
+    prev_level = _user_level_cache.get(user_id, -1)
+    if level <= prev_level:
         return
+    _user_level_cache[user_id] = level
+    if prev_level == -1:
+        return  # first time seen — don't announce retroactively
 
-    old_title = get_level_title(old_level)
-    new_title = get_level_title(new_level)
+    old_title = get_level_title(prev_level if prev_level >= 0 else 0)
+    new_title = get_level_title(level)
 
-    # Primary level-up line in the requested format
-    msg = f"🔥 **Level Up!** {mention} reached **Level {new_level}**! Keep the boli flowing!"
-
-    # Tier crossing: append a witty title unlock line
+    msg = f"🔥 **Level Up!** {mention} reached **Level {level}**! Keep the boli flowing!"
     if new_title != old_title:
-        flavour = random.choice(LEVEL_UP_MESSAGES).format(user=mention, level=new_level)
+        flavour = random.choice(LEVEL_UP_MESSAGES).format(user=mention, level=level)
         msg = (
-            f"🔥 **Level Up!** {mention} reached **Level {new_level}**! "
+            f"🔥 **Level Up!** {mention} reached **Level {level}**! "
             f"Earned title: [**{new_title}**]. Keep the boli flowing!\n"
             f"*{flavour}*"
         )
@@ -1309,6 +1338,15 @@ async def on_ready() -> None:
     # Start daily lucky draw loop (fires at 7:00am IST)
     asyncio.create_task(_lucky_draw_loop())
 
+    # Start daily market price update + holdings expiry loop (midnight IST)
+    asyncio.create_task(_market_daily_loop())
+
+    # Start partner bot API server (port 8080)
+    asyncio.create_task(run_api_server(
+        db_conn,
+        allowed_guild_id=int(os.getenv("GUILD_ID", "0")) or None,
+    ))
+
     await tree.sync()
     logger.info("Slash commands synced. Navi is live. Hey! Listen!")
 
@@ -1529,11 +1567,10 @@ async def on_message(message: discord.Message) -> None:
     triggered_words = contains_boli_trigger(message.content) if get_config_int(db_conn, "feature_boli_points", 1) else []
     if triggered_words and not _is_slang_spam:
         points = len(triggered_words) * 5
-        profile = get_user_profile(db_conn, message.author.id)
-        old_pts = profile["boli_points"] if profile else 0
         update_boli_points(db_conn, message.author.id, points)
+        add_experience(db_conn, message.author.id, points)
         await _maybe_announce_levelup(
-            message.author.mention, old_pts, old_pts + points, message.channel
+            message.author.mention, message.author.id, message.channel
         )
         logger.debug(
             "%s triggered Boli words %s → +%d pts",
@@ -1544,12 +1581,11 @@ async def on_message(message: discord.Message) -> None:
     if get_config_int(db_conn, "feature_boli_points", 1) and not _is_slang_spam:
         slang_delta = score_message(message.content)
         if slang_delta != 0:
-            profile = get_user_profile(db_conn, message.author.id)
-            old_pts = profile["boli_points"] if profile else 0
             update_boli_points(db_conn, message.author.id, slang_delta)
             if slang_delta > 0:
+                add_experience(db_conn, message.author.id, slang_delta)
                 await _maybe_announce_levelup(
-                    message.author.mention, old_pts, old_pts + slang_delta, message.channel
+                    message.author.mention, message.author.id, message.channel
                 )
             matches = get_slang_matches(message.content)
             logger.debug(
@@ -1822,8 +1858,10 @@ async def on_message(message: discord.Message) -> None:
             if random.random() < get_config_float(db_conn, "universal_blessing_chance", 0.05):
                 _UNIVERSAL_BLESSING_BONUS = 100
                 update_boli_points(db_conn, target.id, _UNIVERSAL_BLESSING_BONUS)
+                add_experience(db_conn, target.id, _UNIVERSAL_BLESSING_BONUS)
                 if invoker.id != target.id:
                     update_boli_points(db_conn, invoker.id, _UNIVERSAL_BLESSING_BONUS)
+                    add_experience(db_conn, invoker.id, _UNIVERSAL_BLESSING_BONUS)
                 log_bless(db_conn, target.id, target.display_name, "universal_blessing")
                 uni_msg = random.choice(_UNIVERSAL_BLESSING_MESSAGES).format(
                     caster=invoker.display_name, receiver=target.display_name
@@ -1837,8 +1875,10 @@ async def on_message(message: discord.Message) -> None:
 
             reply, target_pts, caster_pts, bless_word = _bless_target(target, award_points=True)
             update_boli_points(db_conn, target.id, target_pts)
+            add_experience(db_conn, target.id, target_pts)
             if invoker.id != target.id:
                 update_boli_points(db_conn, invoker.id, caster_pts)
+                add_experience(db_conn, invoker.id, caster_pts)
             log_bless(db_conn, target.id, target.display_name, bless_word)
             await message.reply(reply)
             logger.info(
@@ -1880,6 +1920,7 @@ async def on_message(message: discord.Message) -> None:
 
         log_curse(db_conn, user_id, username, curse_used)
         update_boli_points(db_conn, user_id, 1)  # +1 Boli pt for curse event
+        add_experience(db_conn, user_id, 1)
 
         system_prompt = get_time_aware_system_prompt(db_conn, username=username)
         user_prompt = get_curse_prompt(username, curse_used)
@@ -2106,15 +2147,14 @@ async def navi_slash(
     final_reply = prediction.replace(display_name, mention_str)
     await interaction.followup.send(final_reply)
 
-    # +2 Boli Points for using /navi (only on first fresh call)
+    # +2 Boli Points + XP for using /navi (only on first fresh call)
     if usage_count == 1:
-        profile = get_user_profile(db_conn, interaction.user.id)
-        old_pts = profile["boli_points"] if profile else 0
         update_boli_points(db_conn, interaction.user.id, 2)
-        logger.info("%s used /navi → +2 Boli Points", interaction.user.display_name)
+        add_experience(db_conn, interaction.user.id, 2)
+        logger.info("%s used /navi → +2 Boli Points +2 XP", interaction.user.display_name)
         if interaction.channel:
             await _maybe_announce_levelup(
-                interaction.user.mention, old_pts, old_pts + 2, interaction.channel
+                interaction.user.mention, interaction.user.id, interaction.channel
             )
 
 
@@ -2144,7 +2184,9 @@ def _build_rank_embed(page: int, total_pages: int, leaders: list, offset: int) -
         else:
             medal = f"**{global_rank}.**"
         rashi_str = f" · {entry['rashi']}" if entry.get("rashi") else ""
-        level = get_level_from_points(entry["boli_points"])
+        # Level is derived from XP; leaderboard query may include experience if present
+        xp_val = entry.get("experience") or entry.get("boli_points", 0)
+        level = get_level_from_points(xp_val)
         title = get_level_title(level)
         embed.add_field(
             name=f"{medal} {entry['username']}{rashi_str} · Lv.{level}",
@@ -2301,18 +2343,19 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
 
     rashi = profile.get("rashi") or "Not yet assigned"
     pts = profile.get("boli_points", 0)
+    xp = profile.get("experience", 0)
     count = profile.get("prediction_count", 0)
-    level = get_level_from_points(pts)
+    level = get_level_from_points(xp)  # level derived from XP, never Boli
     title = get_level_title(level)
 
     if level < 100:
         next_lvl_pts = points_for_level(level + 1)
         curr_lvl_pts = points_for_level(level)
-        progress = pts - curr_lvl_pts
+        progress = xp - curr_lvl_pts
         needed = next_lvl_pts - curr_lvl_pts
         filled = int((progress / needed) * 10) if needed > 0 else 10
         bar = "█" * filled + "░" * (10 - filled)
-        progress_line = f"📈 `[{bar}]` {progress}/{needed} pts → Level {level + 1}"
+        progress_line = f"📈 `[{bar}]` {progress}/{needed} XP → Level {level + 1}"
     else:
         progress_line = "🌟 Maximum level reached!"
 
@@ -2320,9 +2363,10 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
     profile_text = (
         f"**Your Profile**\n"
         f"🌟 Rashi: **{rashi}**\n"
-        f"⚔️ Level: **{level}** — *{title}*\n"
+        f"⚔️ Level: **{level}** — *{title}* *(based on XP, never decreases)*\n"
         f"{progress_line}\n"
-        f"🍮 Boli Points: **{pts}**\n"
+        f"✨ Total XP: **{xp}**\n"
+        f"🍮 Boli Points: **{pts}** *(spendable balance)*\n"
         f"🔮 Predictions received: **{count}**"
     )
     full_reply = f"{stats_intro}\n\n{profile_text}" if stats_intro else profile_text
@@ -3105,7 +3149,283 @@ class AdminGroup(app_commands.Group):
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    @app_commands.command(name="partner_logs", description="View last 10 partner bot score submissions")
+    async def partner_logs_cmd(self, interaction: discord.Interaction) -> None:
+        logs = get_recent_partner_logs(db_conn, limit=10)
+        if not logs:
+            await interaction.response.send_message("No partner score logs yet.", ephemeral=True)
+            return
+        lines = []
+        for log in logs:
+            lines.append(
+                f"`{log['game_id'][:16]}…` · **{log['username']}** · {log['game_type']} · "
+                f"raw={log['raw_points']} → 🍮{log['boli_awarded']} · {log['received_at']}"
+            )
+        embed = discord.Embed(
+            title="🤝 Partner Score Log (last 10)",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 tree.add_command(AdminGroup())
+
+
+# ---------------------------------------------------------------------------
+# Market daily loop (midnight IST — price update + expiry check)
+# ---------------------------------------------------------------------------
+
+async def _market_daily_loop() -> None:
+    """Background loop that updates market prices and expires stale holdings at midnight IST."""
+    _IST = timezone(timedelta(hours=5, minutes=30))
+
+    while True:
+        now_ist = datetime.now(_IST)
+        target = now_ist.replace(hour=0, minute=0, second=5, microsecond=0)
+        if now_ist >= target:
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now_ist).total_seconds()
+        logger.info("Market loop sleeping for %.0f seconds (until midnight IST).", wait_seconds)
+        await asyncio.sleep(wait_seconds)
+
+        try:
+            # Update prices
+            await update_all_prices(db_conn)
+
+            # Expire stale holdings and notify owners
+            expired = expire_stale_holdings(db_conn)
+            if expired:
+                _NAVI_GAMES_ID = 1499827359585665104
+                notify_ch = bot.get_channel(_NAVI_GAMES_ID)
+                for item in expired:
+                    if notify_ch:
+                        await notify_ch.send(
+                            f"📉 <@{item['user_id']}> — your {item['emoji']} **{item['name']}** "
+                            f"(×{item['quantity']}, bought at {item['purchase_price']} Boli each) "
+                            f"has **expired** and is now worth nothing. F in chat."
+                        )
+        except Exception as exc:
+            logger.error("Market daily loop error: %s", exc)
+
+        await asyncio.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# /market — Boli Stock Market
+# ---------------------------------------------------------------------------
+
+_MARKET_EXPIRY_DAYS = 7  # holdings expire after this many days
+
+_MARKET_BUY_TEMPLATES: list[str] = [
+    "📦 {user} just bought **{qty}× {emoji} {name}** at 🍮 **{price} Boli** each. Bold move.",
+    "💸 {user} dropped **{total} Boli** on **{qty}× {emoji} {name}**. We stan a risk-taker.",
+    "🛒 Order confirmed! {user} snagged **{qty}× {emoji} {name}** @ {price} Boli. 7 days to flip it.",
+]
+
+_MARKET_SELL_TEMPLATES: list[str] = [
+    "✅ {user} sold **{qty}× {emoji} {name}** at 🍮 **{price} Boli** each. {pnl_str}",
+    "💰 {user} just cashed out **{qty}× {emoji} {name}** for **{total} Boli**. {pnl_str}",
+    "📊 Sale complete! {user} offloaded {qty}× {emoji} {name} @ {price} Boli. {pnl_str}",
+]
+
+
+class MarketGroup(app_commands.Group):
+    """Boli Stock Market — buy, sell, and hold funny assets."""
+
+    def __init__(self) -> None:
+        super().__init__(name="market", description="Boli Stock Market — buy and sell assets for profit")
+
+    @app_commands.command(name="view", description="Browse the Boli Stock Market")
+    async def market_view(self, interaction: discord.Interaction) -> None:
+        items = get_market_items(db_conn)
+        embed = discord.Embed(
+            title="📈 Boli Stock Market",
+            description="Prices update daily at midnight IST. Holdings expire in 7 days.",
+            color=discord.Color.dark_gold(),
+        )
+        for item in items:
+            trend = get_trend_arrow(item["current_price"], item["base_price"])
+            pct = 100 * (item["current_price"] - item["base_price"]) / max(item["base_price"], 1)
+            embed.add_field(
+                name=f"{item['emoji']} {item['name']} {trend}",
+                value=(
+                    f"🍮 **{item['current_price']} Boli** "
+                    f"*(base: {item['base_price']}, {pct:+.1f}%)*\n"
+                    f"_{item['description']}_"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text="Use /market buy <item_id> <qty> to invest • /market holdings to see your portfolio")
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="buy", description="Buy a market item with Boli points")
+    @app_commands.describe(item_id="Item to buy (see /market view for IDs)", quantity="How many to buy (1–10)")
+    async def market_buy(
+        self,
+        interaction: discord.Interaction,
+        item_id: str,
+        quantity: app_commands.Range[int, 1, 10] = 1,
+    ) -> None:
+        item = get_market_item(db_conn, item_id.lower().strip())
+        if not item:
+            ids = ", ".join(i["item_id"] for i in get_market_items(db_conn))
+            await interaction.response.send_message(
+                f"Unknown item `{item_id}`. Valid IDs: {ids}", ephemeral=True
+            )
+            return
+
+        profile = get_user_profile(db_conn, interaction.user.id)
+        if not profile:
+            await interaction.response.send_message("Use /navi first to get started.", ephemeral=True)
+            return
+
+        total_cost = item["current_price"] * quantity
+        if profile["boli_points"] < total_cost:
+            await interaction.response.send_message(
+                f"Not enough Boli. This costs 🍮 **{total_cost}** but you have **{profile['boli_points']}**.",
+                ephemeral=True,
+            )
+            return
+
+        expires = datetime.now(timezone.utc) + timedelta(days=_MARKET_EXPIRY_DAYS)
+        update_boli_points(db_conn, interaction.user.id, -total_cost)
+        buy_holding(db_conn, interaction.user.id, item["item_id"], quantity, item["current_price"], expires)
+
+        msg = random.choice(_MARKET_BUY_TEMPLATES).format(
+            user=interaction.user.mention,
+            qty=quantity,
+            emoji=item["emoji"],
+            name=item["name"],
+            price=item["current_price"],
+            total=total_cost,
+        )
+        await interaction.response.send_message(msg)
+        logger.info("%s bought %dx %s @ %d Boli", interaction.user.display_name, quantity, item_id, item["current_price"])
+
+    @app_commands.command(name="sell", description="Sell a market item from your holdings")
+    @app_commands.describe(item_id="Item to sell", quantity="How many to sell")
+    async def market_sell(
+        self,
+        interaction: discord.Interaction,
+        item_id: str,
+        quantity: app_commands.Range[int, 1, 100] = 1,
+    ) -> None:
+        item = get_market_item(db_conn, item_id.lower().strip())
+        if not item:
+            await interaction.response.send_message(f"Unknown item `{item_id}`.", ephemeral=True)
+            return
+
+        holdings = get_user_holding_for_item(db_conn, interaction.user.id, item_id.lower().strip())
+        total_held = sum(h["quantity"] for h in holdings)
+        if total_held < quantity:
+            await interaction.response.send_message(
+                f"You only hold **{total_held}×** {item['emoji']} {item['name']}.", ephemeral=True
+            )
+            return
+
+        # FIFO sell — consume oldest holdings first
+        remaining = quantity
+        total_cost_basis = 0
+        for holding in holdings:
+            if remaining <= 0:
+                break
+            sell_qty = min(remaining, holding["quantity"])
+            total_cost_basis += holding["purchase_price"] * sell_qty
+            reduce_holding(db_conn, holding["id"], sell_qty)
+            remaining -= sell_qty
+
+        proceeds = item["current_price"] * quantity
+        update_boli_points(db_conn, interaction.user.id, proceeds)
+        add_experience(db_conn, interaction.user.id, max(0, proceeds - total_cost_basis) // 10)  # XP from profit
+
+        pnl = proceeds - total_cost_basis
+        pnl_str = f"📈 Profit: +{pnl} Boli" if pnl > 0 else (f"📉 Loss: {pnl} Boli" if pnl < 0 else "Break-even.")
+        msg = random.choice(_MARKET_SELL_TEMPLATES).format(
+            user=interaction.user.mention,
+            qty=quantity,
+            emoji=item["emoji"],
+            name=item["name"],
+            price=item["current_price"],
+            total=proceeds,
+            pnl_str=pnl_str,
+        )
+        await interaction.response.send_message(msg)
+        logger.info("%s sold %dx %s @ %d Boli (P&L: %+d)", interaction.user.display_name, quantity, item_id, item["current_price"], pnl)
+
+    @app_commands.command(name="holdings", description="View your current market holdings")
+    async def market_holdings(self, interaction: discord.Interaction) -> None:
+        holdings = get_user_holdings(db_conn, interaction.user.id)
+        if not holdings:
+            await interaction.response.send_message(
+                "You have no active holdings. Use `/market buy` to invest!", ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title="💼 Your Market Holdings",
+            color=discord.Color.dark_teal(),
+        )
+        total_value = 0
+        total_cost = 0
+        for h in holdings:
+            current_val = h["current_price"] * h["quantity"]
+            cost_val = h["purchase_price"] * h["quantity"]
+            pnl = current_val - cost_val
+            pnl_str = f"+{pnl}" if pnl >= 0 else str(pnl)
+            # Days left before expiry
+            try:
+                exp = datetime.fromisoformat(h["expires_at"].replace("Z", "+00:00"))
+                days_left = max(0, (exp - datetime.now(timezone.utc)).days)
+            except Exception:
+                days_left = "?"
+            embed.add_field(
+                name=f"{h['emoji']} {h['name']} ×{h['quantity']}",
+                value=(
+                    f"Bought @ {h['purchase_price']} · Now {h['current_price']} · P&L: **{pnl_str} Boli**\n"
+                    f"Current value: 🍮 **{current_val}** · Expires in **{days_left}d**"
+                ),
+                inline=False,
+            )
+            total_value += current_val
+            total_cost += cost_val
+        total_pnl = total_value - total_cost
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        embed.set_footer(text=f"Portfolio value: 🍮 {total_value} Boli · Total P&L: {pnl_sign}{total_pnl} Boli")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="history", description="See 7-day price history for an item")
+    @app_commands.describe(item_id="Item to inspect")
+    async def market_history(self, interaction: discord.Interaction, item_id: str) -> None:
+        item = get_market_item(db_conn, item_id.lower().strip())
+        if not item:
+            await interaction.response.send_message(f"Unknown item `{item_id}`.", ephemeral=True)
+            return
+
+        history = get_price_history(db_conn, item_id.lower().strip(), days=7)
+        if not history:
+            await interaction.response.send_message(
+                "No price history yet — check back after the first midnight price update.", ephemeral=True
+            )
+            return
+
+        max_p = max(h["price"] for h in history)
+        chart_lines = []
+        for h in history:
+            bar_len = int(20 * h["price"] / max(max_p, 1))
+            bar = "█" * bar_len
+            chart_lines.append(f"`{h['date']}` {bar} {h['price']}")
+
+        embed = discord.Embed(
+            title=f"{item['emoji']} {item['name']} — 7-day Price History",
+            description="\n".join(chart_lines),
+            color=discord.Color.dark_green(),
+        )
+        embed.set_footer(text=f"Current price: 🍮 {item['current_price']} Boli")
+        await interaction.response.send_message(embed=embed)
+
+
+tree.add_command(MarketGroup())
 
 
 @tree.command(name="strike", description="Issue a manual strike to a user (Moderators only)")
@@ -3498,46 +3818,99 @@ _GIFT_TEMPLATES: list[str] = [
 ]
 
 
-@tree.command(name="gift", description="Gift Boli points to another user")
-@app_commands.describe(recipient="Who to gift points to", amount="How many Boli points to send")
+_GIFT_DAILY_CAP = 500  # max Boli a sender can gift per day
+
+
+@tree.command(name="gift", description="Gift Boli points to another user. Omit recipient to surprise a random recent user!")
+@app_commands.describe(
+    recipient="Who to gift points to (optional — omit for a random active user)",
+    amount="How many Boli points to send",
+)
 async def gift_slash(
     interaction: discord.Interaction,
-    recipient: discord.Member,
     amount: app_commands.Range[int, 1, 10000],
+    recipient: discord.Member | None = None,
 ) -> None:
-    if recipient.id == interaction.user.id:
+    sender_id = interaction.user.id
+
+    # Resolve recipient
+    actual_recipient: discord.Member | None = recipient
+    random_pick: dict | None = None
+    if actual_recipient is None:
+        random_pick = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: get_random_recent_user(db_conn, sender_id)
+        )
+        if not random_pick:
+            await interaction.response.send_message(
+                "No one has used /navi in the last 24 hours — no one to surprise gift!",
+                ephemeral=True,
+            )
+            return
+        # Try to resolve the Discord Member object from the user_id
+        guild = interaction.guild
+        if guild:
+            actual_recipient = guild.get_member(random_pick["user_id"])
+        if actual_recipient is None:
+            await interaction.response.send_message(
+                "Couldn't resolve the random user — try again or tag someone directly.",
+                ephemeral=True,
+            )
+            return
+
+    if actual_recipient.id == sender_id:
         await interaction.response.send_message("You can't gift points to yourself.", ephemeral=True)
         return
-    if recipient.bot:
+    if actual_recipient.bot:
         await interaction.response.send_message("Bots don't need Boli points.", ephemeral=True)
         return
 
-    profile = get_user_profile(db_conn, interaction.user.id)
+    profile = get_user_profile(db_conn, sender_id)
     if not profile:
         await interaction.response.send_message(
             "No profile found. Use /navi first to get started.", ephemeral=True
         )
         return
 
-    sender_pts = profile["boli_points"]
-    if sender_pts < amount:
+    # Daily cap check
+    daily_total = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: get_gift_daily_total(db_conn, sender_id)
+    )
+    remaining_cap = _GIFT_DAILY_CAP - daily_total
+    if remaining_cap <= 0:
         await interaction.response.send_message(
-            f"Not enough Boli. You have 🍮 **{sender_pts}** but tried to gift **{amount}**.",
+            f"🚫 You've hit your daily gift cap of **{_GIFT_DAILY_CAP} Boli**. Come back tomorrow!",
+            ephemeral=True,
+        )
+        return
+    actual_amount = min(amount, remaining_cap)
+
+    sender_pts = profile["boli_points"]
+    if sender_pts < actual_amount:
+        await interaction.response.send_message(
+            f"Not enough Boli. You have 🍮 **{sender_pts}** but tried to gift **{actual_amount}**.",
             ephemeral=True,
         )
         return
 
-    update_boli_points(db_conn, interaction.user.id, -amount)
-    upsert_user(db_conn, recipient.id, recipient.display_name)
-    update_boli_points(db_conn, recipient.id, amount)
+    # Execute transfer (gifts do NOT award XP — anti-farming)
+    update_boli_points(db_conn, sender_id, -actual_amount)
+    upsert_user(db_conn, actual_recipient.id, actual_recipient.display_name)
+    update_boli_points(db_conn, actual_recipient.id, actual_amount)
+    record_gift(db_conn, sender_id, actual_recipient.id, actual_amount)
 
+    surprise_note = " *(random pick — they used /navi recently!)*" if random_pick else ""
+    cap_note = f" *(capped at {actual_amount} — daily limit)*" if actual_amount < amount else ""
     msg = random.choice(_GIFT_TEMPLATES).format(
         sender=interaction.user.mention,
-        recipient=recipient.mention,
-        amount=amount,
-    )
+        recipient=actual_recipient.mention,
+        amount=actual_amount,
+    ) + surprise_note + cap_note
     await interaction.response.send_message(msg)
-    logger.info("%s gifted %d Boli to %s", interaction.user.display_name, amount, recipient.display_name)
+    logger.info(
+        "%s gifted %d Boli to %s%s",
+        interaction.user.display_name, actual_amount, actual_recipient.display_name,
+        " (random)" if random_pick else "",
+    )
 
 
 # ---------------------------------------------------------------------------

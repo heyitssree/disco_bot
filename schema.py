@@ -102,9 +102,69 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             username        TEXT NOT NULL,
             rashi           TEXT,
             boli_points     INTEGER DEFAULT 0,
+            experience      INTEGER DEFAULT 0,
             last_seen       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             prediction_count INTEGER DEFAULT 0,
             extra_actions   INTEGER DEFAULT 0
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gift_log (
+            id          INTEGER PRIMARY KEY,
+            sender_id   INTEGER NOT NULL,
+            recipient_id INTEGER NOT NULL,
+            amount      INTEGER NOT NULL,
+            gifted_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS partner_score_log (
+            id              INTEGER PRIMARY KEY,
+            game_id         TEXT NOT NULL UNIQUE,
+            user_id         INTEGER NOT NULL,
+            guild_id        INTEGER NOT NULL,
+            username        TEXT NOT NULL,
+            raw_points      INTEGER NOT NULL,
+            boli_awarded    INTEGER NOT NULL,
+            xp_awarded      INTEGER NOT NULL,
+            game_type       TEXT DEFAULT 'default',
+            received_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_items (
+            item_id       TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            emoji         TEXT NOT NULL,
+            base_price    INTEGER NOT NULL,
+            current_price INTEGER NOT NULL,
+            volatility    TEXT DEFAULT 'medium',
+            description   TEXT,
+            last_updated  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_holdings (
+            id             INTEGER PRIMARY KEY,
+            user_id        INTEGER NOT NULL,
+            item_id        TEXT NOT NULL,
+            quantity       INTEGER NOT NULL DEFAULT 1,
+            purchase_price INTEGER NOT NULL,
+            purchased_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at     TIMESTAMP NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_price_history (
+            id          INTEGER PRIMARY KEY,
+            item_id     TEXT NOT NULL,
+            price       INTEGER NOT NULL,
+            recorded_at DATE NOT NULL
         )
     """)
 
@@ -324,11 +384,22 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         "ALTER TABLE local_media ADD COLUMN discord_id TEXT",
         "ALTER TABLE local_media ADD COLUMN discord_name TEXT",
         "ALTER TABLE local_media ADD COLUMN animated INTEGER DEFAULT 0",
+        # Feature 2: decouple XP from Boli Points
+        "ALTER TABLE user_stats ADD COLUMN experience INTEGER DEFAULT 0",
     ):
         try:
             conn.execute(col_sql)
         except Exception:
             pass  # column already exists
+
+    # Seed experience from existing boli_points for all users who haven't been migrated yet
+    conn.execute("""
+        UPDATE user_stats SET experience = boli_points
+        WHERE experience = 0 AND boli_points > 0
+    """)
+
+    # Seed market items if table is empty
+    _seed_market_items(conn)
 
     conn.commit()
 
@@ -403,7 +474,7 @@ def get_user_profile(
 ) -> dict | None:
     """Return user profile dict or None if user doesn't exist."""
     row = conn.execute(
-        "SELECT user_id, username, rashi, boli_points, last_seen, prediction_count, "
+        "SELECT user_id, username, rashi, boli_points, experience, last_seen, prediction_count, "
         "daily_action_count, last_action_date, extra_actions "
         "FROM user_stats WHERE user_id = ?",
         [user_id],
@@ -415,11 +486,12 @@ def get_user_profile(
         "username": row[1],
         "rashi": row[2],
         "boli_points": row[3],
-        "last_seen": row[4],
-        "prediction_count": row[5],
-        "daily_action_count": row[6],
-        "last_action_date": row[7],
-        "extra_actions": row[8],
+        "experience": row[4],
+        "last_seen": row[5],
+        "prediction_count": row[6],
+        "daily_action_count": row[7],
+        "last_action_date": row[8],
+        "extra_actions": row[9],
     }
 
 
@@ -468,6 +540,31 @@ def update_boli_points(
         ),
         conn.commit(),
     ))
+
+
+def add_experience(
+    conn: sqlite3.Connection,
+    user_id: int,
+    delta: int,
+) -> None:
+    """Add XP for a user. XP never decreases — negative deltas are silently clamped to 0."""
+    if delta <= 0:
+        return
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE user_stats SET experience = experience + ? WHERE user_id = ?",
+            [delta, user_id],
+        ),
+        conn.commit(),
+    ))
+
+
+def get_experience(conn: sqlite3.Connection, user_id: int) -> int:
+    """Return raw experience points for a user (0 if not found)."""
+    row = conn.execute(
+        "SELECT experience FROM user_stats WHERE user_id = ?", [user_id]
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else 0
 
 
 def increment_prediction_count(
@@ -1254,7 +1351,7 @@ def clear_perk(
 
 
 def get_level_from_points(points: int) -> int:
-    """Compute level (0–100) from total Boli Points.
+    """Compute level (0–100) from lifetime XP (experience column).
 
     Solves 5n(n+3) ≤ points for the largest integer n.
     """
@@ -1599,3 +1696,382 @@ def log_api_call(
         )
         conn.commit()
     _db_write(_write)
+
+
+# ---------------------------------------------------------------------------
+# Gift log (daily cap tracking)
+# ---------------------------------------------------------------------------
+
+def get_gift_daily_total(conn: sqlite3.Connection, sender_id: int) -> int:
+    """Return total Boli gifted by sender_id today (UTC date)."""
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount), 0) FROM gift_log
+        WHERE sender_id = ? AND DATE(gifted_at) = DATE('now')
+        """,
+        [sender_id],
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def record_gift(
+    conn: sqlite3.Connection,
+    sender_id: int,
+    recipient_id: int,
+    amount: int,
+) -> None:
+    """Record a gift transaction for daily cap tracking."""
+    def _write() -> None:
+        conn.execute(
+            "INSERT INTO gift_log (sender_id, recipient_id, amount) VALUES (?, ?, ?)",
+            [sender_id, recipient_id, amount],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_random_recent_user(
+    conn: sqlite3.Connection,
+    exclude_id: int,
+) -> dict | None:
+    """Return a random user who used /navi in the last 24 hours, excluding exclude_id.
+
+    Returns dict with keys user_id and username, or None if no candidates.
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT u.user_id, u.username
+        FROM user_stats u
+        INNER JOIN user_prediction_history h ON h.user_id = u.user_id
+        WHERE u.user_id != ?
+          AND h.timestamp >= datetime('now', '-1 day')
+        """,
+        [exclude_id],
+    ).fetchall()
+    if not rows:
+        return None
+    row = random.choice(rows)
+    return {"user_id": row[0], "username": row[1]}
+
+
+# ---------------------------------------------------------------------------
+# Partner score log (deduplication + audit)
+# ---------------------------------------------------------------------------
+
+def partner_score_exists(conn: sqlite3.Connection, game_id: str) -> bool:
+    """Return True if this game_id has already been processed."""
+    row = conn.execute(
+        "SELECT 1 FROM partner_score_log WHERE game_id = ?", [game_id]
+    ).fetchone()
+    return row is not None
+
+
+def log_partner_score(
+    conn: sqlite3.Connection,
+    game_id: str,
+    user_id: int,
+    guild_id: int,
+    username: str,
+    raw_points: int,
+    boli_awarded: int,
+    xp_awarded: int,
+    game_type: str = "default",
+) -> None:
+    """Persist an inbound partner-bot score submission."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO partner_score_log
+                (game_id, user_id, guild_id, username, raw_points, boli_awarded, xp_awarded, game_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [game_id, user_id, guild_id, username, raw_points, boli_awarded, xp_awarded, game_type],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_recent_partner_logs(conn: sqlite3.Connection, limit: int = 10) -> list[dict]:
+    """Return the most recent partner score submissions."""
+    rows = conn.execute(
+        """
+        SELECT game_id, username, game_type, raw_points, boli_awarded, received_at
+        FROM partner_score_log ORDER BY received_at DESC LIMIT ?
+        """,
+        [limit],
+    ).fetchall()
+    return [
+        {
+            "game_id": r[0], "username": r[1], "game_type": r[2],
+            "raw_points": r[3], "boli_awarded": r[4], "received_at": r[5],
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Stock Market
+# ---------------------------------------------------------------------------
+
+_MARKET_SEED_ITEMS: list[dict] = [
+    {
+        "item_id": "monsoon_insurance",
+        "name": "Monsoon Insurance",
+        "emoji": "🌧️",
+        "base_price": 80,
+        "current_price": 80,
+        "volatility": "high",
+        "description": "Price rises when it rains in Trivandrum. Climate anxiety, monetized.",
+    },
+    {
+        "item_id": "it_layoff_hedge",
+        "name": "IT Layoff Hedge",
+        "emoji": "📱",
+        "base_price": 60,
+        "current_price": 60,
+        "volatility": "medium",
+        "description": "Spikes every Friday. Technopark vibes only.",
+    },
+    {
+        "item_id": "banana_republic",
+        "name": "Banana Republic Stock",
+        "emoji": "🍌",
+        "base_price": 40,
+        "current_price": 40,
+        "volatility": "low",
+        "description": "Slow decay with random noise. A classic.",
+    },
+    {
+        "item_id": "cricket_mood_index",
+        "name": "Cricket Mood Index",
+        "emoji": "🏏",
+        "base_price": 70,
+        "current_price": 70,
+        "volatility": "high",
+        "description": "Extremely volatile during IPL season.",
+    },
+    {
+        "item_id": "chaya_kada_futures",
+        "name": "Chaya Kada Futures",
+        "emoji": "☕",
+        "base_price": 30,
+        "current_price": 30,
+        "volatility": "very_low",
+        "description": "The safest investment in Kerala. Tiny but steady gains.",
+    },
+    {
+        "item_id": "coconut_oil_commodity",
+        "name": "Coconut Oil Commodity",
+        "emoji": "🌴",
+        "base_price": 50,
+        "current_price": 50,
+        "volatility": "low",
+        "description": "Follows a slow sine wave. Buy low, sell after the rains.",
+    },
+]
+
+
+def _seed_market_items(conn: sqlite3.Connection) -> None:
+    """Insert default market items if the table is empty."""
+    count = conn.execute("SELECT COUNT(*) FROM market_items").fetchone()[0]
+    if count > 0:
+        return
+    for item in _MARKET_SEED_ITEMS:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO market_items
+                (item_id, name, emoji, base_price, current_price, volatility, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            [item["item_id"], item["name"], item["emoji"],
+             item["base_price"], item["current_price"],
+             item["volatility"], item["description"]],
+        )
+
+
+def get_market_items(conn: sqlite3.Connection) -> list[dict]:
+    """Return all market items with current prices."""
+    rows = conn.execute(
+        "SELECT item_id, name, emoji, base_price, current_price, volatility, description "
+        "FROM market_items ORDER BY item_id"
+    ).fetchall()
+    return [
+        {
+            "item_id": r[0], "name": r[1], "emoji": r[2],
+            "base_price": r[3], "current_price": r[4],
+            "volatility": r[5], "description": r[6],
+        }
+        for r in rows
+    ]
+
+
+def get_market_item(conn: sqlite3.Connection, item_id: str) -> dict | None:
+    """Return a single market item by item_id, or None."""
+    row = conn.execute(
+        "SELECT item_id, name, emoji, base_price, current_price, volatility, description "
+        "FROM market_items WHERE item_id = ?",
+        [item_id],
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "item_id": row[0], "name": row[1], "emoji": row[2],
+        "base_price": row[3], "current_price": row[4],
+        "volatility": row[5], "description": row[6],
+    }
+
+
+def update_market_price(
+    conn: sqlite3.Connection,
+    item_id: str,
+    new_price: int,
+) -> None:
+    """Set a market item's current price and update last_updated."""
+    _db_write(lambda: (
+        conn.execute(
+            "UPDATE market_items SET current_price = ?, last_updated = CURRENT_TIMESTAMP WHERE item_id = ?",
+            [new_price, item_id],
+        ),
+        conn.commit(),
+    ))
+
+
+def record_price_history(
+    conn: sqlite3.Connection,
+    item_id: str,
+    price: int,
+    date_str: str,
+) -> None:
+    """Persist a daily price point for history display."""
+    def _write() -> None:
+        conn.execute(
+            "INSERT INTO market_price_history (item_id, price, recorded_at) VALUES (?, ?, ?)",
+            [item_id, price, date_str],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_price_history(
+    conn: sqlite3.Connection,
+    item_id: str,
+    days: int = 7,
+) -> list[dict]:
+    """Return the last N days of price history for an item."""
+    rows = conn.execute(
+        """
+        SELECT recorded_at, price FROM market_price_history
+        WHERE item_id = ?
+        ORDER BY recorded_at DESC LIMIT ?
+        """,
+        [item_id, days],
+    ).fetchall()
+    return [{"date": r[0], "price": r[1]} for r in reversed(rows)]
+
+
+def buy_holding(
+    conn: sqlite3.Connection,
+    user_id: int,
+    item_id: str,
+    quantity: int,
+    purchase_price: int,
+    expires_at: datetime,
+) -> None:
+    """Add a new holding row for a user purchase."""
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO user_holdings (user_id, item_id, quantity, purchase_price, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [user_id, item_id, quantity, purchase_price, expires_at.isoformat()],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def get_user_holdings(conn: sqlite3.Connection, user_id: int) -> list[dict]:
+    """Return all non-expired holdings for a user, joined with market item info."""
+    rows = conn.execute(
+        """
+        SELECT h.id, h.item_id, m.name, m.emoji, m.current_price,
+               h.quantity, h.purchase_price, h.purchased_at, h.expires_at
+        FROM user_holdings h
+        JOIN market_items m ON m.item_id = h.item_id
+        WHERE h.user_id = ? AND h.expires_at > CURRENT_TIMESTAMP
+        ORDER BY h.purchased_at
+        """,
+        [user_id],
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "item_id": r[1], "name": r[2], "emoji": r[3],
+            "current_price": r[4], "quantity": r[5], "purchase_price": r[6],
+            "purchased_at": r[7], "expires_at": r[8],
+        }
+        for r in rows
+    ]
+
+
+def get_user_holding_for_item(
+    conn: sqlite3.Connection,
+    user_id: int,
+    item_id: str,
+) -> list[dict]:
+    """Return non-expired holdings for a user for a specific item (FIFO order)."""
+    rows = conn.execute(
+        """
+        SELECT id, quantity, purchase_price, purchased_at, expires_at
+        FROM user_holdings
+        WHERE user_id = ? AND item_id = ? AND expires_at > CURRENT_TIMESTAMP
+        ORDER BY purchased_at ASC
+        """,
+        [user_id, item_id],
+    ).fetchall()
+    return [
+        {
+            "id": r[0], "quantity": r[1], "purchase_price": r[2],
+            "purchased_at": r[3], "expires_at": r[4],
+        }
+        for r in rows
+    ]
+
+
+def reduce_holding(
+    conn: sqlite3.Connection,
+    holding_id: int,
+    qty_to_remove: int,
+) -> None:
+    """Reduce quantity of a holding row, deleting it if it reaches 0."""
+    def _write() -> None:
+        conn.execute(
+            "UPDATE user_holdings SET quantity = quantity - ? WHERE id = ?",
+            [qty_to_remove, holding_id],
+        )
+        conn.execute("DELETE FROM user_holdings WHERE id = ? AND quantity <= 0", [holding_id])
+        conn.commit()
+    _db_write(_write)
+
+
+def expire_stale_holdings(
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    """Delete all expired holding rows and return them (for notification purposes)."""
+    rows = conn.execute(
+        """
+        SELECT h.user_id, m.name, m.emoji, h.quantity, h.purchase_price
+        FROM user_holdings h
+        JOIN market_items m ON m.item_id = h.item_id
+        WHERE h.expires_at <= CURRENT_TIMESTAMP
+        """
+    ).fetchall()
+    expired = [
+        {"user_id": r[0], "name": r[1], "emoji": r[2], "quantity": r[3], "purchase_price": r[4]}
+        for r in rows
+    ]
+    if expired:
+        _db_write(lambda: (
+            conn.execute("DELETE FROM user_holdings WHERE expires_at <= CURRENT_TIMESTAMP"),
+            conn.commit(),
+        ))
+    return expired
