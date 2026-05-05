@@ -116,6 +116,8 @@ from schema import (
     save_score_comment,
     get_random_knowledge_terms,
     _GEMINI_GAME_DAILY_LIMIT,
+    reset_gemini_game_count,
+    reset_gambling_count,
 )
 from market_engine import update_all_prices, get_trend_arrow
 from api_server import run_api_server
@@ -3206,6 +3208,51 @@ class AdminGroup(app_commands.Group):
         status = "✅ **Enabled** — partner bot point awards are active." if enabled else "⛔ **Disabled** — partner bot submissions will be logged but no points awarded."
         await interaction.response.send_message(f"Partner API: {status}", ephemeral=True)
         logger.info("Partner API toggle: %s by %s", "ON" if enabled else "OFF", interaction.user.display_name)
+
+    @app_commands.command(name="reset_game_attempts", description="Reset today's attempt count for a user in a mini-game")
+    @app_commands.describe(
+        user="The member whose attempts to reset",
+        game="Which game's daily count to clear",
+    )
+    @app_commands.choices(game=[
+        app_commands.Choice(name="Type Race",       value="type_race"),
+        app_commands.Choice(name="Navi Challenge",  value="navi_challenge"),
+        app_commands.Choice(name="Gambling (all)",  value="gambling"),
+        app_commands.Choice(name="All Games",       value="all"),
+    ])
+    async def reset_game_attempts_cmd(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        game: str,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        if game in ("type_race", "all"):
+            await loop.run_in_executor(
+                None, lambda: reset_gemini_game_count(db_conn, user.id, "type_race")
+            )
+        if game in ("navi_challenge", "all"):
+            await loop.run_in_executor(
+                None, lambda: reset_gemini_game_count(db_conn, user.id, "navi_challenge")
+            )
+        if game in ("gambling", "all"):
+            await loop.run_in_executor(
+                None, lambda: reset_gambling_count(db_conn, user.id)
+            )
+        game_label = {
+            "type_race":       "Type Race",
+            "navi_challenge":  "Navi Challenge",
+            "gambling":        "Gambling (all games)",
+            "all":             "Type Race + Navi Challenge + Gambling",
+        }[game]
+        await interaction.response.send_message(
+            f"✅ **{user.display_name}**'s daily attempts reset for: **{game_label}**",
+            ephemeral=True,
+        )
+        logger.info(
+            "reset_game_attempts: %s → %s by %s",
+            user.display_name, game, interaction.user.display_name,
+        )
 
 
 tree.add_command(AdminGroup())

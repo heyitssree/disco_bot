@@ -1313,6 +1313,28 @@ def get_random_knowledge_terms(conn: sqlite3.Connection, num_categories: int = 3
     return results
 
 
+def reset_gemini_game_count(conn: sqlite3.Connection, user_id: int, game_name: str) -> None:
+    """Delete today's attempt record for a user in navi_challenge or type_race."""
+    table = "navi_challenge_attempts" if game_name == "navi_challenge" else "type_race_attempts"
+    today = _today_ist()
+    _db_write(lambda: (
+        conn.execute(f"DELETE FROM {table} WHERE user_id = ? AND play_date = ?", [user_id, today]),
+        conn.commit(),
+    ))
+
+
+def reset_gambling_count(conn: sqlite3.Connection, user_id: int) -> None:
+    """Delete all of today's gambling play counts for a user."""
+    today = _today_ist()
+    _db_write(lambda: (
+        conn.execute(
+            "DELETE FROM game_daily_counts WHERE user_id = ? AND play_date = ?",
+            [user_id, today],
+        ),
+        conn.commit(),
+    ))
+
+
 # ---------------------------------------------------------------------------
 # Lucky draw: users active previous day (7am IST prev → 6:59am IST today)
 # ---------------------------------------------------------------------------
