@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -12,6 +13,15 @@ import asyncio
 import shutil
 from collections import deque
 from datetime import datetime, timedelta, timezone
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    _MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    _MATPLOTLIB_AVAILABLE = False
 
 from dotenv import load_dotenv
 import discord
@@ -79,6 +89,7 @@ from schema import (
     increment_daily_refill_count,
     get_game_daily_count,
     increment_game_daily_count,
+    get_total_game_daily_count,
     _GAME_DAILY_LIMIT,
     get_active_user_ids_previous_day,
     get_top_n_from_user_ids,
@@ -98,6 +109,13 @@ from schema import (
     reduce_holding,
     expire_stale_holdings,
     get_price_history,
+    # Gemini mini-games
+    get_gemini_game_daily_count,
+    increment_gemini_game_count,
+    get_score_comment,
+    save_score_comment,
+    get_random_knowledge_terms,
+    _GEMINI_GAME_DAILY_LIMIT,
 )
 from market_engine import update_all_prices, get_trend_arrow
 from api_server import run_api_server
@@ -492,13 +510,13 @@ _HAS_EXTRAS_MESSAGES: list[str] = [
     "⚡ {invoker}, **{extra}** extra cosmic action(s) left in your tank. Burn through them before refilling.",
 ]
 
-# Over-quota game messages (now with countdown)
+# Over-quota game messages (30 combined plays/day across all games)
 _OVER_QUOTA_GAME_MESSAGES: list[str] = [
-    "You've used all 5 plays for **{game}** today, {user}. Come back after midnight IST!",
-    "{user}, the cosmic {game} table is closed for you today. 5 plays max. Reset at midnight IST.",
-    "Out of {game} tries, {user}. You've hit the 5/day limit. See you after midnight IST!",
-    "{user}, 5 games of {game} per day max. The dealer has cut you off until midnight IST.",
-    "The cosmic {game} machine won't spin for you anymore today, {user}. Come back after midnight IST.",
+    "{user}, you've hit the **30 combined game plays** limit for today. Resets at midnight IST!",
+    "The cosmic casino is done with you for today, {user}. 30 plays across all games max. See you at midnight IST.",
+    "{user}, 30 combined gambling plays per day is the rule. The cosmos has spoken. Midnight IST resets it.",
+    "Out of plays, {user}. You've burned through all **30 combined chances** today. Try again after midnight IST.",
+    "The dealer's cut you off, {user}. 30 plays (any game) per day. Midnight IST is your reset.",
 ]
 
 
@@ -1337,8 +1355,8 @@ async def on_ready() -> None:
     # Start daily lucky draw loop (fires at 7:00am IST)
     asyncio.create_task(_lucky_draw_loop())
 
-    # Start daily market price update + holdings expiry loop (midnight IST)
-    asyncio.create_task(_market_daily_loop())
+    # Start hourly market price update loop (history + expiry only at midnight IST)
+    asyncio.create_task(_market_hourly_loop())
 
     # Start partner bot API server (port 8080)
     asyncio.create_task(run_api_server(
@@ -2828,10 +2846,24 @@ async def help_slash(interaction: discord.Interaction) -> None:
         "`/mypoints` — Your Rashi, Boli Points, level, and cosmic title",
         "`/rank` — Top 10 leaderboard",
         "`/leaderboard` — Most cursed, most blessed, and richest users",
-        "`/gift @user amount` — Send Boli Points to someone",
+        "`/gift @user amount` — Send Boli Points to someone (omit recipient = random active user)",
         "`/shop view` / `/shop buy` — Boli Marketplace (perks, protection, extra actions)",
     ]
     embed.add_field(name="🍮 Boli Economy", value="\n".join(economy_lines), inline=False)
+
+    # ── Boli Stock Market ────────────────────────────────────────────────────
+    embed.add_field(
+        name="📈 Boli Stock Market",
+        value=(
+            "`/market view` — Browse all items with live prices\n"
+            "`/market buy <item_id> <qty>` — Buy stocks (up to 10 at once)\n"
+            "`/market sell <item_id> <qty>` — Sell from your holdings (FIFO)\n"
+            "`/market holdings` — Your portfolio: purchase price, quantity, P&L, expiry\n"
+            "`/market history <item_id>` — Price chart (updates **hourly**, history logged daily)\n"
+            "Holdings expire in **7 days**. Profit earns XP. Prices vary by hour + day-of-week."
+        ),
+        inline=False,
+    )
 
     # ── Gambling ─────────────────────────────────────────────────────────────
     if _feat("feature_gambling"):
@@ -2842,8 +2874,27 @@ async def help_slash(interaction: discord.Interaction) -> None:
                 "`/roll_dice bet` — Dice: over/under 1:1, exact 7 pays 4:1, specific sums up to 35:1\n"
                 "`/roulette bet` — 39-pocket wheel: color/odd/even 1:1, dozen 2:1, number 35:1\n"
                 "`/slots bet` — Slot machine: 2-match 3:1, 3-match 10:1, jackpot (7️⃣7️⃣7️⃣) 50:1\n"
-                "Max bet **50,000 Boli** per game."
+                "Max bet **50,000 Boli** · **30 combined game plays/day** · Resets midnight IST"
             ),
+            inline=False,
+        )
+
+    # ── Gemini Mini-Games ────────────────────────────────────────────────────
+    gemini_game_lines = []
+    if _feat("feature_navi_challenge"):
+        gemini_game_lines.append(
+            "`/navi_challenge` — Get 3 random Trivandrum keywords, write a 2-sentence cosmic prediction, "
+            "get Gemini-judged score (0–100 Boli + XP). **90 seconds, 2 attempts/day.**"
+        )
+    if _feat("feature_type_race"):
+        gemini_game_lines.append(
+            "`/type_race` — Gemini generates a Manglish sentence; type it **in Malayalam** within 60 seconds. "
+            "Score → Boli + XP. **2 attempts/day.**"
+        )
+    if gemini_game_lines:
+        embed.add_field(
+            name="🧠 Navi Mini-Games *(Gemini-judged)*",
+            value="\n".join(gemini_game_lines),
             inline=False,
         )
 
@@ -2916,7 +2967,7 @@ async def help_slash(interaction: discord.Interaction) -> None:
         if mod_lines:
             embed.add_field(name="🛡️ Mod Commands", value="\n".join(mod_lines), inline=False)
 
-    embed.set_footer(text=f"Powered by Gemini · {_DAILY_QUOTA} cosmic actions/day · Resets midnight IST")
+    embed.set_footer(text=f"Powered by Gemini · {_DAILY_QUOTA} cosmic actions/day · 30 gambling plays/day · Resets midnight IST")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -3164,39 +3215,44 @@ tree.add_command(AdminGroup())
 # Market daily loop (midnight IST — price update + expiry check)
 # ---------------------------------------------------------------------------
 
-async def _market_daily_loop() -> None:
-    """Background loop that updates market prices and expires stale holdings at midnight IST."""
+async def _market_hourly_loop() -> None:
+    """Background loop that updates market prices every hour (IST :05).
+
+    At midnight IST: also records price history and expires stale holdings.
+    """
     _IST = timezone(timedelta(hours=5, minutes=30))
 
     while True:
         now_ist = datetime.now(_IST)
-        target = now_ist.replace(hour=0, minute=0, second=5, microsecond=0)
-        if now_ist >= target:
-            target = target + timedelta(days=1)
-        wait_seconds = (target - now_ist).total_seconds()
-        logger.info("Market loop sleeping for %.0f seconds (until midnight IST).", wait_seconds)
+        # Sleep until :05 of the next hour
+        next_hour = now_ist.replace(minute=5, second=0, microsecond=0)
+        if now_ist >= next_hour:
+            next_hour += timedelta(hours=1)
+        wait_seconds = (next_hour - now_ist).total_seconds()
+        logger.info("Market hourly loop sleeping %.0f s (until %s IST).", wait_seconds, next_hour.strftime('%H:%M'))
         await asyncio.sleep(wait_seconds)
 
+        _IST2 = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(_IST2)
+        is_midnight_run = now_ist.hour == 0
+
         try:
-            # Update prices
-            await update_all_prices(db_conn)
+            await update_all_prices(db_conn, record_history=is_midnight_run)
 
-            # Expire stale holdings and notify owners
-            expired = expire_stale_holdings(db_conn)
-            if expired:
-                _NAVI_GAMES_ID = 1499827359585665104
-                notify_ch = bot.get_channel(_NAVI_GAMES_ID)
-                for item in expired:
-                    if notify_ch:
-                        await notify_ch.send(
-                            f"📉 <@{item['user_id']}> — your {item['emoji']} **{item['name']}** "
-                            f"(×{item['quantity']}, bought at {item['purchase_price']} Boli each) "
-                            f"has **expired** and is now worth nothing. F in chat."
-                        )
+            if is_midnight_run:
+                expired = expire_stale_holdings(db_conn)
+                if expired:
+                    _NAVI_GAMES_ID = 1499827359585665104
+                    notify_ch = bot.get_channel(_NAVI_GAMES_ID)
+                    for item in expired:
+                        if notify_ch:
+                            await notify_ch.send(
+                                f"📉 <@{item['user_id']}> — your {item['emoji']} **{item['name']}** "
+                                f"(×{item['quantity']}, bought at {item['purchase_price']} Boli each) "
+                                f"has **expired** and is now worth nothing. F in chat."
+                            )
         except Exception as exc:
-            logger.error("Market daily loop error: %s", exc)
-
-        await asyncio.sleep(60)
+            logger.error("Market hourly loop error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3204,6 +3260,45 @@ async def _market_daily_loop() -> None:
 # ---------------------------------------------------------------------------
 
 _MARKET_EXPIRY_DAYS = 7  # holdings expire after this many days
+
+
+def _generate_price_chart(item_label: str, history: list[dict]) -> io.BytesIO:
+    """Render a price history chart to an in-memory PNG (runs in executor, blocking is fine)."""
+    from matplotlib.ticker import MaxNLocator
+    dates, prices = [], []
+    for h in history:
+        try:
+            dt_str = h["date"].replace("T", " ")
+            dt = datetime.strptime(dt_str[:16], "%Y-%m-%d %H:%M")
+            dates.append(dt)
+            prices.append(h["price"])
+        except Exception:
+            continue
+
+    if not dates:
+        raise ValueError("No plottable history entries")
+
+    fig, ax = plt.subplots(figsize=(10, 4), facecolor="#2b2d31")
+    ax.set_facecolor("#1e1f22")
+    ax.plot(dates, prices, "o-", color="#f0c040", linewidth=2, markersize=4)
+    ax.fill_between(dates, prices, min(prices) * 0.98, alpha=0.2, color="#f0c040")
+    ax.set_title(item_label, color="white", fontsize=13)
+    ax.set_ylabel("Boli", color="#aaaaaa")
+    ax.tick_params(colors="#aaaaaa")
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#555555")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=8))
+    plt.xticks(rotation=30, ha="right", color="#aaaaaa")
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
 
 _MARKET_BUY_TEMPLATES: list[str] = [
     "📦 {user} just bought **{qty}× {emoji} {name}** at 🍮 **{price} Boli** each. Bold move.",
@@ -3382,35 +3477,49 @@ class MarketGroup(app_commands.Group):
         embed.set_footer(text=f"Portfolio value: 🍮 {total_value} Boli · Total P&L: {pnl_sign}{total_pnl} Boli")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="history", description="See 7-day price history for an item")
-    @app_commands.describe(item_id="Item to inspect")
+    @app_commands.command(name="history", description="See price history chart for an item (last 48 data points)")
+    @app_commands.describe(item_id="Item to inspect (use ID from /market view)")
     async def market_history(self, interaction: discord.Interaction, item_id: str) -> None:
         item = get_market_item(db_conn, item_id.lower().strip())
         if not item:
-            await interaction.response.send_message(f"Unknown item `{item_id}`.", ephemeral=True)
-            return
-
-        history = get_price_history(db_conn, item_id.lower().strip(), days=7)
-        if not history:
+            ids = ", ".join(i["item_id"] for i in get_market_items(db_conn))
             await interaction.response.send_message(
-                "No price history yet — check back after the first midnight price update.", ephemeral=True
+                f"Unknown item `{item_id}`. Valid IDs: {ids}", ephemeral=True
             )
             return
 
-        max_p = max(h["price"] for h in history)
-        chart_lines = []
-        for h in history:
-            bar_len = int(20 * h["price"] / max(max_p, 1))
-            bar = "█" * bar_len
-            chart_lines.append(f"`{h['date']}` {bar} {h['price']}")
+        history = get_price_history(db_conn, item_id.lower().strip(), days=48)
+        if not history:
+            await interaction.response.send_message(
+                "No price history yet — the bot records prices hourly. Check back in an hour!", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer()
 
         embed = discord.Embed(
-            title=f"{item['emoji']} {item['name']} — 7-day Price History",
-            description="\n".join(chart_lines),
+            title=f"{item['emoji']} {item['name']} — Price History",
             color=discord.Color.dark_green(),
         )
-        embed.set_footer(text=f"Current price: 🍮 {item['current_price']} Boli")
-        await interaction.response.send_message(embed=embed)
+        embed.set_footer(text=f"Current: 🍮 {item['current_price']} Boli · Prices update every hour")
+
+        if _MATPLOTLIB_AVAILABLE and len(history) > 1:
+            chart_file = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: _generate_price_chart(item['emoji'] + ' ' + item['name'], history)
+            )
+            discord_file = discord.File(chart_file, filename="price_chart.png")
+            embed.set_image(url="attachment://price_chart.png")
+            await interaction.followup.send(embed=embed, file=discord_file)
+        else:
+            # Fallback text bars
+            max_p = max(h["price"] for h in history)
+            chart_lines = []
+            for h in history[-14:]:  # last 14 points
+                bar_len = int(18 * h["price"] / max(max_p, 1))
+                bar = "█" * bar_len
+                chart_lines.append(f"`{h['date'][:16]}` {bar} **{h['price']}**")
+            embed.description = "\n".join(chart_lines)
+            await interaction.followup.send(embed=embed)
 
 
 tree.add_command(MarketGroup())
@@ -3480,22 +3589,24 @@ async def flip_slash(
     if not _feat("feature_gambling"):
         await interaction.response.send_message("Gambling is currently disabled.", ephemeral=True)
         return
-    profile = get_user_profile(db_conn, interaction.user.id)
+    await interaction.response.defer(thinking=True)
+    loop = asyncio.get_running_loop()
+    profile, total_count = await loop.run_in_executor(
+        None,
+        lambda: (get_user_profile(db_conn, interaction.user.id),
+                 get_total_game_daily_count(db_conn, interaction.user.id)),
+    )
     err = _gambling_guard(profile, bet)
     if err:
-        await interaction.response.send_message(err, ephemeral=True)
+        await interaction.followup.send(err, ephemeral=True)
         return
 
-    daily_count = get_game_daily_count(db_conn, interaction.user.id, "flip")
-    if daily_count >= _GAME_DAILY_LIMIT:
-        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, game="Coin Flip"
-        )
-        await interaction.response.send_message(msg, ephemeral=True)
+    if total_count >= _GAME_DAILY_LIMIT:
+        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(user=interaction.user.display_name, game="Coin Flip")
+        await interaction.followup.send(msg, ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
-    increment_game_daily_count(db_conn, interaction.user.id, "flip")
+    await loop.run_in_executor(None, lambda: increment_game_daily_count(db_conn, interaction.user.id, "flip"))
     update_boli_points(db_conn, interaction.user.id, -bet)
     await asyncio.sleep(1.5)
 
@@ -3546,22 +3657,24 @@ async def roll_dice_slash(
     if not _feat("feature_gambling"):
         await interaction.response.send_message("Gambling is currently disabled.", ephemeral=True)
         return
-    profile = get_user_profile(db_conn, interaction.user.id)
+    await interaction.response.defer(thinking=True)
+    loop = asyncio.get_running_loop()
+    profile, total_count = await loop.run_in_executor(
+        None,
+        lambda: (get_user_profile(db_conn, interaction.user.id),
+                 get_total_game_daily_count(db_conn, interaction.user.id)),
+    )
     err = _gambling_guard(profile, bet)
     if err:
-        await interaction.response.send_message(err, ephemeral=True)
+        await interaction.followup.send(err, ephemeral=True)
         return
 
-    daily_count = get_game_daily_count(db_conn, interaction.user.id, "roll_dice")
-    if daily_count >= _GAME_DAILY_LIMIT:
-        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, game="Dice"
-        )
-        await interaction.response.send_message(msg, ephemeral=True)
+    if total_count >= _GAME_DAILY_LIMIT:
+        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(user=interaction.user.display_name, game="Dice")
+        await interaction.followup.send(msg, ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
-    increment_game_daily_count(db_conn, interaction.user.id, "roll_dice")
+    await loop.run_in_executor(None, lambda: increment_game_daily_count(db_conn, interaction.user.id, "roll_dice"))
     update_boli_points(db_conn, interaction.user.id, -bet)
     await asyncio.sleep(1.5)
 
@@ -3641,22 +3754,24 @@ async def roulette_slash(
         )
         return
 
-    profile = get_user_profile(db_conn, interaction.user.id)
+    await interaction.response.defer(thinking=True)
+    loop = asyncio.get_running_loop()
+    profile, total_count = await loop.run_in_executor(
+        None,
+        lambda: (get_user_profile(db_conn, interaction.user.id),
+                 get_total_game_daily_count(db_conn, interaction.user.id)),
+    )
     err = _gambling_guard(profile, bet)
     if err:
-        await interaction.response.send_message(err, ephemeral=True)
+        await interaction.followup.send(err, ephemeral=True)
         return
 
-    daily_count = get_game_daily_count(db_conn, interaction.user.id, "roulette")
-    if daily_count >= _GAME_DAILY_LIMIT:
-        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, game="Roulette"
-        )
-        await interaction.response.send_message(msg, ephemeral=True)
+    if total_count >= _GAME_DAILY_LIMIT:
+        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(user=interaction.user.display_name, game="Roulette")
+        await interaction.followup.send(msg, ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
-    increment_game_daily_count(db_conn, interaction.user.id, "roulette")
+    await loop.run_in_executor(None, lambda: increment_game_daily_count(db_conn, interaction.user.id, "roulette"))
     update_boli_points(db_conn, interaction.user.id, -bet)
 
     await interaction.followup.send(
@@ -3731,22 +3846,24 @@ async def slots_slash(
     if not _feat("feature_gambling"):
         await interaction.response.send_message("Gambling is currently disabled.", ephemeral=True)
         return
-    profile = get_user_profile(db_conn, interaction.user.id)
+    await interaction.response.defer(thinking=True)
+    loop = asyncio.get_running_loop()
+    profile, total_count = await loop.run_in_executor(
+        None,
+        lambda: (get_user_profile(db_conn, interaction.user.id),
+                 get_total_game_daily_count(db_conn, interaction.user.id)),
+    )
     err = _gambling_guard(profile, bet)
     if err:
-        await interaction.response.send_message(err, ephemeral=True)
+        await interaction.followup.send(err, ephemeral=True)
         return
 
-    daily_count = get_game_daily_count(db_conn, interaction.user.id, "slots")
-    if daily_count >= _GAME_DAILY_LIMIT:
-        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(
-            user=interaction.user.display_name, game="Slots"
-        )
-        await interaction.response.send_message(msg, ephemeral=True)
+    if total_count >= _GAME_DAILY_LIMIT:
+        msg = random.choice(_OVER_QUOTA_GAME_MESSAGES).format(user=interaction.user.display_name, game="Slots")
+        await interaction.followup.send(msg, ephemeral=True)
         return
 
-    await interaction.response.defer(thinking=True)
-    increment_game_daily_count(db_conn, interaction.user.id, "slots")
+    await loop.run_in_executor(None, lambda: increment_game_daily_count(db_conn, interaction.user.id, "slots"))
     update_boli_points(db_conn, interaction.user.id, -bet)
     await asyncio.sleep(1.5)
 
@@ -3794,6 +3911,367 @@ async def slots_slash(
 
 
 # ---------------------------------------------------------------------------
+# /navi_challenge — Gemini-judged prediction game using local_knowledge keywords
+# ---------------------------------------------------------------------------
+
+class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your Cosmic Prediction"):
+    prediction = discord.ui.TextInput(
+        label="Your prediction (max 2 sentences, use all 3 keywords)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Write a Navi-style cosmic prediction using all 3 keywords…",
+        max_length=500,
+        required=True,
+    )
+
+    def __init__(
+        self,
+        keywords: list[dict],
+        start_time: datetime,
+        score_comment_cache: dict,
+    ) -> None:
+        super().__init__()
+        self.keywords = keywords
+        self.start_time = start_time
+        self.score_comment_cache = score_comment_cache
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+        if elapsed > 90:
+            await interaction.response.send_message(
+                "⏱️ Time's up! You had 90 seconds. Better luck next time.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        keyword_str = ", ".join(f"**{k['term']}**" for k in self.keywords)
+        user_prediction = self.prediction.value.strip()
+
+        system_prompt = (
+            "You are a strict but witty cosmic judge. Reply ONLY with valid JSON."
+        )
+        prompt = (
+            f"A user was given these 3 Trivandrum-themed keywords: {keyword_str}.\n"
+            f"Their 2-sentence cosmic Navi-style prediction is:\n\"{user_prediction}\"\n\n"
+            f"Judge on:\n"
+            f"1. Did they use all 3 keywords meaningfully? (40 pts)\n"
+            f"2. Is it creative and Navi-like in tone? (30 pts)\n"
+            f"3. Is the Manglish/Trivandrum vibe authentic? (30 pts)\n\n"
+            f"Reply ONLY with this JSON:\n"
+            f'{{\"score\": <0-100>, \"comment\": \"<one short funny sentence>\"}}'
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            _fallback = '{"score": 50, "comment": "The cosmos is unreachable right now."}'
+            raw, _ = await loop.run_in_executor(
+                None,
+                lambda: api_mgr.call(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    cache_type="navi_challenge",
+                    name=interaction.user.display_name,
+                    fallback_message=_fallback,
+                ),
+            )
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                score = max(0, min(100, int(data.get("score", 50))))
+                gemini_comment = data.get("comment", "The cosmos is unimpressed.")
+            else:
+                score = 50
+                gemini_comment = "Navi couldn't parse the cosmic data. Defaulting to 50."
+        except Exception as exc:
+            logger.error("Navi Challenge Gemini error: %s", exc)
+            score = 50
+            gemini_comment = "The cosmic judging system is temporarily offline."
+
+        # Try cached comment first, then save the new one
+        cached = get_score_comment(db_conn, "navi_challenge", score)
+        if cached and random.random() < 0.7:
+            display_comment = cached
+        else:
+            display_comment = gemini_comment
+            try:
+                save_score_comment(db_conn, "navi_challenge", score, gemini_comment)
+            except Exception:
+                pass
+
+        boli_award = score
+        xp_award = score // 2
+        update_boli_points(db_conn, interaction.user.id, boli_award)
+        add_experience(db_conn, interaction.user.id, xp_award)
+
+        color = discord.Color.green() if score >= 70 else (discord.Color.orange() if score >= 40 else discord.Color.red())
+        embed = discord.Embed(
+            title="🔮 Navi Challenge — Results",
+            color=color,
+        )
+        embed.add_field(name="Your Prediction", value=f"_{user_prediction}_", inline=False)
+        embed.add_field(name="Keywords Used", value=keyword_str, inline=False)
+        embed.add_field(
+            name="Score",
+            value=f"**{score}/100** → +🍮 **{boli_award} Boli** & +✨ **{xp_award} XP**",
+            inline=False,
+        )
+        embed.add_field(name="Navi's Verdict", value=f"_{display_comment}_", inline=False)
+        embed.set_footer(text=f"Judged by Gemini · Time taken: {int(elapsed)}s of 90s")
+        await interaction.followup.send(embed=embed)
+        logger.info(
+            "Navi Challenge: %s scored %d (keywords: %s)",
+            interaction.user.display_name, score, [k["term"] for k in self.keywords],
+        )
+
+
+@tree.command(name="navi_challenge", description="Navi Challenge — write a cosmic prediction using 3 random keywords (2 attempts/day)")
+async def navi_challenge_slash(interaction: discord.Interaction) -> None:
+    if not _feat("feature_navi_challenge"):
+        await interaction.response.send_message("Navi Challenge is currently disabled.", ephemeral=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    count, profile, keywords = await loop.run_in_executor(
+        None,
+        lambda: (
+            get_gemini_game_daily_count(db_conn, interaction.user.id, "navi_challenge"),
+            get_user_profile(db_conn, interaction.user.id),
+            get_random_knowledge_terms(db_conn, num_categories=3),
+        ),
+    )
+    if not profile:
+        await interaction.response.send_message("Use /navi first to get started.", ephemeral=True)
+        return
+    if count >= _GEMINI_GAME_DAILY_LIMIT:
+        await interaction.response.send_message(
+            "You've used both your **Navi Challenge** attempts for today. Come back after midnight IST!",
+            ephemeral=True,
+        )
+        return
+    if not keywords:
+        await interaction.response.send_message("Knowledge base is empty — contact the bot admin.", ephemeral=True)
+        return
+
+    await loop.run_in_executor(
+        None, lambda: increment_gemini_game_count(db_conn, interaction.user.id, "navi_challenge")
+    )
+
+    keyword_lines = "\n".join(
+        f"• **{k['term']}** *(_{k['category']}_)* — {k['description'][:70]}"
+        for k in keywords
+    )
+    start_time = datetime.now(timezone.utc)
+    modal = NaviChallengeModal(keywords=keywords, start_time=start_time, score_comment_cache={})
+
+    # send_modal is the only way to present modals — use it as the immediate response
+    await interaction.response.send_modal(modal)
+    # followup shows the keywords publicly in the channel
+    await interaction.followup.send(
+        f"🔮 **Navi Challenge for {interaction.user.mention}!**\n"
+        f"Write a **Navi-style cosmic prediction** (max 2 sentences) using all 3 keywords below.\n"
+        f"Modal is open — you have **90 seconds**. *(Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today)*\n\n"
+        f"{keyword_lines}",
+    )
+    logger.info(
+        "Navi Challenge started for %s (attempt %d, keywords: %s)",
+        interaction.user.display_name, count + 1, [k["term"] for k in keywords],
+    )
+
+
+# ---------------------------------------------------------------------------
+# /type_race — Gemini-judged Malayalam typing game
+# ---------------------------------------------------------------------------
+
+class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Type it in Malayalam!"):
+    answer = discord.ui.TextInput(
+        label="Type the sentence in Malayalam",
+        style=discord.TextStyle.paragraph,
+        placeholder="Type the Manglish sentence in Malayalam script here…",
+        max_length=400,
+        required=True,
+    )
+
+    def __init__(self, sentence: str, start_time: datetime) -> None:
+        super().__init__()
+        self.sentence = sentence
+        self.start_time = start_time
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+        if elapsed > 60:
+            await interaction.response.send_message(
+                "⏱️ Time's up! You had 60 seconds. Faster next time!", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        user_answer = self.answer.value.strip()
+        system_prompt = "You are a strict but funny language judge. Reply ONLY with valid JSON."
+        prompt = (
+            f"The user was shown this Manglish sentence:\n\"{self.sentence}\"\n\n"
+            f"They typed this in Malayalam script:\n\"{user_answer}\"\n\n"
+            f"Judge how accurately they typed the Malayalam equivalent (script accuracy, meaning, completeness).\n"
+            f"Score out of 100: exact match = 100, roughly right = 50-80, totally off = 0-30.\n"
+            f"Reply ONLY with this JSON:\n"
+            f'{{\"score\": <0-100>, \"comment\": \"<one short funny sentence about the attempt>\"}}'
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            _fallback = '{"score": 50, "comment": "Cosmic judges are on a chai break."}'
+            raw, _ = await loop.run_in_executor(
+                None,
+                lambda: api_mgr.call(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    cache_type="type_race",
+                    name=interaction.user.display_name,
+                    fallback_message=_fallback,
+                ),
+            )
+            json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group())
+                score = max(0, min(100, int(data.get("score", 50))))
+                gemini_comment = data.get("comment", "The cosmos cannot process this typing.")
+            else:
+                score = 50
+                gemini_comment = "The cosmic typesetter has crashed. 50 it is."
+        except Exception as exc:
+            logger.error("Type Race Gemini error: %s", exc)
+            score = 50
+            gemini_comment = "The cosmic judging system is offline."
+
+        cached = get_score_comment(db_conn, "type_race", score)
+        if cached and random.random() < 0.7:
+            display_comment = cached
+        else:
+            display_comment = gemini_comment
+            try:
+                save_score_comment(db_conn, "type_race", score, gemini_comment)
+            except Exception:
+                pass
+
+        boli_award = score
+        xp_award = score // 2
+        update_boli_points(db_conn, interaction.user.id, boli_award)
+        add_experience(db_conn, interaction.user.id, xp_award)
+
+        color = discord.Color.green() if score >= 70 else (discord.Color.orange() if score >= 40 else discord.Color.red())
+        embed = discord.Embed(title="⌨️ Type Race — Results", color=color)
+        embed.add_field(name="Original Sentence", value=f"_{self.sentence}_", inline=False)
+        embed.add_field(name="Your Answer", value=f"_{user_answer}_", inline=False)
+        embed.add_field(
+            name="Score",
+            value=f"**{score}/100** → +🍮 **{boli_award} Boli** & +✨ **{xp_award} XP**",
+            inline=False,
+        )
+        embed.add_field(name="Navi's Verdict", value=f"_{display_comment}_", inline=False)
+        embed.set_footer(text=f"Judged by Gemini · Time taken: {int(elapsed)}s of 60s")
+        await interaction.followup.send(embed=embed)
+        logger.info(
+            "Type Race: %s scored %d in %.0fs",
+            interaction.user.display_name, score, elapsed,
+        )
+
+
+class TypeRaceStartView(discord.ui.View):
+    """Button that opens the typing modal when clicked. Timer starts on click."""
+
+    def __init__(self, sentence: str, user_id: int) -> None:
+        super().__init__(timeout=120)
+        self.sentence = sentence
+        self.user_id = user_id
+        self._used = False
+
+    @discord.ui.button(label="Start Typing (60s timer starts now)", style=discord.ButtonStyle.danger, emoji="⌨️")
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your race!", ephemeral=True)
+            return
+        if self._used:
+            await interaction.response.send_message("You've already started this attempt.", ephemeral=True)
+            return
+        self._used = True
+        button.disabled = True
+        start_time = datetime.now(timezone.utc)
+        modal = TypeRaceModal(sentence=self.sentence, start_time=start_time)
+        await interaction.response.send_modal(modal)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        pass
+
+
+@tree.command(name="type_race", description="Type Race — type a Manglish sentence in Malayalam within 60 seconds (2 attempts/day)")
+async def type_race_slash(interaction: discord.Interaction) -> None:
+    if not _feat("feature_type_race"):
+        await interaction.response.send_message("Type Race is currently disabled.", ephemeral=True)
+        return
+
+    loop = asyncio.get_running_loop()
+    count, profile = await loop.run_in_executor(
+        None,
+        lambda: (
+            get_gemini_game_daily_count(db_conn, interaction.user.id, "type_race"),
+            get_user_profile(db_conn, interaction.user.id),
+        ),
+    )
+    if not profile:
+        await interaction.response.send_message("Use /navi first to get started.", ephemeral=True)
+        return
+    if count >= _GEMINI_GAME_DAILY_LIMIT:
+        await interaction.response.send_message(
+            "You've used both your **Type Race** attempts for today. Come back after midnight IST!",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True)
+
+    gen_system = "You are a Trivandrum local. Reply with ONLY the sentence, no quotes, nothing else."
+    gen_prompt = (
+        "Generate ONE funny, authentic Manglish sentence (mix of Malayalam and English) "
+        "with strong Trivandrum slang vibes. 10-20 words. Natural spoken style — "
+        "like something you'd hear at Thampanoor bus stand or Chalai Market."
+    )
+    try:
+        raw_sentence, _ = await loop.run_in_executor(
+            None,
+            lambda: api_mgr.call(
+                prompt=gen_prompt,
+                system_prompt=gen_system,
+                cache_type="type_race_sentence",
+                name=interaction.user.display_name,
+                fallback_message="Mone, oru chai kudikaan paisa illenkil bank-il poyi ATM-il nokkeda!",
+            ),
+        )
+        sentence = (raw_sentence or "").strip().strip('"').strip("'")
+        if not sentence or len(sentence) < 10:
+            raise ValueError("empty sentence")
+    except Exception as exc:
+        logger.error("Type Race sentence generation error: %s", exc)
+        sentence = "Mone, oru chai kudikaan paisa illenkil bank-il poyi ATM-il nokkeda, pinne kanaruthu!"
+
+    await loop.run_in_executor(
+        None, lambda: increment_gemini_game_count(db_conn, interaction.user.id, "type_race")
+    )
+
+    view = TypeRaceStartView(sentence=sentence, user_id=interaction.user.id)
+    await interaction.followup.send(
+        f"⌨️ **Type Race for {interaction.user.mention}!**\n"
+        f"Read the sentence carefully, then click the button to open the typing modal.\n"
+        f"**Your 60-second timer starts when you click the button.**\n\n"
+        f">>> {sentence}\n\n"
+        f"*(Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today)*",
+        view=view,
+    )
+    logger.info(
+        "Type Race started for %s (attempt %d, sentence len=%d)",
+        interaction.user.display_name, count + 1, len(sentence),
+    )
+
+
+# ---------------------------------------------------------------------------
 # /gift — send Boli points to another user
 # ---------------------------------------------------------------------------
 
@@ -3834,13 +4312,18 @@ async def gift_slash(
                 ephemeral=True,
             )
             return
-        # Try to resolve the Discord Member object from the user_id
+        # Resolve the Discord Member object — try cache first, then API fetch
         guild = interaction.guild
         if guild:
             actual_recipient = guild.get_member(random_pick["user_id"])
+            if actual_recipient is None:
+                try:
+                    actual_recipient = await guild.fetch_member(random_pick["user_id"])
+                except (discord.NotFound, discord.HTTPException):
+                    actual_recipient = None
         if actual_recipient is None:
             await interaction.response.send_message(
-                "Couldn't resolve the random user — try again or tag someone directly.",
+                "Couldn't resolve the random user — they may have left the server. Try again or tag someone directly.",
                 ephemeral=True,
             )
             return

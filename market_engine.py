@@ -48,9 +48,9 @@ _OPEN_METEO_URL = (
 )
 
 
-def _seeded_rng(item_id: str, for_date: date) -> random.Random:
-    """Return a deterministic RNG seeded from item_id + date."""
-    seed_str = f"{item_id}:{for_date.isoformat()}"
+def _seeded_rng(item_id: str, for_date: date, hour: int = 0) -> random.Random:
+    """Return a deterministic RNG seeded from item_id + date + hour for intraday variation."""
+    seed_str = f"{item_id}:{for_date.isoformat()}:{hour}"
     seed_int = int(hashlib.sha256(seed_str.encode()).hexdigest(), 16) % (2**32)
     return random.Random(seed_int)
 
@@ -61,13 +61,14 @@ def _compute_price(
     volatility: str,
     for_date: date,
     rain_mm: float = 0.0,
+    hour: int = 0,
 ) -> int:
-    """Compute today's price for an item using deterministic seeded RNG.
+    """Compute price for an item using deterministic seeded RNG (per item+date+hour).
 
-    The result is the same regardless of how many times it is called for the
-    same (item_id, date) pair — safe to call repeatedly.
+    Including hour in the seed gives intraday price movement while remaining
+    fully deterministic — safe to recompute without drift.
     """
-    rng = _seeded_rng(item_id, for_date)
+    rng = _seeded_rng(item_id, for_date, hour)
     lo, hi = _VOLATILITY_RANGE.get(volatility, (0.90, 1.10))
     multiplier = rng.uniform(lo, hi)
 
@@ -111,10 +112,11 @@ async def _fetch_rain_mm() -> float:
     return 0.0
 
 
-async def update_all_prices(conn: sqlite3.Connection) -> None:
+async def update_all_prices(conn: sqlite3.Connection, record_history: bool = True) -> None:
     """Recompute and persist prices for all market items.
 
-    Called once per day at midnight IST. Records price history for each item.
+    Called hourly. When record_history=True (midnight run), also writes to
+    market_price_history so the daily chart has one entry per day.
     """
     from schema import (
         get_market_items,
@@ -122,12 +124,15 @@ async def update_all_prices(conn: sqlite3.Connection) -> None:
         record_price_history,
     )
 
-    today = date.today()
-    date_str = today.isoformat()
+    _IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(_IST)
+    today = now_ist.date()
+    hour = now_ist.hour
+    datetime_str = now_ist.strftime('%Y-%m-%d %H:%M:%S')
 
     # Fetch rain data once for Monsoon Insurance
     rain_mm = await _fetch_rain_mm()
-    logger.info("Market price update: Trivandrum rain today = %.1f mm", rain_mm)
+    logger.info("Market price update (hour=%d): Trivandrum rain = %.1f mm", hour, rain_mm)
 
     items = get_market_items(conn)
     for item in items:
@@ -137,16 +142,18 @@ async def update_all_prices(conn: sqlite3.Connection) -> None:
             item["volatility"],
             today,
             rain_mm=rain_mm if item["item_id"] == "monsoon_insurance" else 0.0,
+            hour=hour,
         )
         update_market_price(conn, item["item_id"], new_price)
-        record_price_history(conn, item["item_id"], new_price, date_str)
+        if record_history:
+            record_price_history(conn, item["item_id"], new_price, datetime_str)
         logger.info(
             "Market: %s — %d → %d (%.1f%%)",
             item["item_id"], item["current_price"], new_price,
             100 * (new_price - item["current_price"]) / max(item["current_price"], 1),
         )
 
-    logger.info("Market price update complete (%d items).", len(items))
+    logger.info("Market price update complete (%d items, history=%s).", len(items), record_history)
 
 
 def get_trend_arrow(current_price: int, base_price: int) -> str:

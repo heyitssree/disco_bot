@@ -266,6 +266,32 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         )
     """)
 
+    # Gemini-powered mini-games (2 attempts per user per day each)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS navi_challenge_attempts (
+            user_id    INTEGER NOT NULL,
+            play_date  DATE NOT NULL,
+            play_count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, play_date)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS type_race_attempts (
+            user_id    INTEGER NOT NULL,
+            play_date  DATE NOT NULL,
+            play_count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, play_date)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gemini_score_comments (
+            id           INTEGER PRIMARY KEY,
+            game_type    TEXT NOT NULL,
+            score_bucket INTEGER NOT NULL,
+            comment      TEXT NOT NULL
+        )
+    """)
+
     # Analytics tables
     conn.execute("""
         CREATE TABLE IF NOT EXISTS command_events (
@@ -339,6 +365,7 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         "feature_kochi_replies", "feature_curse_replies", "feature_boli_points",
         "feature_welcome", "feature_navi", "feature_vibe_check", "feature_kanmanilla",
         "feature_audit", "feature_mod_tldr", "feature_link_summary", "feature_strikes",
+        "feature_navi_challenge", "feature_type_race",
     ):
         conn.execute(f"""
             INSERT INTO bot_config (key, value_int)
@@ -1160,10 +1187,10 @@ def increment_daily_refill_count(conn: sqlite3.Connection, user_id: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Per-game daily play quota (5 plays per game per day, independent per game)
+# Per-game daily play quota (30 combined plays across all games per day)
 # ---------------------------------------------------------------------------
 
-_GAME_DAILY_LIMIT = 5
+_GAME_DAILY_LIMIT = 30
 
 
 def get_game_daily_count(conn: sqlite3.Connection, user_id: int, game_name: str) -> int:
@@ -1172,6 +1199,16 @@ def get_game_daily_count(conn: sqlite3.Connection, user_id: int, game_name: str)
     row = conn.execute(
         "SELECT play_count FROM game_daily_counts WHERE user_id = ? AND game_name = ? AND play_date = ?",
         [user_id, game_name, today],
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_total_game_daily_count(conn: sqlite3.Connection, user_id: int) -> int:
+    """Return total plays across ALL games today (IST). Used for the combined 30/day limit."""
+    today = _today_ist()
+    row = conn.execute(
+        "SELECT COALESCE(SUM(play_count), 0) FROM game_daily_counts WHERE user_id = ? AND play_date = ?",
+        [user_id, today],
     ).fetchone()
     return int(row[0]) if row else 0
 
@@ -1196,6 +1233,83 @@ def increment_game_daily_count(conn: sqlite3.Connection, user_id: int, game_name
         [user_id, game_name, today],
     ).fetchone()
     return int(row[0]) if row else 1
+
+
+# ---------------------------------------------------------------------------
+# Gemini mini-games (navi_challenge, type_race) — 2 attempts per user per day
+# ---------------------------------------------------------------------------
+
+_GEMINI_GAME_DAILY_LIMIT = 2
+
+
+def get_gemini_game_daily_count(conn: sqlite3.Connection, user_id: int, game_name: str) -> int:
+    """Return today's attempt count for navi_challenge or type_race."""
+    table = "navi_challenge_attempts" if game_name == "navi_challenge" else "type_race_attempts"
+    today = _today_ist()
+    row = conn.execute(
+        f"SELECT play_count FROM {table} WHERE user_id = ? AND play_date = ?",
+        [user_id, today],
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def increment_gemini_game_count(conn: sqlite3.Connection, user_id: int, game_name: str) -> int:
+    """Increment attempt count. Returns new count."""
+    table = "navi_challenge_attempts" if game_name == "navi_challenge" else "type_race_attempts"
+    today = _today_ist()
+    _db_write(lambda: (
+        conn.execute(
+            f"INSERT INTO {table} (user_id, play_date, play_count) VALUES (?, ?, 1) "
+            f"ON CONFLICT (user_id, play_date) DO UPDATE SET play_count = play_count + 1",
+            [user_id, today],
+        ),
+        conn.commit(),
+    ))
+    row = conn.execute(
+        f"SELECT play_count FROM {table} WHERE user_id = ? AND play_date = ?",
+        [user_id, today],
+    ).fetchone()
+    return int(row[0]) if row else 1
+
+
+def get_score_comment(conn: sqlite3.Connection, game_type: str, score: int) -> str | None:
+    """Return a cached funny comment for the given score bucket, or None if uncached."""
+    bucket = min(score // 10, 9)
+    rows = conn.execute(
+        "SELECT comment FROM gemini_score_comments WHERE game_type = ? AND score_bucket = ?",
+        [game_type, bucket],
+    ).fetchall()
+    return random.choice(rows)[0] if rows else None
+
+
+def save_score_comment(conn: sqlite3.Connection, game_type: str, score: int, comment: str) -> None:
+    """Cache a funny Gemini-generated score comment for future reuse."""
+    bucket = min(score // 10, 9)
+    _db_write(lambda: (
+        conn.execute(
+            "INSERT INTO gemini_score_comments (game_type, score_bucket, comment) VALUES (?, ?, ?)",
+            [game_type, bucket, comment],
+        ),
+        conn.commit(),
+    ))
+
+
+def get_random_knowledge_terms(conn: sqlite3.Connection, num_categories: int = 3) -> list[dict]:
+    """Return one random term per randomly-selected category for Navi Challenge."""
+    cats = conn.execute("SELECT DISTINCT category FROM local_knowledge").fetchall()
+    cat_list = [r[0] for r in cats]
+    if not cat_list:
+        return []
+    selected_cats = random.sample(cat_list, min(num_categories, len(cat_list)))
+    results = []
+    for cat in selected_cats:
+        rows = conn.execute(
+            "SELECT term, description FROM local_knowledge WHERE category = ? ORDER BY RANDOM() LIMIT 1",
+            [cat],
+        ).fetchall()
+        if rows:
+            results.append({"category": cat, "term": rows[0][0], "description": rows[0][1]})
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1978,13 +2092,15 @@ def buy_holding(
     expires_at: datetime,
 ) -> None:
     """Add a new holding row for a user purchase."""
+    # Store as UTC without timezone offset so SQLite CURRENT_TIMESTAMP comparisons work correctly
+    expires_str = expires_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     def _write() -> None:
         conn.execute(
             """
             INSERT INTO user_holdings (user_id, item_id, quantity, purchase_price, expires_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            [user_id, item_id, quantity, purchase_price, expires_at.isoformat()],
+            [user_id, item_id, quantity, purchase_price, expires_str],
         )
         conn.commit()
     _db_write(_write)

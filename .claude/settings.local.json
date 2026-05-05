@@ -3,7 +3,14 @@
     "allow": [
       "Bash(Get-ChildItem -Recurse -Filter \"*.py\")",
       "Bash(Sort-Object FullName)",
-      "Bash(awk '{print $NF}')"
+      "Bash(awk '{print $NF}')",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\Sree\\\\Documents\\\\GitHub\\\\disco_bot\" -Recurse -Directory)",
+      "Bash(Sort-Object)",
+      "Bash(python -c \"import ast, sys; ast.parse\\(open\\('schema.py'\\).read\\(\\)\\); print\\('schema.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('schema.py', encoding='utf-8'\\).read\\(\\)\\); print\\('schema.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('market_engine.py', encoding='utf-8'\\).read\\(\\)\\); print\\('market_engine.py OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('schema.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('market_engine.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('bot.py', encoding='utf-8'\\).read\\(\\)\\); print\\('All files OK'\\)\")"
     ]
   }
 }
