@@ -3915,14 +3915,6 @@ async def slots_slash(
 # ---------------------------------------------------------------------------
 
 class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your Cosmic Prediction"):
-    prediction = discord.ui.TextInput(
-        label="Your prediction (max 2 sentences, use all 3 keywords)",
-        style=discord.TextStyle.paragraph,
-        placeholder="Write a Navi-style cosmic prediction using all 3 keywords…",
-        max_length=500,
-        required=True,
-    )
-
     def __init__(
         self,
         keywords: list[dict],
@@ -3933,6 +3925,17 @@ class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your C
         self.keywords = keywords
         self.start_time = start_time
         self.score_comment_cache = score_comment_cache
+        # Show keywords in placeholder so user can read them while the modal overlay is open
+        kw_hint = " · ".join(k["term"] for k in keywords)
+        kw_hint = kw_hint if len(kw_hint) <= 97 else kw_hint[:97] + "…"
+        self.prediction = discord.ui.TextInput(
+            label="Your prediction (use all 3 keywords)",
+            style=discord.TextStyle.paragraph,
+            placeholder=kw_hint,
+            max_length=500,
+            required=True,
+        )
+        self.add_item(self.prediction)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
@@ -4065,12 +4068,21 @@ async def navi_challenge_slash(interaction: discord.Interaction) -> None:
     # send_modal is the only way to present modals — use it as the immediate response
     await interaction.response.send_modal(modal)
     # followup shows the keywords publicly in the channel
-    await interaction.followup.send(
+    kw_content = (
         f"🔮 **Navi Challenge for {interaction.user.mention}!**\n"
         f"Write a **Navi-style cosmic prediction** (max 2 sentences) using all 3 keywords below.\n"
         f"Modal is open — you have **90 seconds**. *(Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today)*\n\n"
-        f"{keyword_lines}",
+        f"{keyword_lines}"
     )
+    kw_msg = await interaction.followup.send(kw_content)
+    # Edit the keywords message after 91s to signal the window has closed
+    async def _navi_timeout_edit() -> None:
+        await asyncio.sleep(92)
+        try:
+            await kw_msg.edit(content=kw_content + "\n\n⏰ *90-second window has closed.*")
+        except Exception:
+            pass
+    asyncio.create_task(_navi_timeout_edit())
     logger.info(
         "Navi Challenge started for %s (attempt %d, keywords: %s)",
         interaction.user.display_name, count + 1, [k["term"] for k in keywords],
@@ -4082,18 +4094,21 @@ async def navi_challenge_slash(interaction: discord.Interaction) -> None:
 # ---------------------------------------------------------------------------
 
 class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Type it in Malayalam!"):
-    answer = discord.ui.TextInput(
-        label="Type the sentence in Malayalam",
-        style=discord.TextStyle.paragraph,
-        placeholder="Type the Manglish sentence in Malayalam script here…",
-        max_length=400,
-        required=True,
-    )
-
-    def __init__(self, sentence: str, start_time: datetime) -> None:
+    def __init__(self, sentence: str, start_time: datetime, view: "TypeRaceStartView") -> None:
         super().__init__()
         self.sentence = sentence
         self.start_time = start_time
+        self._view = view
+        # Sentence as placeholder so user can read it while the modal overlay is open
+        placeholder = sentence if len(sentence) <= 97 else sentence[:97] + "…"
+        self.answer = discord.ui.TextInput(
+            label="Type the sentence in Malayalam script",
+            style=discord.TextStyle.paragraph,
+            placeholder=placeholder,
+            max_length=400,
+            required=True,
+        )
+        self.add_item(self.answer)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         elapsed = (datetime.now(timezone.utc) - self.start_time).total_seconds()
@@ -4104,6 +4119,7 @@ class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Type it in Mal
             return
 
         await interaction.response.defer(thinking=True)
+        self._view._modal_submitted = True  # cancel the 62s timeout-edit task
 
         user_answer = self.answer.value.strip()
         system_prompt = "You are a strict but funny language judge. Reply ONLY with valid JSON."
@@ -4182,6 +4198,9 @@ class TypeRaceStartView(discord.ui.View):
         self.sentence = sentence
         self.user_id = user_id
         self._used = False
+        self.message: discord.Message | None = None
+        self._modal_submitted = False
+        self._timeout_task: asyncio.Task | None = None
 
     @discord.ui.button(label="Start Typing (60s timer starts now)", style=discord.ButtonStyle.danger, emoji="⌨️")
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -4192,14 +4211,58 @@ class TypeRaceStartView(discord.ui.View):
             await interaction.response.send_message("You've already started this attempt.", ephemeral=True)
             return
         self._used = True
-        button.disabled = True
         start_time = datetime.now(timezone.utc)
-        modal = TypeRaceModal(sentence=self.sentence, start_time=start_time)
+        modal = TypeRaceModal(sentence=self.sentence, start_time=start_time, view=self)
         await interaction.response.send_modal(modal)
+        # Keep sentence visible in the message while modal overlay is open
+        button.disabled = True
+        button.label = "⏱️ Timer running…"
+        try:
+            await interaction.message.edit(
+                content=(
+                    f"⌨️ **Type Race — ⏱️ Timer running! (60 seconds)**\n"
+                    f"**Sentence to type in Malayalam:**\n"
+                    f">>> {self.sentence}"
+                ),
+                view=self,
+            )
+        except Exception:
+            pass
+        # Background task: mark time's-up on the message if modal is not submitted in time
+        self._timeout_task = asyncio.create_task(self._race_timeout())
         self.stop()
 
+    async def _race_timeout(self) -> None:
+        await asyncio.sleep(62)
+        if self._modal_submitted:
+            return
+        if self.message:
+            try:
+                await self.message.edit(
+                    content=(
+                        f"⌨️ **Type Race — ⏰ Time's Up!**\n"
+                        f"*The 60-second window has closed. Late submissions will be rejected.*\n\n"
+                        f">>> ~~{self.sentence}~~"
+                    ),
+                )
+            except Exception:
+                pass
+
     async def on_timeout(self) -> None:
-        pass
+        # Fires after 120s if the user never clicked the button
+        if self.message:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self.message.edit(
+                    content=(
+                        f"⌨️ **Type Race — Attempt Expired**\n"
+                        f"*This attempt window has closed. Run `/type_race` again.*"
+                    ),
+                    view=self,
+                )
+            except Exception:
+                pass
 
 
 @tree.command(name="type_race", description="Type Race — type a Manglish sentence in Malayalam within 60 seconds (2 attempts/day)")
@@ -4257,7 +4320,7 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
     )
 
     view = TypeRaceStartView(sentence=sentence, user_id=interaction.user.id)
-    await interaction.followup.send(
+    msg = await interaction.followup.send(
         f"⌨️ **Type Race for {interaction.user.mention}!**\n"
         f"Read the sentence carefully, then click the button to open the typing modal.\n"
         f"**Your 60-second timer starts when you click the button.**\n\n"
@@ -4265,6 +4328,7 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
         f"*(Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today)*",
         view=view,
     )
+    view.message = msg
     logger.info(
         "Type Race started for %s (attempt %d, sentence len=%d)",
         interaction.user.display_name, count + 1, len(sentence),
