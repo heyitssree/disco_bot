@@ -4231,7 +4231,7 @@ class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Malayalam or M
         self._view = view
         placeholder = sentence if len(sentence) <= 97 else sentence[:97] + "…"
         self.answer = discord.ui.TextInput(
-            label="Malayalam script (≤100) or Manglish slang (≤50)",
+            label="Malayalam (max 100) or Manglish (max 50)",
             style=discord.TextStyle.paragraph,
             placeholder=placeholder,
             max_length=400,
