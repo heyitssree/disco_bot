@@ -123,6 +123,7 @@ from schema import (
     get_movie_dialogue_count,
     get_random_movie_dialogue,
     save_movie_dialogue,
+    dialogue_exists,
 )
 from market_engine import update_all_prices, get_trend_arrow
 from api_server import run_api_server
@@ -4516,34 +4517,45 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
             sentence = "Why so serious? Let's put a smile on that face."
         logger.info("Type Race: using cached dialogue (%d in cache)", dialogue_count)
     else:
-        genre = random.choice(_DIALOGUE_GENRES)
         gen_system = "You are a movie buff. Reply with ONLY the dialogue line, no movie title, no speaker name, no quotes, nothing else. Never include foul or abusive language."
-        gen_prompt = (
-            f"Pick ONE iconic, funny, or dramatically memorable line specifically from {genre}. "
-            f"It must be a line a Trivandrum crowd would recognise or find hilarious to translate into Malayalam. "
-            f"The line must be clean (no profanity), in plain English, 8-20 words, and stand alone without needing context. "
-            f"Do NOT pick the most obvious or overused line — surprise us. "
-            f"Output ONLY the dialogue line itself."
-        )
-        try:
-            # Call gemini_svc directly — we handle our own dialogue cache via movie_dialogues,
-            # so we don't want api_mgr's predictions_cache returning the same line repeatedly.
-            raw_sentence = await loop.run_in_executor(
-                None,
-                lambda: gemini_svc.call(gen_prompt, gen_system),
-            )
-            sentence = (raw_sentence or "").strip().strip('"').strip("'")
-            if not sentence or len(sentence) < 8:
-                raise ValueError("empty or too short")
-            # Save to cache (UNIQUE constraint silently drops duplicates)
-            await loop.run_in_executor(None, lambda: save_movie_dialogue(db_conn, sentence))
-            logger.info("Type Race: new dialogue cached (%d → %d, genre: %s)", dialogue_count, dialogue_count + 1, genre)
-        except Exception as exc:
-            logger.error("Type Race sentence generation error: %s", exc)
-            # Fall back to any existing cached dialogue, then hardcoded last resort
+        sentence = None
+        for attempt in range(3):
+            try:
+                attempt_genre = random.choice(_DIALOGUE_GENRES)
+                attempt_prompt = (
+                    f"Pick ONE iconic, funny, or dramatically memorable line specifically from {attempt_genre}. "
+                    f"It must be a line a Trivandrum crowd would recognise or find hilarious to translate into Malayalam. "
+                    f"The line must be clean (no profanity), in plain English, 8-20 words, and stand alone without needing context. "
+                    f"Do NOT pick the most obvious or overused line — surprise us. "
+                    f"Output ONLY the dialogue line itself."
+                )
+                raw_sentence = await loop.run_in_executor(
+                    None,
+                    lambda: gemini_svc.call(attempt_prompt, gen_system),
+                )
+                candidate = (raw_sentence or "").strip().strip('"').strip("'")
+                if not candidate or len(candidate) < 8:
+                    logger.warning("Type Race: attempt %d returned empty sentence, retrying", attempt + 1)
+                    continue
+                is_dupe = await loop.run_in_executor(None, lambda: dialogue_exists(db_conn, candidate))
+                if is_dupe:
+                    logger.info("Type Race: attempt %d duplicate (%r), retrying", attempt + 1, candidate[:50])
+                    continue
+                # Unique — save and use it
+                await loop.run_in_executor(None, lambda: save_movie_dialogue(db_conn, candidate))
+                sentence = candidate
+                logger.info("Type Race: new dialogue cached after %d attempt(s) (%d → %d, genre: %s)",
+                            attempt + 1, dialogue_count, dialogue_count + 1, attempt_genre)
+                break
+            except Exception as exc:
+                logger.error("Type Race sentence generation attempt %d error: %s", attempt + 1, exc)
+
+        if not sentence:
+            # All attempts failed or were duplicates — fall back to cache, then hardcoded
             sentence = await loop.run_in_executor(None, lambda: get_random_movie_dialogue(db_conn))
             if not sentence:
                 sentence = "Why so serious? Let's put a smile on that face."
+            logger.info("Type Race: fell back to cached/hardcoded dialogue after 3 attempts")
 
     if not testing:
         await loop.run_in_executor(

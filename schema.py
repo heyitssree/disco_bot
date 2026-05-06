@@ -1364,6 +1364,14 @@ def get_random_movie_dialogue(conn: sqlite3.Connection) -> str | None:
     return row[0] if row else None
 
 
+def dialogue_exists(conn: sqlite3.Connection, dialogue: str) -> bool:
+    """Return True if this exact dialogue is already cached."""
+    row = conn.execute(
+        "SELECT 1 FROM movie_dialogues WHERE dialogue = ? LIMIT 1", [dialogue]
+    ).fetchone()
+    return row is not None
+
+
 def save_movie_dialogue(conn: sqlite3.Connection, dialogue: str) -> None:
     """Insert a new dialogue, silently ignore if it already exists (UNIQUE constraint)."""
     _db_write(lambda: (
