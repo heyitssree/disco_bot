@@ -388,22 +388,24 @@ _seen_users: set[int] = set()
 # ---------------------------------------------------------------------------
 
 _FEATURE_DEFAULTS: dict[str, int] = {
-    "master_killswitch":    0,
-    "feature_navi":         1,
-    "feature_curses":       1,
-    "feature_gambling":     1,
-    "feature_local_media":  1,
-    "feature_boli_points":  1,
-    "feature_kochi_replies": 1,
-    "feature_curse_replies": 1,
-    "feature_vibe_check":   1,
-    "feature_link_summary": 1,
-    "feature_kanmanilla":   1,
-    "feature_welcome":      1,
-    "feature_temp_vc":      1,
-    "feature_audit":        1,
-    "feature_mod_tldr":     1,
-    "feature_strikes":      1,
+    "master_killswitch":       0,
+    "feature_navi":            1,
+    "feature_curses":          1,
+    "feature_gambling":        1,
+    "feature_local_media":     1,
+    "feature_boli_points":     1,
+    "feature_kochi_replies":   1,
+    "feature_curse_replies":   1,
+    "feature_vibe_check":      1,
+    "feature_link_summary":    1,
+    "feature_kanmanilla":      1,
+    "feature_welcome":         1,
+    "feature_temp_vc":         1,
+    "feature_audit":           1,
+    "feature_mod_tldr":        1,
+    "feature_strikes":         1,
+    "feature_navi_challenge":  1,
+    "feature_type_race":       1,
 }
 
 # Populated in on_ready() after db_conn is available
@@ -3063,6 +3065,8 @@ class AdminGroup(app_commands.Group):
         app_commands.Choice(name="Mod Audit (/audit)", value="feature_audit"),
         app_commands.Choice(name="Mod TL;DR (/mod_tldr)", value="feature_mod_tldr"),
         app_commands.Choice(name="3-Strike System", value="feature_strikes"),
+        app_commands.Choice(name="Navi Challenge (/navi_challenge)", value="feature_navi_challenge"),
+        app_commands.Choice(name="Type Race (/type_race)", value="feature_type_race"),
     ])
     async def toggle_feature(
         self, interaction: discord.Interaction,
