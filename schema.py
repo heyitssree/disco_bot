@@ -297,6 +297,12 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             guild_id INTEGER PRIMARY KEY
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS movie_dialogues (
+            id       INTEGER PRIMARY KEY,
+            dialogue TEXT NOT NULL UNIQUE
+        )
+    """)
 
     # Analytics tables
     conn.execute("""
@@ -1346,6 +1352,24 @@ def set_testing_guild(conn: sqlite3.Connection, guild_id: int, enabled: bool) ->
             conn.execute("DELETE FROM testing_guilds WHERE guild_id = ?", [guild_id]),
             conn.commit(),
         ))
+
+
+def get_movie_dialogue_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(*) FROM movie_dialogues").fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_random_movie_dialogue(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT dialogue FROM movie_dialogues ORDER BY RANDOM() LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def save_movie_dialogue(conn: sqlite3.Connection, dialogue: str) -> None:
+    """Insert a new dialogue, silently ignore if it already exists (UNIQUE constraint)."""
+    _db_write(lambda: (
+        conn.execute("INSERT OR IGNORE INTO movie_dialogues (dialogue) VALUES (?)", [dialogue]),
+        conn.commit(),
+    ))
 
 
 def reset_gambling_count(conn: sqlite3.Connection, user_id: int) -> None:

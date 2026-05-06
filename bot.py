@@ -120,6 +120,9 @@ from schema import (
     reset_gambling_count,
     get_testing_guilds,
     set_testing_guild,
+    get_movie_dialogue_count,
+    get_random_movie_dialogue,
+    save_movie_dialogue,
 )
 from market_engine import update_all_prices, get_trend_arrow
 from api_server import run_api_server
@@ -4243,6 +4246,19 @@ class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Malayalam or M
         await interaction.response.defer(thinking=True)
         self._view._modal_submitted = True  # cancel the 62s timeout-edit task
 
+        try:
+            await self._judge_and_respond(interaction, elapsed)
+        except Exception as exc:
+            logger.error("Type Race on_submit unhandled error: %s", exc, exc_info=True)
+            try:
+                await interaction.followup.send(
+                    "Something went wrong judging your answer. This attempt has not been counted.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+
+    async def _judge_and_respond(self, interaction: discord.Interaction, elapsed: float) -> None:
         user_answer = self.answer.value.strip()
         is_malayalam = _is_malayalam_script(user_answer)
 
@@ -4470,32 +4486,47 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer(thinking=True)
 
-    gen_system = "You are a movie buff. Reply with ONLY the dialogue line, no movie title, no speaker name, no quotes, nothing else. Never include foul or abusive language."
-    gen_prompt = (
-        "Pick ONE iconic, funny, or dramatically memorable line from a well-known English movie — "
-        "something a Trivandrum crowd would instantly recognise or find hilarious to translate. "
-        "Examples of the kind of lines to draw from: motivational one-liners, villain monologues, comic exchanges, "
-        "classic catchphrases (e.g. from action films, animated films, comedies, sci-fi blockbusters). "
-        "The line should be clean (no profanity), in plain English, 8-20 words, and stand alone without needing context. "
-        "Output ONLY the dialogue line itself."
-    )
-    try:
-        raw_sentence, _ = await loop.run_in_executor(
-            None,
-            lambda: api_mgr.call(
-                prompt=gen_prompt,
-                system_prompt=gen_system,
-                cache_type="type_race_sentence",
-                name=interaction.user.display_name,
-                fallback_message="Why so serious? Let's put a smile on that face.",
-            ),
+    _DIALOGUE_CACHE_LIMIT = 300
+    dialogue_count = await loop.run_in_executor(None, lambda: get_movie_dialogue_count(db_conn))
+
+    if dialogue_count >= _DIALOGUE_CACHE_LIMIT:
+        # Cache is full — use it exclusively, no API call needed
+        sentence = await loop.run_in_executor(None, lambda: get_random_movie_dialogue(db_conn))
+        if not sentence:
+            sentence = "Why so serious? Let's put a smile on that face."
+        logger.info("Type Race: using cached dialogue (%d in cache)", dialogue_count)
+    else:
+        gen_system = "You are a movie buff. Reply with ONLY the dialogue line, no movie title, no speaker name, no quotes, nothing else. Never include foul or abusive language."
+        gen_prompt = (
+            "Pick ONE iconic, funny, or dramatically memorable line from a well-known English movie — "
+            "something a Trivandrum crowd would instantly recognise or find hilarious to translate. "
+            "Examples of the kind of lines to draw from: motivational one-liners, villain monologues, comic exchanges, "
+            "classic catchphrases (e.g. from action films, animated films, comedies, sci-fi blockbusters). "
+            "The line should be clean (no profanity), in plain English, 8-20 words, and stand alone without needing context. "
+            "Output ONLY the dialogue line itself."
         )
-        sentence = (raw_sentence or "").strip().strip('"').strip("'")
-        if not sentence or len(sentence) < 8:
-            raise ValueError("empty sentence")
-    except Exception as exc:
-        logger.error("Type Race sentence generation error: %s", exc)
-        sentence = "Why so serious? Let's put a smile on that face."
+        try:
+            raw_sentence, _ = await loop.run_in_executor(
+                None,
+                lambda: api_mgr.call(
+                    prompt=gen_prompt,
+                    system_prompt=gen_system,
+                    cache_type="type_race_sentence",
+                    name=interaction.user.display_name,
+                    fallback_message="Why so serious? Let's put a smile on that face.",
+                ),
+            )
+            sentence = (raw_sentence or "").strip().strip('"').strip("'")
+            if not sentence or len(sentence) < 8:
+                raise ValueError("empty sentence")
+            # Save to cache (UNIQUE constraint silently drops duplicates)
+            await loop.run_in_executor(None, lambda: save_movie_dialogue(db_conn, sentence))
+            logger.info("Type Race: new dialogue cached (%d → %d)", dialogue_count, dialogue_count + 1)
+        except Exception as exc:
+            logger.error("Type Race sentence generation error: %s", exc)
+            sentence = await loop.run_in_executor(None, lambda: get_random_movie_dialogue(db_conn))
+            if not sentence:
+                sentence = "Why so serious? Let's put a smile on that face."
 
     if not testing:
         await loop.run_in_executor(
