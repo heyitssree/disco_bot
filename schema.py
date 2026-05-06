@@ -292,6 +292,11 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             comment      TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS testing_guilds (
+            guild_id INTEGER PRIMARY KEY
+        )
+    """)
 
     # Analytics tables
     conn.execute("""
@@ -1321,6 +1326,26 @@ def reset_gemini_game_count(conn: sqlite3.Connection, user_id: int, game_name: s
         conn.execute(f"DELETE FROM {table} WHERE user_id = ? AND play_date = ?", [user_id, today]),
         conn.commit(),
     ))
+
+
+def get_testing_guilds(conn: sqlite3.Connection) -> set[int]:
+    """Return the set of guild IDs with testing mode enabled."""
+    rows = conn.execute("SELECT guild_id FROM testing_guilds").fetchall()
+    return {int(r[0]) for r in rows}
+
+
+def set_testing_guild(conn: sqlite3.Connection, guild_id: int, enabled: bool) -> None:
+    """Enable or disable testing mode for a guild."""
+    if enabled:
+        _db_write(lambda: (
+            conn.execute("INSERT OR IGNORE INTO testing_guilds (guild_id) VALUES (?)", [guild_id]),
+            conn.commit(),
+        ))
+    else:
+        _db_write(lambda: (
+            conn.execute("DELETE FROM testing_guilds WHERE guild_id = ?", [guild_id]),
+            conn.commit(),
+        ))
 
 
 def reset_gambling_count(conn: sqlite3.Connection, user_id: int) -> None:

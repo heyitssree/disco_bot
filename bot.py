@@ -118,6 +118,8 @@ from schema import (
     _GEMINI_GAME_DAILY_LIMIT,
     reset_gemini_game_count,
     reset_gambling_count,
+    get_testing_guilds,
+    set_testing_guild,
 )
 from market_engine import update_all_prices, get_trend_arrow
 from api_server import run_api_server
@@ -412,6 +414,14 @@ _user_level_cache: dict[int, int] = {}
 def _feat(key: str) -> bool:
     """Return True if the feature is enabled in the in-memory cache."""
     return bool(_feature_cache.get(key, _FEATURE_DEFAULTS.get(key, 1)))
+
+
+# In-memory set of guild IDs with testing mode active (no rate limits, no rewards)
+_testing_guild_ids: set[int] = set()
+
+
+def _is_testing_guild(guild_id: int | None) -> bool:
+    return guild_id is not None and guild_id in _testing_guild_ids
 
 
 def _load_feature_cache() -> None:
@@ -1342,6 +1352,10 @@ async def on_ready() -> None:
 
     # Load feature toggles into memory cache
     _load_feature_cache()
+
+    # Load testing guild IDs into memory cache
+    _testing_guild_ids.update(get_testing_guilds(db_conn))
+    logger.info("Testing guilds loaded: %s", _testing_guild_ids)
 
     # Load local slang dictionary and response templates into memory
     load_slang_data()
@@ -2890,8 +2904,8 @@ async def help_slash(interaction: discord.Interaction) -> None:
         )
     if _feat("feature_type_race"):
         gemini_game_lines.append(
-            "`/type_race` — Gemini generates a Manglish sentence; type it **in Malayalam** within 60 seconds. "
-            "Score → Boli + XP. **2 attempts/day.**"
+            "`/type_race` — Gemini gives you an iconic **movie dialogue**; translate it into Malayalam script (0–100) "
+            "or Trivandrum Manglish slang (max 50) within 60 seconds. Gemini scores strictly → Boli + XP. **2 attempts/day.**"
         )
     if gemini_game_lines:
         embed.add_field(
@@ -3057,6 +3071,38 @@ class AdminGroup(app_commands.Group):
         state = "ENABLED ✅" if enabled else "DISABLED ❌"
         await interaction.response.send_message(
             f"**{label}** is now **{state}**.", ephemeral=True
+        )
+
+    @app_commands.command(name="testing", description="Toggle testing mode for this server — bypasses rate limits, disables Boli/XP rewards")
+    async def testing_cmd(self, interaction: discord.Interaction) -> None:
+        guild_id = interaction.guild_id
+        if guild_id is None:
+            await interaction.response.send_message("Must be used inside a server.", ephemeral=True)
+            return
+        currently_on = guild_id in _testing_guild_ids
+        new_state = not currently_on
+        set_testing_guild(db_conn, guild_id, new_state)
+        if new_state:
+            _testing_guild_ids.add(guild_id)
+        else:
+            _testing_guild_ids.discard(guild_id)
+        guild_name = interaction.guild.name if interaction.guild else str(guild_id)
+        if new_state:
+            await interaction.response.send_message(
+                f"🧪 **Testing mode ON** for **{guild_name}**.\n"
+                f"Rate limits are suspended for `/type_race` and `/navi_challenge`. "
+                f"No Boli or XP will be awarded while this is active.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"✅ **Testing mode OFF** for **{guild_name}**.\n"
+                f"Normal rate limits and rewards are restored.",
+                ephemeral=True,
+            )
+        logger.info(
+            "Testing mode %s for guild %s (%d) by %s",
+            "ON" if new_state else "OFF", guild_name, guild_id, interaction.user.display_name,
         )
 
     @app_commands.command(name="set_chance", description="Set the probability (0.0–1.0) for a specific behaviour")
@@ -3998,17 +4044,24 @@ class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your C
         user_prediction = self.prediction.value.strip()
 
         system_prompt = (
-            "You are a strict but witty cosmic judge. Reply ONLY with valid JSON."
+            "You are a harsh, witty cosmic judge. Reply ONLY with valid JSON. Be strict — most attempts deserve 30-60. Reserve high scores for genuinely impressive predictions."
         )
         prompt = (
             f"A user was given these 3 Trivandrum-themed keywords: {keyword_str}.\n"
             f"Their 2-sentence cosmic Navi-style prediction is:\n\"{user_prediction}\"\n\n"
-            f"Judge on:\n"
-            f"1. Did they use all 3 keywords meaningfully? (40 pts)\n"
-            f"2. Is it creative and Navi-like in tone? (30 pts)\n"
-            f"3. Is the Manglish/Trivandrum vibe authentic? (30 pts)\n\n"
-            f"Reply ONLY with this JSON:\n"
-            f'{{\"score\": <0-100>, \"comment\": \"<one short funny sentence>\"}}'
+            f"Judge STRICTLY on:\n"
+            f"1. Did they use all 3 keywords meaningfully — not just shoehorned in? (40 pts)\n"
+            f"2. Is it genuinely creative and Navi-like in tone — dry, deadpan, local? (30 pts)\n"
+            f"3. Is the Trivandrum vibe authentic and specific — not generic? (30 pts)\n\n"
+            f"STRICT GRADING SCALE (apply this rigorously):\n"
+            f"- 0-20: Keywords missing or prediction makes no sense\n"
+            f"- 21-40: Keywords mentioned but forced, generic prediction\n"
+            f"- 41-60: Decent use of keywords but lacks Navi voice or Trivandrum flavour\n"
+            f"- 61-75: Good — keywords woven in, some Trivandrum character\n"
+            f"- 76-88: Strong — all keywords used well, genuinely Navi-toned\n"
+            f"- 89-100: Reserved for predictions that are genuinely clever, specific, and perfectly capture Navi's voice\n\n"
+            f"Do NOT use foul language. Reply ONLY with this JSON:\n"
+            f'{{\"score\": <0-100>, \"comment\": \"<one short witty sentence>\"}}'
         )
         try:
             loop = asyncio.get_running_loop()
@@ -4049,8 +4102,10 @@ class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your C
 
         boli_award = score
         xp_award = score // 2
-        update_boli_points(db_conn, interaction.user.id, boli_award)
-        add_experience(db_conn, interaction.user.id, xp_award)
+        testing = _is_testing_guild(interaction.guild_id)
+        if not testing:
+            update_boli_points(db_conn, interaction.user.id, boli_award)
+            add_experience(db_conn, interaction.user.id, xp_award)
 
         color = discord.Color.green() if score >= 70 else (discord.Color.orange() if score >= 40 else discord.Color.red())
         embed = discord.Embed(
@@ -4059,17 +4114,18 @@ class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your C
         )
         embed.add_field(name="Your Prediction", value=f"_{user_prediction}_", inline=False)
         embed.add_field(name="Keywords Used", value=keyword_str, inline=False)
-        embed.add_field(
-            name="Score",
-            value=f"**{score}/100** → +🍮 **{boli_award} Boli** & +✨ **{xp_award} XP**",
-            inline=False,
+        reward_line = (
+            f"**{score}/100** *(🧪 Testing mode — no rewards credited)*"
+            if testing else
+            f"**{score}/100** → +🍮 **{boli_award} Boli** & +✨ **{xp_award} XP**"
         )
+        embed.add_field(name="Score", value=reward_line, inline=False)
         embed.add_field(name="Navi's Verdict", value=f"_{display_comment}_", inline=False)
         embed.set_footer(text=f"Judged by Gemini · Time taken: {int(elapsed)}s of 90s")
         await interaction.followup.send(embed=embed)
         logger.info(
-            "Navi Challenge: %s scored %d (keywords: %s)",
-            interaction.user.display_name, score, [k["term"] for k in self.keywords],
+            "Navi Challenge: %s scored %d (keywords: %s, testing=%s)",
+            interaction.user.display_name, score, [k["term"] for k in self.keywords], testing,
         )
 
 
@@ -4088,10 +4144,11 @@ async def navi_challenge_slash(interaction: discord.Interaction) -> None:
             get_random_knowledge_terms(db_conn, num_categories=3),
         ),
     )
+    testing = _is_testing_guild(interaction.guild_id)
     if not profile:
         await interaction.response.send_message("Use /navi first to get started.", ephemeral=True)
         return
-    if count >= _GEMINI_GAME_DAILY_LIMIT:
+    if not testing and count >= _GEMINI_GAME_DAILY_LIMIT:
         await interaction.response.send_message(
             "You've used both your **Navi Challenge** attempts for today. Come back after midnight IST!",
             ephemeral=True,
@@ -4101,9 +4158,10 @@ async def navi_challenge_slash(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Knowledge base is empty — contact the bot admin.", ephemeral=True)
         return
 
-    await loop.run_in_executor(
-        None, lambda: increment_gemini_game_count(db_conn, interaction.user.id, "navi_challenge")
-    )
+    if not testing:
+        await loop.run_in_executor(
+            None, lambda: increment_gemini_game_count(db_conn, interaction.user.id, "navi_challenge")
+        )
 
     keyword_lines = "\n".join(
         f"• **{k['term']}** *(_{k['category']}_)* — {k['description'][:70]}"
@@ -4115,10 +4173,11 @@ async def navi_challenge_slash(interaction: discord.Interaction) -> None:
     # send_modal is the only way to present modals — use it as the immediate response
     await interaction.response.send_modal(modal)
     # followup shows the keywords publicly in the channel
+    attempt_line = "*(🧪 Testing mode — unlimited attempts, no rewards)*" if testing else f"*(Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today)*"
     kw_content = (
         f"🔮 **Navi Challenge for {interaction.user.mention}!**\n"
         f"Write a **Navi-style cosmic prediction** (max 2 sentences) using all 3 keywords below.\n"
-        f"Modal is open — you have **90 seconds**. *(Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today)*\n\n"
+        f"Modal is open — you have **90 seconds**. {attempt_line}\n\n"
         f"{keyword_lines}"
     )
     kw_msg = await interaction.followup.send(kw_content)
@@ -4137,19 +4196,35 @@ async def navi_challenge_slash(interaction: discord.Interaction) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /type_race — Gemini-judged Malayalam typing game
+# /type_race — Gemini-judged translation game (movie dialogue → Trivandrum style)
 # ---------------------------------------------------------------------------
 
-class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Type it in Malayalam!"):
+_TYPE_RACE_RULES = (
+    "📋 **How to play:**\n"
+    "• **Option A — Malayalam script** → scored **0–100** "
+    "(accuracy of meaning + Trivandrum regional accent)\n"
+    "• **Option B — Manglish slang** → max **50 pts** even if perfect "
+    "(how a Trivandrum local would say it out loud)\n"
+    "• You have **60 seconds** once you hit Start\n"
+    "• Foul language = zero marks, full stop\n"
+    "• Scoring is strict — average effort gets 30–55"
+)
+
+
+def _is_malayalam_script(text: str) -> bool:
+    """True if the text contains any Malayalam Unicode characters (U+0D00–U+0D7F)."""
+    return any('ഀ' <= ch <= 'ൿ' for ch in text)
+
+
+class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Malayalam or Manglish?"):
     def __init__(self, sentence: str, start_time: datetime, view: "TypeRaceStartView") -> None:
         super().__init__()
         self.sentence = sentence
         self.start_time = start_time
         self._view = view
-        # Sentence as placeholder so user can read it while the modal overlay is open
         placeholder = sentence if len(sentence) <= 97 else sentence[:97] + "…"
         self.answer = discord.ui.TextInput(
-            label="Type the sentence in Malayalam script",
+            label="Malayalam script (≤100) or Manglish slang (≤50)",
             style=discord.TextStyle.paragraph,
             placeholder=placeholder,
             max_length=400,
@@ -4169,18 +4244,64 @@ class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Type it in Mal
         self._view._modal_submitted = True  # cancel the 62s timeout-edit task
 
         user_answer = self.answer.value.strip()
-        system_prompt = "You are a strict but funny language judge. Reply ONLY with valid JSON."
-        prompt = (
-            f"The user was shown this Manglish sentence:\n\"{self.sentence}\"\n\n"
-            f"They typed this in Malayalam script:\n\"{user_answer}\"\n\n"
-            f"Judge how accurately they typed the Malayalam equivalent (script accuracy, meaning, completeness).\n"
-            f"Score out of 100: exact match = 100, roughly right = 50-80, totally off = 0-30.\n"
-            f"Reply ONLY with this JSON:\n"
-            f'{{\"score\": <0-100>, \"comment\": \"<one short funny sentence about the attempt>\"}}'
-        )
+        is_malayalam = _is_malayalam_script(user_answer)
+
+        if is_malayalam:
+            score_cap = 100
+            mode_label = "Malayalam script"
+            system_prompt = (
+                "You are a strict Malayalam language judge with a sharp Trivandrum ear. "
+                "Reply ONLY with valid JSON. Be harsh — most attempts deserve 30–60. "
+                "Only genuinely precise, beautifully localised translations deserve above 80."
+            )
+            prompt = (
+                f"The user was given this famous English movie dialogue to translate into Malayalam "
+                f"(Kerala/Trivandrum accent and phrasing):\n\"{self.sentence}\"\n\n"
+                f"Their Malayalam translation:\n\"{user_answer}\"\n\n"
+                f"Judge STRICTLY on:\n"
+                f"1. Meaning accuracy — does it faithfully convey the original idea? (50 pts)\n"
+                f"2. Trivandrum accent and phrasing — would a Trivandrum local actually say it this way? (30 pts)\n"
+                f"3. Script correctness — is the Malayalam script properly written? (20 pts)\n\n"
+                f"STRICT GRADING SCALE:\n"
+                f"- 0-20: Wrong meaning or barely recognisable Malayalam\n"
+                f"- 21-40: Attempted but meaning is off or script is poor\n"
+                f"- 41-60: Correct meaning but generic Kerala Malayalam, no Trivandrum flavour\n"
+                f"- 61-75: Good meaning, some Trivandrum character in phrasing\n"
+                f"- 76-88: Strong — accurate meaning, proper script, clear Trivandrum accent\n"
+                f"- 89-100: Near-perfect — only for genuinely precise, beautifully localised translations\n\n"
+                f"Do NOT use foul language in your comment. Reply ONLY with this JSON:\n"
+                f'{{\"score\": <0-100>, \"comment\": \"<one short witty sentence>\"}}'
+            )
+            fallback_score = 40
+        else:
+            score_cap = 50
+            mode_label = "Manglish slang"
+            system_prompt = (
+                "You are a strict Trivandrum slang judge. "
+                "Reply ONLY with valid JSON. Be harsh — most attempts deserve 15–30. "
+                "The absolute maximum score is 50, only for genuinely brilliant Trivandrum slang."
+            )
+            prompt = (
+                f"The user was given this famous English movie dialogue to translate into Trivandrum Manglish slang:\n\"{self.sentence}\"\n\n"
+                f"Their Manglish attempt:\n\"{user_answer}\"\n\n"
+                f"Judge STRICTLY on (MAX SCORE IS 50):\n"
+                f"1. Meaning accuracy — same core idea as the original? (20 pts)\n"
+                f"2. Trivandrum slang authenticity — sounds like a real local, not generic Manglish? (20 pts)\n"
+                f"3. Natural flow and wit (10 pts)\n\n"
+                f"STRICT GRADING SCALE (out of 50):\n"
+                f"- 0-10: Wrong meaning or barely tried\n"
+                f"- 11-20: Attempted but weak or very generic slang\n"
+                f"- 21-30: Decent meaning, some slang but not distinctly Trivandrum\n"
+                f"- 31-40: Good — recognisable meaning, authentic Trivandrum flavour\n"
+                f"- 41-50: Only for genuinely brilliant, perfectly local Manglish — very rare\n\n"
+                f"Do NOT use foul language in your comment. Reply ONLY with this JSON:\n"
+                f'{{\"score\": <0-50>, \"comment\": \"<one short witty sentence>\"}}'
+            )
+            fallback_score = 20
+
         try:
             loop = asyncio.get_running_loop()
-            _fallback = '{"score": 50, "comment": "Cosmic judges are on a chai break."}'
+            _fallback = f'{{"score": {fallback_score}, "comment": "Cosmic judges are on a chai break."}}'
             raw, _ = await loop.run_in_executor(
                 None,
                 lambda: api_mgr.call(
@@ -4194,14 +4315,15 @@ class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Type it in Mal
             json_match = re.search(r'\{.*\}', raw, re.DOTALL)
             if json_match:
                 data = json.loads(json_match.group())
-                score = max(0, min(100, int(data.get("score", 50))))
-                gemini_comment = data.get("comment", "The cosmos cannot process this typing.")
+                raw_score = max(0, min(score_cap, int(data.get("score", fallback_score))))
+                score = raw_score
+                gemini_comment = data.get("comment", "The cosmos cannot process this.")
             else:
-                score = 50
-                gemini_comment = "The cosmic typesetter has crashed. 50 it is."
+                score = fallback_score
+                gemini_comment = "The cosmic typesetter has crashed."
         except Exception as exc:
             logger.error("Type Race Gemini error: %s", exc)
-            score = 50
+            score = fallback_score
             gemini_comment = "The cosmic judging system is offline."
 
         cached = get_score_comment(db_conn, "type_race", score)
@@ -4216,24 +4338,33 @@ class TypeRaceModal(discord.ui.Modal, title="⌨️ Type Race — Type it in Mal
 
         boli_award = score
         xp_award = score // 2
-        update_boli_points(db_conn, interaction.user.id, boli_award)
-        add_experience(db_conn, interaction.user.id, xp_award)
+        testing = _is_testing_guild(interaction.guild_id)
+        if not testing:
+            update_boli_points(db_conn, interaction.user.id, boli_award)
+            add_experience(db_conn, interaction.user.id, xp_award)
 
-        color = discord.Color.green() if score >= 70 else (discord.Color.orange() if score >= 40 else discord.Color.red())
+        color = discord.Color.green() if score >= (60 if is_malayalam else 35) else (
+            discord.Color.orange() if score >= (30 if is_malayalam else 15) else discord.Color.red()
+        )
         embed = discord.Embed(title="⌨️ Type Race — Results", color=color)
-        embed.add_field(name="Original Sentence", value=f"_{self.sentence}_", inline=False)
-        embed.add_field(name="Your Answer", value=f"_{user_answer}_", inline=False)
+        embed.add_field(name="Movie Dialogue", value=f"_{self.sentence}_", inline=False)
         embed.add_field(
-            name="Score",
-            value=f"**{score}/100** → +🍮 **{boli_award} Boli** & +✨ **{xp_award} XP**",
+            name=f"Your Answer ({mode_label})",
+            value=f"_{user_answer}_",
             inline=False,
         )
+        reward_line = (
+            f"**{score}/{score_cap}** *(🧪 Testing mode — no rewards credited)*"
+            if testing else
+            f"**{score}/{score_cap}** → +🍮 **{boli_award} Boli** & +✨ **{xp_award} XP**"
+        )
+        embed.add_field(name="Score", value=reward_line, inline=False)
         embed.add_field(name="Navi's Verdict", value=f"_{display_comment}_", inline=False)
-        embed.set_footer(text=f"Judged by Gemini · Time taken: {int(elapsed)}s of 60s")
+        embed.set_footer(text=f"Mode: {mode_label} · Judged by Gemini · Time: {int(elapsed)}s of 60s")
         await interaction.followup.send(embed=embed)
         logger.info(
-            "Type Race: %s scored %d in %.0fs",
-            interaction.user.display_name, score, elapsed,
+            "Type Race: %s scored %d/%d (%s) in %.0fs",
+            interaction.user.display_name, score, score_cap, mode_label, elapsed,
         )
 
 
@@ -4268,7 +4399,7 @@ class TypeRaceStartView(discord.ui.View):
             await interaction.message.edit(
                 content=(
                     f"⌨️ **Type Race — ⏱️ Timer running! (60 seconds)**\n"
-                    f"**Sentence to type in Malayalam:**\n"
+                    f"**Translate this movie dialogue** — Malayalam script (max 100) or Manglish slang (max 50):\n"
                     f">>> {self.sentence}"
                 ),
                 view=self,
@@ -4312,7 +4443,7 @@ class TypeRaceStartView(discord.ui.View):
                 pass
 
 
-@tree.command(name="type_race", description="Type Race — type a Manglish sentence in Malayalam within 60 seconds (2 attempts/day)")
+@tree.command(name="type_race", description="Type Race — translate a movie dialogue into Malayalam or Trivandrum Manglish within 60 seconds (2 attempts/day)")
 async def type_race_slash(interaction: discord.Interaction) -> None:
     if not _feat("feature_type_race"):
         await interaction.response.send_message("Type Race is currently disabled.", ephemeral=True)
@@ -4326,10 +4457,11 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
             get_user_profile(db_conn, interaction.user.id),
         ),
     )
+    testing = _is_testing_guild(interaction.guild_id)
     if not profile:
         await interaction.response.send_message("Use /navi first to get started.", ephemeral=True)
         return
-    if count >= _GEMINI_GAME_DAILY_LIMIT:
+    if not testing and count >= _GEMINI_GAME_DAILY_LIMIT:
         await interaction.response.send_message(
             "You've used both your **Type Race** attempts for today. Come back after midnight IST!",
             ephemeral=True,
@@ -4338,11 +4470,14 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer(thinking=True)
 
-    gen_system = "You are a Trivandrum local. Reply with ONLY the sentence, no quotes, nothing else."
+    gen_system = "You are a movie buff. Reply with ONLY the dialogue line, no movie title, no speaker name, no quotes, nothing else. Never include foul or abusive language."
     gen_prompt = (
-        "Generate ONE funny, authentic Manglish sentence (mix of Malayalam and English) "
-        "with strong Trivandrum slang vibes. 10-20 words. Natural spoken style — "
-        "like something you'd hear at Thampanoor bus stand or Chalai Market."
+        "Pick ONE iconic, funny, or dramatically memorable line from a well-known English movie — "
+        "something a Trivandrum crowd would instantly recognise or find hilarious to translate. "
+        "Examples of the kind of lines to draw from: motivational one-liners, villain monologues, comic exchanges, "
+        "classic catchphrases (e.g. from action films, animated films, comedies, sci-fi blockbusters). "
+        "The line should be clean (no profanity), in plain English, 8-20 words, and stand alone without needing context. "
+        "Output ONLY the dialogue line itself."
     )
     try:
         raw_sentence, _ = await loop.run_in_executor(
@@ -4352,33 +4487,35 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
                 system_prompt=gen_system,
                 cache_type="type_race_sentence",
                 name=interaction.user.display_name,
-                fallback_message="Mone, oru chai kudikaan paisa illenkil bank-il poyi ATM-il nokkeda!",
+                fallback_message="Why so serious? Let's put a smile on that face.",
             ),
         )
         sentence = (raw_sentence or "").strip().strip('"').strip("'")
-        if not sentence or len(sentence) < 10:
+        if not sentence or len(sentence) < 8:
             raise ValueError("empty sentence")
     except Exception as exc:
         logger.error("Type Race sentence generation error: %s", exc)
-        sentence = "Mone, oru chai kudikaan paisa illenkil bank-il poyi ATM-il nokkeda, pinne kanaruthu!"
+        sentence = "Why so serious? Let's put a smile on that face."
 
-    await loop.run_in_executor(
-        None, lambda: increment_gemini_game_count(db_conn, interaction.user.id, "type_race")
-    )
+    if not testing:
+        await loop.run_in_executor(
+            None, lambda: increment_gemini_game_count(db_conn, interaction.user.id, "type_race")
+        )
 
+    attempt_line = "🧪 *Testing mode — unlimited attempts, no rewards*" if testing else f"*Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today*"
     view = TypeRaceStartView(sentence=sentence, user_id=interaction.user.id)
     msg = await interaction.followup.send(
-        f"⌨️ **Type Race for {interaction.user.mention}!**\n"
-        f"Read the sentence carefully, then click the button to open the typing modal.\n"
-        f"**Your 60-second timer starts when you click the button.**\n\n"
+        f"⌨️ **Type Race for {interaction.user.mention}!**\n\n"
+        f"{_TYPE_RACE_RULES}\n\n"
+        f"**🎬 Translate this movie dialogue:**\n"
         f">>> {sentence}\n\n"
-        f"*(Attempt {count + 1}/{_GEMINI_GAME_DAILY_LIMIT} today)*",
+        f"*Click the button when you're ready — timer starts then.* {attempt_line}",
         view=view,
     )
     view.message = msg
     logger.info(
-        "Type Race started for %s (attempt %d, sentence len=%d)",
-        interaction.user.display_name, count + 1, len(sentence),
+        "Type Race started for %s (attempt %d, testing=%s, sentence len=%d)",
+        interaction.user.display_name, count + 1, testing, len(sentence),
     )
 
 
