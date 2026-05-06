@@ -4493,6 +4493,22 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
     _DIALOGUE_CACHE_LIMIT = 300
     dialogue_count = await loop.run_in_executor(None, lambda: get_movie_dialogue_count(db_conn))
 
+    _DIALOGUE_GENRES = [
+        "90s action blockbusters",
+        "Disney or Pixar animated films",
+        "Marvel or DC superhero movies",
+        "classic sci-fi films (Star Wars, Matrix, Terminator, etc.)",
+        "90s or 2000s comedies",
+        "thriller or suspense films",
+        "80s cult classics",
+        "romantic comedies",
+        "war or historical epics",
+        "heist or crime films",
+        "horror or dark films (no gore references)",
+        "sports films",
+        "coming-of-age films",
+    ]
+
     if dialogue_count >= _DIALOGUE_CACHE_LIMIT:
         # Cache is full — use it exclusively, no API call needed
         sentence = await loop.run_in_executor(None, lambda: get_random_movie_dialogue(db_conn))
@@ -4500,34 +4516,31 @@ async def type_race_slash(interaction: discord.Interaction) -> None:
             sentence = "Why so serious? Let's put a smile on that face."
         logger.info("Type Race: using cached dialogue (%d in cache)", dialogue_count)
     else:
+        genre = random.choice(_DIALOGUE_GENRES)
         gen_system = "You are a movie buff. Reply with ONLY the dialogue line, no movie title, no speaker name, no quotes, nothing else. Never include foul or abusive language."
         gen_prompt = (
-            "Pick ONE iconic, funny, or dramatically memorable line from a well-known English movie — "
-            "something a Trivandrum crowd would instantly recognise or find hilarious to translate. "
-            "Examples of the kind of lines to draw from: motivational one-liners, villain monologues, comic exchanges, "
-            "classic catchphrases (e.g. from action films, animated films, comedies, sci-fi blockbusters). "
-            "The line should be clean (no profanity), in plain English, 8-20 words, and stand alone without needing context. "
-            "Output ONLY the dialogue line itself."
+            f"Pick ONE iconic, funny, or dramatically memorable line specifically from {genre}. "
+            f"It must be a line a Trivandrum crowd would recognise or find hilarious to translate into Malayalam. "
+            f"The line must be clean (no profanity), in plain English, 8-20 words, and stand alone without needing context. "
+            f"Do NOT pick the most obvious or overused line — surprise us. "
+            f"Output ONLY the dialogue line itself."
         )
         try:
-            raw_sentence, _ = await loop.run_in_executor(
+            # Call gemini_svc directly — we handle our own dialogue cache via movie_dialogues,
+            # so we don't want api_mgr's predictions_cache returning the same line repeatedly.
+            raw_sentence = await loop.run_in_executor(
                 None,
-                lambda: api_mgr.call(
-                    prompt=gen_prompt,
-                    system_prompt=gen_system,
-                    cache_type="type_race_sentence",
-                    name=interaction.user.display_name,
-                    fallback_message="Why so serious? Let's put a smile on that face.",
-                ),
+                lambda: gemini_svc.call(gen_prompt, gen_system),
             )
             sentence = (raw_sentence or "").strip().strip('"').strip("'")
             if not sentence or len(sentence) < 8:
-                raise ValueError("empty sentence")
+                raise ValueError("empty or too short")
             # Save to cache (UNIQUE constraint silently drops duplicates)
             await loop.run_in_executor(None, lambda: save_movie_dialogue(db_conn, sentence))
-            logger.info("Type Race: new dialogue cached (%d → %d)", dialogue_count, dialogue_count + 1)
+            logger.info("Type Race: new dialogue cached (%d → %d, genre: %s)", dialogue_count, dialogue_count + 1, genre)
         except Exception as exc:
             logger.error("Type Race sentence generation error: %s", exc)
+            # Fall back to any existing cached dialogue, then hardcoded last resort
             sentence = await loop.run_in_executor(None, lambda: get_random_movie_dialogue(db_conn))
             if not sentence:
                 sentence = "Why so serious? Let's put a smile on that face."
