@@ -4443,7 +4443,7 @@ class TypeRaceStartView(discord.ui.View):
                 pass
 
 
-@tree.command(name="type_race", description="Type Race — translate a movie dialogue into Malayalam or Trivandrum Manglish within 60 seconds (2 attempts/day)")
+@tree.command(name="type_race", description="Translate a movie dialogue into Malayalam or Trivandrum Manglish — 60 seconds (2 attempts/day)")
 async def type_race_slash(interaction: discord.Interaction) -> None:
     if not _feat("feature_type_race"):
         await interaction.response.send_message("Type Race is currently disabled.", ephemeral=True)
