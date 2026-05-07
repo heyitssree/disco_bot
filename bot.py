@@ -405,8 +405,8 @@ _FEATURE_DEFAULTS: dict[str, int] = {
     "feature_audit":           1,
     "feature_mod_tldr":        1,
     "feature_strikes":         1,
-    "feature_navi_challenge":  1,
-    "feature_type_race":       1,
+    "feature_navi_challenge":  0,  # DISABLED — Gemini outputting inappropriate language
+    "feature_type_race":       0,  # DISABLED — Gemini outputting inappropriate language
 }
 
 # Populated in on_ready() after db_conn is available
@@ -2901,24 +2901,24 @@ async def help_slash(interaction: discord.Interaction) -> None:
             inline=False,
         )
 
-    # ── Gemini Mini-Games ────────────────────────────────────────────────────
-    gemini_game_lines = []
-    if _feat("feature_navi_challenge"):
-        gemini_game_lines.append(
-            "`/navi_challenge` — Get 3 random Trivandrum keywords, write a 2-sentence cosmic prediction, "
-            "get Gemini-judged score (0–100 Boli + XP). **90 seconds, 2 attempts/day.**"
-        )
-    if _feat("feature_type_race"):
-        gemini_game_lines.append(
-            "`/type_race` — Gemini gives you an iconic **movie dialogue**; translate it into Malayalam script (0–100) "
-            "or Trivandrum Manglish slang (max 50) within 60 seconds. Gemini scores strictly → Boli + XP. **2 attempts/day.**"
-        )
-    if gemini_game_lines:
-        embed.add_field(
-            name="🧠 Navi Mini-Games *(Gemini-judged)*",
-            value="\n".join(gemini_game_lines),
-            inline=False,
-        )
+    # ── Gemini Mini-Games — DISABLED (Gemini outputting inappropriate language) ──
+    # gemini_game_lines = []
+    # if _feat("feature_navi_challenge"):
+    #     gemini_game_lines.append(
+    #         "`/navi_challenge` — Get 3 random Trivandrum keywords, write a 2-sentence cosmic prediction, "
+    #         "get Gemini-judged score (0–100 Boli + XP). **90 seconds, 2 attempts/day.**"
+    #     )
+    # if _feat("feature_type_race"):
+    #     gemini_game_lines.append(
+    #         "`/type_race` — Gemini gives you an iconic **movie dialogue**; translate it into Malayalam script (0–100) "
+    #         "or Trivandrum Manglish slang (max 50) within 60 seconds. Gemini scores strictly → Boli + XP. **2 attempts/day.**"
+    #     )
+    # if gemini_game_lines:
+    #     embed.add_field(
+    #         name="🧠 Navi Mini-Games *(Gemini-judged)*",
+    #         value="\n".join(gemini_game_lines),
+    #         inline=False,
+    #     )
 
     # ── Boli Points (passive earning) ────────────────────────────────────────
     if _feat("feature_boli_points"):
@@ -3066,8 +3066,8 @@ class AdminGroup(app_commands.Group):
         app_commands.Choice(name="Mod Audit (/audit)", value="feature_audit"),
         app_commands.Choice(name="Mod TL;DR (/mod_tldr)", value="feature_mod_tldr"),
         app_commands.Choice(name="3-Strike System", value="feature_strikes"),
-        app_commands.Choice(name="Navi Challenge (/navi_challenge)", value="feature_navi_challenge"),
-        app_commands.Choice(name="Type Race (/type_race)", value="feature_type_race"),
+        # app_commands.Choice(name="Navi Challenge (/navi_challenge)", value="feature_navi_challenge"),  # DISABLED
+        # app_commands.Choice(name="Type Race (/type_race)", value="feature_type_race"),  # DISABLED
     ])
     async def toggle_feature(
         self, interaction: discord.Interaction,
@@ -3269,8 +3269,8 @@ class AdminGroup(app_commands.Group):
         game="Which game's daily count to clear",
     )
     @app_commands.choices(game=[
-        app_commands.Choice(name="Type Race",       value="type_race"),
-        app_commands.Choice(name="Navi Challenge",  value="navi_challenge"),
+        # app_commands.Choice(name="Type Race",       value="type_race"),      # DISABLED
+        # app_commands.Choice(name="Navi Challenge",  value="navi_challenge"),  # DISABLED
         app_commands.Choice(name="Gambling (all)",  value="gambling"),
         app_commands.Choice(name="All Games",       value="all"),
     ])
@@ -4012,7 +4012,8 @@ async def slots_slash(
 
 
 # ---------------------------------------------------------------------------
-# /navi_challenge — Gemini-judged prediction game using local_knowledge keywords
+# /navi_challenge — DISABLED (Gemini outputting inappropriate language)
+# To re-enable: set feature_navi_challenge=1 in _DEFAULT_CONFIG and restore decorators
 # ---------------------------------------------------------------------------
 
 class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your Cosmic Prediction"):
@@ -4137,7 +4138,7 @@ class NaviChallengeModal(discord.ui.Modal, title="🔮 Navi Challenge — Your C
         )
 
 
-@tree.command(name="navi_challenge", description="Navi Challenge — write a cosmic prediction using 3 random keywords (2 attempts/day)")
+# DISABLED: @tree.command(name="navi_challenge", description="Navi Challenge — write a cosmic prediction using 3 random keywords (2 attempts/day)")
 async def navi_challenge_slash(interaction: discord.Interaction) -> None:
     if not _feat("feature_navi_challenge"):
         await interaction.response.send_message("Navi Challenge is currently disabled.", ephemeral=True)
@@ -4204,7 +4205,8 @@ async def navi_challenge_slash(interaction: discord.Interaction) -> None:
 
 
 # ---------------------------------------------------------------------------
-# /type_race — Gemini-judged translation game (movie dialogue → Trivandrum style)
+# /type_race — DISABLED (Gemini outputting inappropriate language)
+# To re-enable: set feature_type_race=1 in _DEFAULT_CONFIG and restore decorators
 # ---------------------------------------------------------------------------
 
 _TYPE_RACE_RULES = (
@@ -4464,7 +4466,7 @@ class TypeRaceStartView(discord.ui.View):
                 pass
 
 
-@tree.command(name="type_race", description="Translate a movie dialogue into Malayalam or Trivandrum Manglish — 60 seconds (2 attempts/day)")
+# DISABLED: @tree.command(name="type_race", description="Translate a movie dialogue into Malayalam or Trivandrum Manglish — 60 seconds (2 attempts/day)")
 async def type_race_slash(interaction: discord.Interaction) -> None:
     if not _feat("feature_type_race"):
         await interaction.response.send_message("Type Race is currently disabled.", ephemeral=True)
