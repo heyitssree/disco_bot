@@ -2154,7 +2154,7 @@ def get_price_history(
     """Return the last N days of price history for an item."""
     rows = conn.execute(
         """
-        SELECT recorded_at, price FROM market_price_history
+        SELECT CAST(recorded_at AS TEXT), price FROM market_price_history
         WHERE item_id = ?
         ORDER BY recorded_at DESC LIMIT ?
         """,

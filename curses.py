@@ -113,6 +113,8 @@ COMPLIMENTS: list[dict] = [
     {"word": "vavakutty",     "meaning": "darling / dear one",   "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
     {"word": "pookie",        "meaning": "pookie",               "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
     {"word": "minnaram",      "meaning": "shining light",        "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "kunuvaava",     "meaning": "little one / cutie",   "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
+    {"word": "thakkuduvaava", "meaning": "precious one",         "tier": "Affectionate & Sweet", "points": 5,  "caster_share_pct": 15},
     # Tier 2 — Friendship (10 pts, caster gets 20%)
     {"word": "chunk",         "meaning": "best friend",          "tier": "Friendship",           "points": 10, "caster_share_pct": 20},
     {"word": "machane",       "meaning": "bro / buddy",          "tier": "Friendship",           "points": 10, "caster_share_pct": 20},

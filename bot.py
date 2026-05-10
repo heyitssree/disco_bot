@@ -3444,7 +3444,7 @@ class MarketGroup(app_commands.Group):
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="buy", description="Buy a market item with Boli points")
-    @app_commands.describe(item_id="Item to buy (see /market view for IDs)", quantity="How many to buy (1–10)")
+    @app_commands.describe(item_id="Item to buy", quantity="How many to buy (1–10)")
     async def market_buy(
         self,
         interaction: discord.Interaction,
@@ -3486,6 +3486,15 @@ class MarketGroup(app_commands.Group):
         )
         await interaction.response.send_message(msg)
         logger.info("%s bought %dx %s @ %d Boli", interaction.user.display_name, quantity, item_id, item["current_price"])
+
+    @market_buy.autocomplete("item_id")
+    async def market_buy_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        items = get_market_items(db_conn)
+        return [
+            app_commands.Choice(name=f"{item['emoji']} {item['name']} — {item['current_price']} Boli", value=item["item_id"])
+            for item in items
+            if not current or current.lower() in item["item_id"] or current.lower() in item["name"].lower()
+        ][:25]
 
     @app_commands.command(name="sell", description="Sell a market item from your holdings")
     @app_commands.describe(item_id="Item to sell", quantity="How many to sell")
@@ -3536,6 +3545,15 @@ class MarketGroup(app_commands.Group):
         )
         await interaction.response.send_message(msg)
         logger.info("%s sold %dx %s @ %d Boli (P&L: %+d)", interaction.user.display_name, quantity, item_id, item["current_price"], pnl)
+
+    @market_sell.autocomplete("item_id")
+    async def market_sell_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        items = get_market_items(db_conn)
+        return [
+            app_commands.Choice(name=f"{item['emoji']} {item['name']} — {item['current_price']} Boli", value=item["item_id"])
+            for item in items
+            if not current or current.lower() in item["item_id"] or current.lower() in item["name"].lower()
+        ][:25]
 
     @app_commands.command(name="holdings", description="View your current market holdings")
     async def market_holdings(self, interaction: discord.Interaction) -> None:
@@ -3621,6 +3639,15 @@ class MarketGroup(app_commands.Group):
                 chart_lines.append(f"`{h['date'][:16]}` {bar} **{h['price']}**")
             embed.description = "\n".join(chart_lines)
             await interaction.followup.send(embed=embed)
+
+    @market_history.autocomplete("item_id")
+    async def market_history_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        items = get_market_items(db_conn)
+        return [
+            app_commands.Choice(name=f"{item['emoji']} {item['name']}", value=item["item_id"])
+            for item in items
+            if not current or current.lower() in item["item_id"] or current.lower() in item["name"].lower()
+        ][:25]
 
 
 tree.add_command(MarketGroup())
@@ -3828,11 +3855,37 @@ _ROULETTE_DOZENS: dict[str, tuple[int, int]] = {
 }
 
 
+_ROULETTE_STANDARD_CHOICES: list[app_commands.Choice[str]] = [
+    app_commands.Choice(name="Red (1:1)", value="red"),
+    app_commands.Choice(name="Black (1:1)", value="black"),
+    app_commands.Choice(name="Odd (1:1)", value="odd"),
+    app_commands.Choice(name="Even (1:1)", value="even"),
+    app_commands.Choice(name="Dozen 1 — 1 to 12 (2:1)", value="dozen1"),
+    app_commands.Choice(name="Dozen 2 — 13 to 24 (2:1)", value="dozen2"),
+    app_commands.Choice(name="Dozen 3 — 25 to 36 (2:1)", value="dozen3"),
+]
+
+
+async def _roulette_choice_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if current and current.isdigit():
+        number_choices = [
+            app_commands.Choice(name=f"Number {i} (35:1)", value=str(i))
+            for i in range(1, 37)
+            if str(i).startswith(current)
+        ]
+        return (number_choices + _ROULETTE_STANDARD_CHOICES)[:25]
+    elif current:
+        filtered = [c for c in _ROULETTE_STANDARD_CHOICES if current.lower() in c.name.lower()]
+        return filtered or _ROULETTE_STANDARD_CHOICES
+    return _ROULETTE_STANDARD_CHOICES
+
+
 @tree.command(name="roulette", description="Space roulette — color (1:1), dozen (2:1), odd/even (1:1), or number 1-36 (35:1)")
 @app_commands.describe(
-    choice="red/black, odd/even, dozen1/dozen2/dozen3, or a number 1-36",
+    choice="Pick a bet type or type a number 1-36",
     bet="How many Boli to wager",
 )
+@app_commands.autocomplete(choice=_roulette_choice_autocomplete)
 async def roulette_slash(
     interaction: discord.Interaction,
     choice: str,
