@@ -4647,7 +4647,6 @@ _GIFT_TEMPLATES: list[str] = [
 ]
 
 
-_GIFT_DAILY_CAP = 500  # max Boli a sender can gift per day
 
 
 @tree.command(name="gift", description="Gift Boli points to another user. Omit recipient to surprise a random recent user!")
@@ -4705,19 +4704,7 @@ async def gift_slash(
         )
         return
 
-    # Daily cap check
-    daily_total = await asyncio.get_running_loop().run_in_executor(
-        None, lambda: get_gift_daily_total(db_conn, sender_id)
-    )
-    remaining_cap = _GIFT_DAILY_CAP - daily_total
-    if remaining_cap <= 0:
-        await interaction.response.send_message(
-            f"🚫 You've hit your daily gift cap of **{_GIFT_DAILY_CAP} Boli**. Come back tomorrow!",
-            ephemeral=True,
-        )
-        return
-    actual_amount = min(amount, remaining_cap)
-
+    actual_amount = amount
     sender_pts = profile["boli_points"]
     if sender_pts < actual_amount:
         await interaction.response.send_message(
@@ -4733,12 +4720,11 @@ async def gift_slash(
     record_gift(db_conn, sender_id, actual_recipient.id, actual_amount)
 
     surprise_note = " *(random pick — they used /navi recently!)*" if random_pick else ""
-    cap_note = f" *(capped at {actual_amount} — daily limit)*" if actual_amount < amount else ""
     msg = random.choice(_GIFT_TEMPLATES).format(
         sender=interaction.user.mention,
         recipient=actual_recipient.mention,
         amount=actual_amount,
-    ) + surprise_note + cap_note
+    ) + surprise_note
     await interaction.response.send_message(msg)
     logger.info(
         "%s gifted %d Boli to %s%s",
