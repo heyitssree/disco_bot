@@ -1,0 +1,72 @@
+[
+  {
+    "question": "In what year did the Berlin Wall fall?",
+    "correct_answer": "1989",
+    "incorrect_answers": ["1991", "1987", "1993"],
+    "category": "History",
+    "difficulty": "medium"
+  },
+  {
+    "question": "How many bones are in the adult human body?",
+    "correct_answer": "206",
+    "incorrect_answers": ["198", "214", "220"],
+    "category": "Science",
+    "difficulty": "medium"
+  },
+  {
+    "question": "What is the largest ocean on Earth?",
+    "correct_answer": "Pacific Ocean",
+    "incorrect_answers": ["Atlantic Ocean", "Indian Ocean", "Arctic Ocean"],
+    "category": "Geography",
+    "difficulty": "easy"
+  },
+  {
+    "question": "Which element has the chemical symbol Au?",
+    "correct_answer": "Gold",
+    "incorrect_answers": ["Silver", "Aluminium", "Argon"],
+    "category": "Science",
+    "difficulty": "easy"
+  },
+  {
+    "question": "Who painted the Mona Lisa?",
+    "correct_answer": "Leonardo da Vinci",
+    "incorrect_answers": ["Michelangelo", "Raphael", "Caravaggio"],
+    "category": "Art",
+    "difficulty": "easy"
+  },
+  {
+    "question": "What is the speed of light in a vacuum (approx)?",
+    "correct_answer": "299,792 km/s",
+    "incorrect_answers": ["150,000 km/s", "450,000 km/s", "199,792 km/s"],
+    "category": "Science",
+    "difficulty": "medium"
+  },
+  {
+    "question": "Which Shakespeare play features the character Iago?",
+    "correct_answer": "Othello",
+    "incorrect_answers": ["Hamlet", "Macbeth", "King Lear"],
+    "category": "Literature",
+    "difficulty": "medium"
+  },
+  {
+    "question": "What is the smallest prime number?",
+    "correct_answer": "2",
+    "incorrect_answers": ["1", "3", "0"],
+    "category": "Mathematics",
+    "difficulty": "easy"
+  },
+  {
+    "question": "In which country would you find Machu Picchu?",
+    "correct_answer": "Peru",
+    "incorrect_answers": ["Bolivia", "Ecuador", "Colombia"],
+    "category": "Geography",
+    "difficulty": "easy"
+  },
+  {
+    "question": "What is the chemical formula for water?",
+    "correct_answer": "H2O",
+    "incorrect_answers": ["CO2", "H2O2", "HO"],
+    "category": "Science",
+    "difficulty": "easy"
+  }
+]
