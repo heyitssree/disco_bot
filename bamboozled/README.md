@@ -1,110 +1,259 @@
-# Bamboozled — Discord Trivia Chaos Game
+# Bamboozled — Deployment Guide
 
-A multiplayer trivia game for 1–6 players inspired by the fictional game from *Friends*. Runs entirely via slash commands in Discord.
-
----
-
-## Requirements
-
-- Python 3.11+
-- A Discord bot application with the **bot** scope and **applications.commands** scope
+Bamboozled lives in the `bamboozled/` sub-directory of the same `disco_bot` repo as AstRobot. It runs as a **separate bot process** with its own Discord application and token, on the same GCP VM. The two bots are completely independent.
 
 ---
 
-## Setup
+## What's new since initial build
 
-### 1. Create a `.env` file
+| Area | What changed |
+|---|---|
+| OpenTDB questions | Restricted to 12 SFW category IDs — entertainment categories excluded |
+| Bamboozle Rule input | Player-typed rules are screened by a content filter before posting |
+| `BAMBOOZLE_RULE_FILTER_ENABLED` | Toggle in `constants.py` — `True` by default |
+| `SAFE_OPENTDB_CATEGORY_IDS` | Configurable list of allowed category IDs in `constants.py` |
 
-Copy `.env.example` to `.env` inside the `bamboozled/` directory and fill in your token:
+---
 
+## Step 0 — One-time: Create a Discord application for Bamboozled
+
+Bamboozled needs its own bot token. Do this once from any browser.
+
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) → **New Application** → name it **Bamboozled**
+2. Left sidebar → **Bot** → **Add Bot**
+3. Under **Token** → **Reset Token** → copy and save it somewhere safe
+4. Scroll down to **Privileged Gateway Intents** — no intents are needed, leave all off
+5. Left sidebar → **OAuth2 → URL Generator**
+   - Scopes: tick **`bot`** and **`applications.commands`**
+   - Bot permissions: tick **`Send Messages`**, **`Read Message History`**, **`Use Slash Commands`**
+6. Copy the generated URL at the bottom → open it in a browser → select your server → **Authorise**
+
+---
+
+## Step 1 — Push the code from Windows
+
+On your local machine, commit and push the new `bamboozled/` directory:
+
+```powershell
+cd "C:\Users\Sree\Documents\GitHub\disco_bot"
+git add bamboozled/
+git commit -m "feat: add Bamboozled game"
+git push origin main
 ```
-DISCORD_TOKEN=your_bot_token_here
-```
 
-### 2. Install dependencies
+> `.env` files are git-ignored and will **not** be pushed — only the `.env.example` template is tracked.
 
-From inside the `bamboozled/` directory:
+---
+
+## Step 2 — Pull on the GCP VM
+
+SSH into your VM (GCP Console → Compute Engine → click **SSH**), then:
 
 ```bash
+cd ~/disco_bot
+git pull origin main
+```
+
+---
+
+## Step 3 — Set up a virtual environment for Bamboozled
+
+Bamboozled needs `discord.py`, `aiosqlite`, and `aiohttp` — versions that may differ from AstRobot's. Give it its own venv to keep them isolated.
+
+```bash
+cd ~/disco_bot/bamboozled
+
+python3 -m venv .venv
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-### 3. Invite the bot to your server
-
-Go to the [Discord Developer Portal](https://discord.com/developers/applications), open your application, then navigate to **OAuth2 → URL Generator**.
-
-Required scopes:
-- `bot`
-- `applications.commands`
-
-Required bot permissions:
-- `Send Messages`
-- `Read Message History`
-- `Use Slash Commands`
-
-Copy the generated URL and open it in your browser to invite the bot.
-
-### 4. Run the bot
-
-From inside the `bamboozled/` directory:
+Verify:
 
 ```bash
+python -c "import discord, aiosqlite, aiohttp; print('deps OK')"
+# Expected: deps OK
+```
+
+---
+
+## Step 4 — Create the `.env` file
+
+```bash
+cd ~/disco_bot/bamboozled
+cp .env.example .env
+nano .env
+```
+
+Replace the placeholder with your real token:
+
+```env
+DISCORD_TOKEN=your_bamboozled_bot_token_here
+```
+
+Press `Ctrl+O` → `Enter` to save, `Ctrl+X` to exit.
+
+---
+
+## Step 5 — Run the bot
+
+Open a **new tmux window** (don't touch the existing AstRobot session):
+
+```bash
+# Create a new tmux session just for Bamboozled
+tmux new -s bamboozled
+
+# Inside the new session
+cd ~/disco_bot/bamboozled
+source .venv/bin/activate
 python bot.py
 ```
 
-The bot will:
-- Initialise the SQLite database (`db/bamboozled.db`) automatically
-- Sync slash commands globally (may take up to 1 hour to propagate — for instant registration during development, edit `bot.py` to sync to a specific guild ID)
-- Post a restart notice in any channels that had an active game when the bot last stopped
+On a successful start you should see:
+
+```
+2026-05-11 [INFO] __main__: Synced 7 slash command(s).
+2026-05-11 [INFO] __main__: Logged in as Bamboozled#1234 (ID: ...)
+2026-05-11 [INFO] __main__: Bamboozled bot is ready!
+```
+
+**Detach from tmux** (bot keeps running after you close SSH):
+Press `Ctrl+B`, release, then press `D`.
+
+> **Slash command propagation**: Global command sync can take up to 1 hour on first run. For instant registration during testing, see [Fast dev sync](#fast-dev-sync-optional) below.
 
 ---
 
-## Commands
+## Step 6 — Verify it's working
 
-| Command | Description |
+In Discord, type `/bamboozled` — the command group should appear. Run through:
+
+| Action | Expected |
 |---|---|
-| `/bamboozled join` | Join the lobby for the next game in this channel |
-| `/bamboozled start` | Start the game (host/first-joiner only) |
-| `/bamboozled scores` | View current scores mid-game |
-| `/bamboozled leaderboard` | All-time win counts |
-| `/bamboozled stats @user` | A specific player's all-time stats |
-| `/bamboozled forfeit` | Forfeit your current turn (treated as timeout) |
-| `/bamboozled endgame` | Force-end the game with no results saved (host only) |
+| `/bamboozled join` | Bot posts lobby message with your name |
+| `/bamboozled start` | Game begins, first question posted |
+| Answer a question | Points awarded, card drawn |
+| `/bamboozled scores` | Ephemeral score list |
+| `/bamboozled leaderboard` | All-time wins embed |
+| `/bamboozled endgame` | Game cancelled, no results saved |
 
 ---
 
-## Game Overview
+## Checking logs / reattaching
 
-- **1–6 players** per game, **5 rounds**, turn order fixed by join order
-- Questions fetched from [OpenTDB](https://opentdb.com/) (free, no key required)
-- **Correct answer** → +100 pts, draw a **Chance Card**
-- **Wrong answer** → -50 pts, draw a **Wicked Wango Card**
-- **Timeout/Forfeit** → -100 pts, no card
+```bash
+# Reattach to the running bot
+tmux attach -t bamboozled
 
-### Cards & Chaos
+# Stop the bot
+# (inside tmux) Ctrl+C
 
-**Chance Cards:** Lucky Llama · Switcheroo · Double Down · Spin the Wheel · Golden Pass · Bamboozle
-
-**Wicked Wango Cards:** Wango Classic · The Silence · Reverse Uno · The Sombrero · Double Wango · Mystic Mist
-
-**Wheel of Mayhem (8 segments):** Ladder of Chance · Tax Season · Gift of the Bamboozle · Full Reversal · Mystic Mist · Bonus Round · Wango Again · Monkey's Choice
-
-### Special Mechanics
-
-- 🐒 **Golden Monkey** — Belly (+300) or Tail (−200 + Wango card)
-- 🪅 **The Sombrero** — Extra -25 pts per wrong answer while held
-- 🌫️ **Mystic Mist** — Scores hidden for 2 turns
-- 🃏 **Bamboozle Rule** — Player writes a custom honour-system rule for 1 full round
-- 🎫 **Golden Pass** — Skip the next Wango card you'd draw
-
-### Solo Mode
-
-All mechanics work with a single player. Player-targeting effects resolve automatically (Phantom Player for Switcheroo, The Bank for Gift, etc.).
+# Restart after a code update
+tmux attach -t bamboozled
+# Ctrl+C to stop, then:
+git pull origin main
+python bot.py
+```
 
 ---
 
-## Data
+## Updating the bot after a code change
 
-Results are stored in `db/bamboozled.db` (SQLite). The file is created automatically on first run.
+```bash
+# On your local machine
+git add bamboozled/
+git commit -m "your message"
+git push origin main
 
-Custom fallback questions can be added to `data/custom_questions.json`. They are used if the OpenTDB API is unavailable.
+# On the VM
+tmux attach -t bamboozled
+# Ctrl+C to stop the bot
+cd ~/disco_bot
+git pull origin main
+cd bamboozled
+source .venv/bin/activate
+python bot.py
+# Ctrl+B then D to detach
+```
+
+---
+
+## Database backup
+
+The SQLite database lives at `bamboozled/db/bamboozled.db` on the VM. It is not committed to git. To copy it to your local machine:
+
+```powershell
+# Run on your local machine (Windows PowerShell)
+# Replace YOUR_VM_NAME and YOUR_ZONE with your GCP instance details
+gcloud compute scp YOUR_VM_NAME:~/disco_bot/bamboozled/db/bamboozled.db ./bamboozled_backup.db --zone=YOUR_ZONE
+```
+
+To find your VM name and zone: GCP Console → Compute Engine → VM Instances.
+
+---
+
+## Configuring content safety settings
+
+Both settings live in `bamboozled/game_engine/constants.py`. Edit them on the VM:
+
+```bash
+nano ~/disco_bot/bamboozled/game_engine/constants.py
+```
+
+| Setting | Default | Effect |
+|---|---|---|
+| `BAMBOOZLE_RULE_FILTER_ENABLED` | `True` | Set to `False` to allow any player-typed rule text through unfiltered |
+| `SAFE_OPENTDB_CATEGORY_IDS` | 12 category IDs | Add or remove OpenTDB category IDs to change which topics questions can come from |
+
+After editing, restart the bot (Ctrl+C in tmux, then `python bot.py`).
+
+---
+
+## Customising fallback questions
+
+If OpenTDB is unreachable, the bot uses `bamboozled/data/custom_questions.json`. Add your own questions in this format:
+
+```json
+{
+  "question": "Your question here?",
+  "correct_answer": "The right answer",
+  "incorrect_answers": ["Wrong 1", "Wrong 2", "Wrong 3"],
+  "category": "Category Name",
+  "difficulty": "easy"
+}
+```
+
+No restart needed — the file is read at fetch time.
+
+---
+
+## Fast dev sync (optional)
+
+The default global command sync takes up to 1 hour. To register commands instantly in one specific server during development, edit `bamboozled/bot.py` and replace the sync line:
+
+```python
+# In setup_hook, replace:
+synced = await self.tree.sync()
+
+# With (use your server's ID):
+GUILD = discord.Object(id=YOUR_GUILD_ID_HERE)
+self.tree.copy_global_to(guild=GUILD)
+synced = await self.tree.sync(guild=GUILD)
+```
+
+Revert this change before final deployment so the commands are available in all servers.
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `RuntimeError: DISCORD_TOKEN not set` | Check `bamboozled/.env` exists and contains the token |
+| `/bamboozled` command doesn't appear after 1 hour | Check the bot was invited with `applications.commands` scope; re-invite if needed |
+| `aiosqlite` or `discord` not found | Make sure you activated `bamboozled/.venv` before running |
+| Bot posts restart notice on startup | Expected — means the bot restarted during an active game. Safe to ignore. |
+| Questions are all the same category | `SAFE_OPENTDB_CATEGORY_IDS` has only one entry — add more in `constants.py` |
+| Bamboozle Rule gets rejected unexpectedly | Rule contains a substring that matches the filter (e.g. "classic" contains "ass"). Set `BAMBOOZLE_RULE_FILTER_ENABLED = False` in `constants.py` to disable |
+| `Too Many Requests` from OpenTDB | OpenTDB has a rate limit — the bot retries once after 3 s, then falls back to `custom_questions.json` automatically |
