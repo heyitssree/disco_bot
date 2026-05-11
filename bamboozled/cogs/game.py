@@ -846,7 +846,7 @@ class BamboozledCog(commands.Cog):
                 )
             else:
                 await channel.send(
-                    f"❌ **WRONG!** The answer was **{correct_text}**. "
+                    f"❌ **WRONG!** The correct answer was **{correct_text}**.\n"
                     f"**{player_name}** loses **{abs(penalty)}** points{sombrero_note}{dj_note}. "
                     f"*(Score: {score:,})*"
                 )
