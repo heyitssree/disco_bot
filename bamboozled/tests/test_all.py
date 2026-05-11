@@ -58,7 +58,8 @@ from game_engine.constants import (
     DOUBLE_WANGO_CHAIN_LIMIT,
 )
 from game_engine.content_filter import is_clean
-from game_engine.state import BamboozleRule, GameState
+from game_engine.state import GameState
+from game_engine.bamboozle_rules import make_active_rule
 from game_engine.cards import (
     CHANCE_CARD_FLAVOUR,
     WANGO_CARD_FLAVOUR,
@@ -248,23 +249,23 @@ class TestGameState(unittest.TestCase):
     def test_bamboozle_rule_expires_after_n_turns(self):
         n = 3
         game = _make_game(n)
-        game.bamboozle_rule = BamboozleRule(text="test rule", set_by=100, turns_remaining=n)
+        game.active_bamboozle_rule = make_active_rule(1, n)  # Speed Tax, non-permanent
         expired = False
         for i in range(n):
             result = game.advance_turn()
             if result:
                 expired = True
         self.assertTrue(expired)
-        self.assertIsNone(game.bamboozle_rule)
+        self.assertIsNone(game.active_bamboozle_rule)
 
     def test_bamboozle_rule_not_expired_early(self):
         n = 4
         game = _make_game(n)
-        game.bamboozle_rule = BamboozleRule(text="rule", set_by=100, turns_remaining=n)
+        game.active_bamboozle_rule = make_active_rule(1, n)  # Speed Tax, non-permanent
         for i in range(n - 1):
             result = game.advance_turn()
             self.assertFalse(result)
-            self.assertIsNotNone(game.bamboozle_rule)
+            self.assertIsNotNone(game.active_bamboozle_rule)
 
     def test_next_player_in_order(self):
         game = _make_game(4)
@@ -911,12 +912,18 @@ class TestGameFlowLogic(unittest.TestCase):
 
     def test_bamboozle_rule_stored_and_retrieved(self):
         game = _make_game(2)
-        rule_text = "Everyone must speak in rhyme."
-        game.bamboozle_rule = BamboozleRule(
-            text=rule_text, set_by=game.players[0], turns_remaining=len(game.players)
-        )
-        self.assertEqual(game.bamboozle_rule.text, rule_text)
-        self.assertIsNotNone(game.bamboozle_rule)
+        game.active_bamboozle_rule = make_active_rule(4, len(game.players))  # Hot Streak
+        self.assertEqual(game.active_bamboozle_rule["name"], "Hot Streak")
+        self.assertIsNotNone(game.active_bamboozle_rule)
+
+    def test_bamboozle_permanent_rule_never_expires(self):
+        n = 4
+        game = _make_game(n)
+        game.active_bamboozle_rule = make_active_rule(10, n)  # Mist Magnet — permanent
+        for _ in range(n * 2):
+            result = game.advance_turn()
+            self.assertFalse(result)
+            self.assertIsNotNone(game.active_bamboozle_rule)
 
     def test_silenced_flag_lifecycle(self):
         game = _make_game(2)

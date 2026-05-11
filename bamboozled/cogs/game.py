@@ -1,6 +1,7 @@
 """Main game cog: all slash commands, UI components, and game-flow logic."""
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import discord
@@ -24,10 +25,19 @@ from game_engine.cards import (
     draw_chance_card,
     draw_wango_card,
 )
-from game_engine.content_filter import is_clean, rejection_reason
+from game_engine.bamboozle_rules import (
+    BAMBOOZLE_RULES,
+    apply_after_correct,
+    apply_after_wrong_or_timeout,
+    apply_on_set,
+    apply_start_of_turn,
+    get_effective_timeout_penalty,
+    get_effective_wrong_penalty,
+    make_active_rule,
+)
 from game_engine.constants import (
-    BAMBOOZLE_RULE_FILTER_ENABLED,
     BAMBOOZLE_RULE_INPUT_TIMEOUT_SECONDS,
+    BAMBOOZLE_TIMEOUT_TERROR_COST,
     BONUS_ROUND_POINTS,
     CORRECT_ANSWER_POINTS,
     DOUBLE_DOWN_BONUS,
@@ -50,7 +60,7 @@ from game_engine.constants import (
     WANGO_AGAIN_WHEEL_DEPTH_LIMIT,
     DOUBLE_WANGO_CHAIN_LIMIT,
 )
-from game_engine.state import BamboozleRule, GameState
+from game_engine.state import GameState
 from game_engine.trivia import fetch_question, fetch_session_token, shuffle_answers
 from game_engine.wheel import (
     SPIN_SUSPENSE,
@@ -150,50 +160,65 @@ class PlayerSelectView(discord.ui.View):
         self.stop()
 
 
-class BamboozleRuleModal(discord.ui.Modal, title="📜 WRITE THE LAW"):
-    rule_input = discord.ui.TextInput(
-        label="Your Bamboozle Rule",
-        placeholder="e.g. Anyone who says 'points' must spin the Wheel next turn.",
-        max_length=200,
-        required=True,
-    )
-
-    def __init__(self):
-        super().__init__(timeout=float(BAMBOOZLE_RULE_INPUT_TIMEOUT_SECONDS))
-        self.submitted_rule: Optional[str] = None
-        self.submitted = False
-
-    async def on_submit(self, interaction: discord.Interaction):
-        self.submitted_rule = self.rule_input.value
-        self.submitted = True
-        await interaction.response.defer()
-        self.stop()
-
-    async def on_timeout(self):
-        self.stop()
-
-
-class BamboozleRuleButton(discord.ui.View):
-    """One-button view whose click opens the Bamboozle Rule modal."""
+class BamboozleRuleTriggerButton(discord.ui.View):
+    """Public button that triggers an ephemeral Select Menu for rule selection."""
 
     def __init__(self, active_player_id: int):
         super().__init__(timeout=35.0)
         self.active_player_id = active_player_id
-        self.rule_text: Optional[str] = None
+        self.selected_rule_id: Optional[int] = None
         self.done = False
+        self._activated = False
 
-    @discord.ui.button(label="📜 Write the Law!", style=discord.ButtonStyle.primary)
-    async def open_modal(self, interaction: discord.Interaction, _button: discord.ui.Button):
+    @discord.ui.button(label="⚖️ Choose the Law!", style=discord.ButtonStyle.primary)
+    async def choose_law(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.active_player_id:
             await interaction.response.send_message(
-                "⚠️ This isn't your law to write!", ephemeral=True
+                "⚠️ This isn't your law to choose!", ephemeral=True
             )
             return
-        modal = BamboozleRuleModal()
-        await interaction.response.send_modal(modal)
-        timed_out = await modal.wait()
-        if not timed_out and modal.submitted:
-            self.rule_text = modal.submitted_rule
+        if self._activated:
+            await interaction.response.send_message(
+                "⚠️ You're already choosing!", ephemeral=True
+            )
+            return
+        self._activated = True
+
+        options = [
+            discord.SelectOption(
+                label=rule.name,
+                value=str(rule.id),
+                description=rule.description[:100],
+            )
+            for rule in BAMBOOZLE_RULES
+        ]
+        select = discord.ui.Select(
+            placeholder="⚖️ Choose the new Law of the Land...",
+            options=options,
+        )
+        inner_view = discord.ui.View(timeout=float(BAMBOOZLE_RULE_INPUT_TIMEOUT_SECONDS))
+        inner_result: dict = {"rule_id": None}
+
+        async def on_select(sel_interaction: discord.Interaction):
+            if sel_interaction.user.id != self.active_player_id:
+                await sel_interaction.response.send_message("Not yours!", ephemeral=True)
+                return
+            inner_result["rule_id"] = int(sel_interaction.data["values"][0])
+            inner_view.stop()
+            await sel_interaction.response.defer()
+
+        select.callback = on_select
+        inner_view.add_item(select)
+
+        await interaction.response.send_message(
+            "⚖️ **Choose the new Law of the Land!** You have 60 seconds.",
+            view=inner_view,
+            ephemeral=True,
+        )
+        await inner_view.wait()
+
+        if inner_result["rule_id"] is not None:
+            self.selected_rule_id = inner_result["rule_id"]
             self.done = True
             self.stop()
 
@@ -447,10 +472,12 @@ class BamboozledCog(commands.Cog):
             score_str = display[pid] if game.mist_active else f"**{game.scores.get(pid, 0):,}** pts"
             embed.add_field(name=f"{medal} {name} {badges}".strip(), value=score_str, inline=False)
 
-        if game.bamboozle_rule:
+        if game.active_bamboozle_rule:
+            rule = game.active_bamboozle_rule
+            perm_note = " *(permanent)*" if rule["is_permanent"] else ""
             embed.add_field(
-                name="🃏 ACTIVE BAMBOOZLE RULE",
-                value=f"*{game.bamboozle_rule.text}*",
+                name="⚖️ ACTIVE LAW",
+                value=f"**{rule['name']}**{perm_note} — *{rule['description']}*",
                 inline=False,
             )
         embed.set_footer(text=f"Round {game.current_round}/{TOTAL_ROUNDS}")
@@ -483,6 +510,7 @@ class BamboozledCog(commands.Cog):
 
             mist_lifted = game.decrement_mist()
 
+            prev_rule = game.active_bamboozle_rule
             rule_expired = game.advance_turn()
 
             if mist_lifted:
@@ -492,9 +520,10 @@ class BamboozledCog(commands.Cog):
                 )
                 await channel.send(embed=self._scores_embed(game))
 
-            if rule_expired:
+            if rule_expired and prev_rule:
                 await channel.send(
-                    "📜 **The Bamboozle Rule has expired!** Anarchy resumes. Act normally. Whatever that means."
+                    f"📜 **THE LAW HAS EXPIRED!** ⚖️ *{prev_rule['name']}* is no more. "
+                    f"Anarchy resumes. Act normally. Whatever that means."
                 )
 
             # Post round summary (not after the final round — endgame handles that)
@@ -518,19 +547,27 @@ class BamboozledCog(commands.Cog):
         cid = channel.id
         player_name = game.player_display_name(player_id)
         game.forfeit_requested = False
+        game.answer_time_seconds = 0.0
 
         await channel.send(
             f"🎬 It's **{player_name}'s** turn. The studio lights dim. "
             f"The audience holds its breath. Here comes your question..."
         )
 
-        if game.bamboozle_rule:
+        if game.active_bamboozle_rule:
+            rule = game.active_bamboozle_rule
+            perm_note = " *(permanent)*" if rule["is_permanent"] else ""
             await asyncio.sleep(0.5)
-            setter = game.player_names.get(game.bamboozle_rule.set_by, "Someone")
             await channel.send(
-                f"📜 **ACTIVE BAMBOOZLE RULE** *(by {setter}):* "
-                f"*\"{game.bamboozle_rule.text}\"*"
+                f"⚖️ **ACTIVE LAW: {rule['name']}**{perm_note} — *{rule['description']}*"
             )
+
+        # Start-of-turn rule enforcement (Rules 5, 6)
+        if game.active_bamboozle_rule:
+            sot_msg = apply_start_of_turn(game.active_bamboozle_rule, game, player_id)
+            if sot_msg:
+                await asyncio.sleep(0.5)
+                await channel.send(sot_msg)
 
         await asyncio.sleep(1)
 
@@ -548,6 +585,7 @@ class BamboozledCog(commands.Cog):
         )
 
         view = AnswerView(answers, correct_idx, player_id)
+        question_sent_at = time.monotonic()
         msg = await channel.send(
             f"🎯 **{player_name}**, you have **{QUESTION_TIMEOUT_SECONDS} seconds!**",
             embed=embed,
@@ -564,6 +602,12 @@ class BamboozledCog(commands.Cog):
 
         await asyncio.gather(view.wait(), _forfeit_watch())
 
+        # Record answer time before anything else
+        if not view.timed_out and not game.forfeit_requested:
+            game.answer_time_seconds = time.monotonic() - question_sent_at
+        else:
+            game.answer_time_seconds = float(QUESTION_TIMEOUT_SECONDS)
+
         # Disable buttons
         for item in view.children:
             item.disabled = True
@@ -577,9 +621,18 @@ class BamboozledCog(commands.Cog):
 
         # ── Timeout / Forfeit ────────────────────────────────
         if view.timed_out or game.forfeit_requested:
-            game.apply_points(player_id, TIMEOUT_POINTS)
+            active_rule = game.active_bamboozle_rule
+            timeout_penalty = get_effective_timeout_penalty(active_rule)
+            game.apply_points(player_id, timeout_penalty)
+            game.consecutive_correct[player_id] = 0
+
             score = game.scores[player_id]
             label = "FORFEITED" if game.forfeit_requested else "TIME'S UP"
+            terror_note = (
+                f" ⚠️ *Timeout Terror: -{BAMBOOZLE_TIMEOUT_TERROR_COST} pts!*"
+                if active_rule and active_rule["id"] == 7 and not game.forfeit_requested
+                else ""
+            )
             if game.mist_active:
                 await channel.send(
                     f"⏰ **{label}** for **{player_name}**! "
@@ -588,13 +641,20 @@ class BamboozledCog(commands.Cog):
             else:
                 await channel.send(
                     f"⏰ **{label}** for **{player_name}**! "
-                    f"That's **{TIMEOUT_POINTS:,} points**. Ouch. *(Score: {score:,})*"
+                    f"That's **{abs(timeout_penalty):,} points**.{terror_note} *(Score: {score:,})*"
                 )
+
+            # Rule 2 (Slow Burn) — timeout always exceeds 20s threshold
+            if active_rule:
+                slow_burn_msg = apply_after_wrong_or_timeout(active_rule, game, player_id)
+                if slow_burn_msg:
+                    await channel.send(slow_burn_msg)
             return
 
         # ── Correct ──────────────────────────────────────────
         if view.chosen_idx == correct_idx:
             game.apply_points(player_id, CORRECT_ANSWER_POINTS)
+            game.consecutive_correct[player_id] = game.consecutive_correct.get(player_id, 0) + 1
             score = game.scores[player_id]
             if game.mist_active:
                 await channel.send(
@@ -606,7 +666,33 @@ class BamboozledCog(commands.Cog):
                     f"✅ **CORRECT!** **{player_name}** nails it for "
                     f"**+{CORRECT_ANSWER_POINTS}** points! *(Score: {score:,})*"
                 )
+
+            # Rule enforcement for correct answers (Rules 1, 4, 8)
+            active_rule = game.active_bamboozle_rule
+            if active_rule:
+                rule_msg = apply_after_correct(active_rule, game, player_id)
+                if rule_msg:
+                    await channel.send(rule_msg)
+
             await asyncio.sleep(1)
+
+            # Rule 9 (Streak Breaker) — intercept before Chance Card is drawn
+            if active_rule and active_rule["id"] == 9:
+                max_score = max(game.scores.values(), default=0)
+                if game.scores.get(player_id, 0) >= max_score:
+                    await channel.send(
+                        f"⚡ **STREAK BREAKER!** **{player_name}** is in first place — "
+                        f"the Chance Card is **DISCARDED** and replaced with a Wicked Wango Card!"
+                    )
+                    await asyncio.sleep(1)
+                    wango_card = draw_wango_card()
+                    await channel.send(f"🎴 **{player_name}** draws a **Wicked Wango Card**...")
+                    await asyncio.sleep(1)
+                    await channel.send(WANGO_CARD_FLAVOUR[wango_card])
+                    await asyncio.sleep(1)
+                    await self._apply_wango_card(channel, game, player_id, wango_card, chain_depth=0)
+                    return
+
             card = draw_chance_card()
             await channel.send(f"🃏 **{player_name}** draws a **Chance Card**...")
             await asyncio.sleep(1)
@@ -616,15 +702,24 @@ class BamboozledCog(commands.Cog):
 
         # ── Wrong ────────────────────────────────────────────
         else:
-            penalty = WRONG_ANSWER_POINTS
+            active_rule = game.active_bamboozle_rule
+            wrong_base = get_effective_wrong_penalty(active_rule)
+            penalty = wrong_base
             if game.sombrero_holder == player_id:
                 penalty -= game.sombrero_penalty
             game.apply_points(player_id, penalty)
+            game.consecutive_correct[player_id] = 0
+
             score = game.scores[player_id]
             correct_text = question["correct_answer"]
             sombrero_note = (
                 f" 🪅 (+{game.sombrero_penalty} Sombrero penalty)"
                 if game.sombrero_holder == player_id
+                else ""
+            )
+            dj_note = (
+                " ⚠️ *Double Jeopardy: -100 pts!*"
+                if active_rule and active_rule["id"] == 3
                 else ""
             )
             if game.mist_active:
@@ -634,9 +729,16 @@ class BamboozledCog(commands.Cog):
             else:
                 await channel.send(
                     f"❌ **WRONG!** The answer was **{correct_text}**. "
-                    f"**{player_name}** loses **{abs(penalty)}** points{sombrero_note}. "
+                    f"**{player_name}** loses **{abs(penalty)}** points{sombrero_note}{dj_note}. "
                     f"*(Score: {score:,})*"
                 )
+
+            # Rule 2 (Slow Burn) check on wrong answer
+            if active_rule:
+                slow_burn_msg = apply_after_wrong_or_timeout(active_rule, game, player_id)
+                if slow_burn_msg:
+                    await channel.send(slow_burn_msg)
+
             await asyncio.sleep(1)
 
             # Golden Pass check
@@ -780,39 +882,43 @@ class BamboozledCog(commands.Cog):
 
         elif card == ChanceCard.BAMBOOZLE:
             await channel.send(
-                f"🃏 **{pname}** draws **THE BAMBOOZLE!** "
-                f"You have ~30 seconds to click the button and write THE LAW!"
+                f"🃏 **{pname}** drew the **Bamboozle** card! They're choosing a new law of the land..."
             )
-            btn_view = BamboozleRuleButton(player_id)
+            btn_view = BamboozleRuleTriggerButton(player_id)
             await channel.send(
-                f"🃏 <@{player_id}>, click below to write your Bamboozle Rule!",
+                f"⚖️ <@{player_id}>, click below to choose your law! You have 35 seconds to click.",
                 view=btn_view,
             )
             await btn_view.wait()
 
-            if btn_view.done and btn_view.rule_text:
-                rule_text = btn_view.rule_text
-                # Content filter — reject if the text fails the SFW check
-                if BAMBOOZLE_RULE_FILTER_ENABLED and not is_clean(rule_text):
+            if btn_view.done and btn_view.selected_rule_id is not None:
+                rule_def = next(
+                    (r for r in BAMBOOZLE_RULES if r.id == btn_view.selected_rule_id), None
+                )
+                if rule_def:
+                    active_rule = make_active_rule(rule_def.id, len(game.players))
+                    game.active_bamboozle_rule = active_rule
+
+                    if rule_def.is_permanent:
+                        perm_note = " This rule is **permanent** for the rest of the game."
+                    else:
+                        perm_note = (
+                            f" This rule is in effect for **1 full round** "
+                            f"({len(game.players)} turns)."
+                        )
                     await channel.send(
-                        f"{rejection_reason()}\n"
-                        f"**{pname}'s** rule was discarded. The cosmos remain lawless."
+                        f"⚖️ **THE NEW LAW: {rule_def.name}** — {rule_def.description}."
+                        f" This is now in effect.{perm_note}"
                     )
-                else:
-                    game.bamboozle_rule = BamboozleRule(
-                        text=rule_text,
-                        set_by=player_id,
-                        turns_remaining=len(game.players),
-                    )
-                    await channel.send(
-                        f"📜 **THE LAW HAS BEEN WRITTEN!** Hear ye, hear ye!\n\n"
-                        f"🃏 **BAMBOOZLE RULE:** *\"{rule_text}\"*\n\n"
-                        f"This rule is in effect for **1 full round**. "
-                        f"Honour system only — the bot won't enforce it. ACT ACCORDINGLY."
-                    )
+
+                    # Apply permanent rule effects immediately
+                    if rule_def.is_permanent:
+                        on_set_msg = apply_on_set(active_rule, game)
+                        if on_set_msg:
+                            await channel.send(on_set_msg)
             else:
                 await channel.send(
-                    f"⏰ **{pname}** failed to write a rule in time. The cosmos remain lawless."
+                    f"⏰ **{pname}** failed to choose a rule in time. The cosmos remain lawless."
                 )
 
     # ─────────────────────────────────────────────────────────

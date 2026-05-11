@@ -5,13 +5,6 @@ from game_engine.constants import MAX_SINGLE_SWING_FIXED, MIST_TURN_DURATION, SO
 
 
 @dataclass
-class BamboozleRule:
-    text: str
-    set_by: int
-    turns_remaining: int
-
-
-@dataclass
 class GameState:
     channel_id: int
     host_id: int
@@ -32,32 +25,38 @@ class GameState:
     sombrero_holder: Optional[int] = None
     sombrero_penalty: int = SOMBRERO_EXTRA_PENALTY
 
-    bamboozle_rule: Optional[BamboozleRule] = None
+    # Predefined Bamboozle Rule — dict with keys: id, name, description, is_permanent, turns_remaining
+    active_bamboozle_rule: Optional[dict] = None
 
     mist_active: bool = False
     mist_turns_remaining: int = 0
+    mist_turn_duration: int = MIST_TURN_DURATION  # overridable by Mist Magnet rule
 
     session_token: Optional[str] = None
 
-    # Forfeit flag set by the /forfeit slash command
     forfeit_requested: bool = False
+
+    # Per-player consecutive correct answer streak (reset on wrong/timeout)
+    consecutive_correct: Dict[int, int] = field(default_factory=dict)
+    # Seconds the active player took to answer this turn (set after answer/timeout)
+    answer_time_seconds: float = 0.0
 
     def current_player_id(self) -> int:
         return self.players[self.current_turn_index]
 
     def advance_turn(self) -> bool:
         """Advance to next player, increment round if needed.
-        Returns True if the Bamboozle Rule just expired."""
+        Returns True if a non-permanent Bamboozle Rule just expired."""
         self.current_turn_index += 1
         if self.current_turn_index >= len(self.players):
             self.current_turn_index = 0
             self.current_round += 1
 
         rule_expired = False
-        if self.bamboozle_rule is not None:
-            self.bamboozle_rule.turns_remaining -= 1
-            if self.bamboozle_rule.turns_remaining <= 0:
-                self.bamboozle_rule = None
+        if self.active_bamboozle_rule is not None and not self.active_bamboozle_rule["is_permanent"]:
+            self.active_bamboozle_rule["turns_remaining"] -= 1
+            if self.active_bamboozle_rule["turns_remaining"] <= 0:
+                self.active_bamboozle_rule = None
                 rule_expired = True
         return rule_expired
 
@@ -103,4 +102,4 @@ class GameState:
 
     def activate_mist(self):
         self.mist_active = True
-        self.mist_turns_remaining = MIST_TURN_DURATION
+        self.mist_turns_remaining = self.mist_turn_duration
