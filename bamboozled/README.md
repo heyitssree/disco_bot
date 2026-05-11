@@ -12,6 +12,48 @@ Bamboozled lives in the `bamboozled/` sub-directory of the same `disco_bot` repo
 | Bamboozle Rule input | Player-typed rules are screened by a content filter before posting |
 | `BAMBOOZLE_RULE_FILTER_ENABLED` | Toggle in `constants.py` — `True` by default |
 | `SAFE_OPENTDB_CATEGORY_IDS` | Configurable list of allowed category IDs in `constants.py` |
+| Game config UI | Host sees a rounds/difficulty/category picker before the game starts |
+| Player mentions | Turn opener and silence-skip now ping the active player |
+| Pacing delays | Small sleeps between game events for readability |
+| Boli Points bridge | Bamboozled awards Boli Points into Navi's database at game end |
+
+---
+
+## Boli Points bridge
+
+At the end of each game Bamboozled writes Boli Point awards directly into Navi's SQLite database. No Navi code is imported — only raw SQL via `aiosqlite`.
+
+### Setup
+
+Set `NAVI_DB_PATH` in `bamboozled/.env` to the absolute path of Navi's database on the VM:
+
+```env
+NAVI_DB_PATH=/home/astrobot/disco_bot/data/astro_bot.db
+```
+
+If the variable is empty or the file does not exist, the bridge silently does nothing — Bamboozled will never crash due to a missing Navi database.
+
+### Award formula
+
+| Component | Amount |
+|---|---|
+| Participation | `round(20 × difficulty_multiplier)` |
+| Per correct answer | `correct_answers × 3` (no multiplier) |
+| Winner bonus | `round(50 × dm)` |
+| 2nd place (3+ players) | `round(20 × dm)` |
+| 3rd place (5+ players) | `round(10 × dm)` |
+| Score bonus | `max(0, score) // 50` (+1 per 50 positive pts) |
+| Negative score penalty | `max(score // 100, -20)` (capped at −20) |
+
+Difficulty multipliers: Easy = 0.75 × · Medium = 1.0 × · Hard = 1.5 × · Mixed = 1.0 ×
+
+Only positive totals are written to Navi's DB. Negative totals appear in the end-of-game embed but are not deducted from Navi.
+
+### Environment variable
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NAVI_DB_PATH` | *(empty)* | Absolute path to Navi's `astro_bot.db`. Leave empty to disable the bridge. |
 
 ---
 

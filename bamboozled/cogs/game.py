@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from cogs.game_config_view import GameConfigView
 from db.database import (
     get_leaderboard,
     get_player_stats,
@@ -17,6 +18,7 @@ from db.database import (
     update_player_stats,
     upsert_player,
 )
+from db.navi_bridge import award_boli
 from game_engine.cards import (
     CHANCE_CARD_FLAVOUR,
     WANGO_CARD_FLAVOUR,
@@ -40,6 +42,7 @@ from game_engine.constants import (
     BAMBOOZLE_TIMEOUT_TERROR_COST,
     BONUS_ROUND_POINTS,
     CORRECT_ANSWER_POINTS,
+    DIFFICULTY_MULTIPLIER,
     DOUBLE_DOWN_BONUS,
     DOUBLE_DOWN_PENALTY,
     GIFT_STEAL_AMOUNT,
@@ -48,6 +51,7 @@ from game_engine.constants import (
     GOLDEN_MONKEY_TIMEOUT_SECONDS,
     LUCKY_LLAMA_BONUS,
     MIST_TURN_DURATION,
+    NAVI_DB_PATH,
     QUESTION_TIMEOUT_SECONDS,
     REVERSE_UNO_PENALTY,
     SOMBRERO_EXTRA_PENALTY,
@@ -59,6 +63,7 @@ from game_engine.constants import (
     TOTAL_ROUNDS,
     WANGO_AGAIN_WHEEL_DEPTH_LIMIT,
     DOUBLE_WANGO_CHAIN_LIMIT,
+    WRONG_ANSWER_POINTS,
 )
 from game_engine.state import GameState
 from game_engine.trivia import fetch_question, fetch_session_token, shuffle_answers
@@ -164,7 +169,7 @@ class BamboozleRuleTriggerButton(discord.ui.View):
     """Public button that triggers an ephemeral Select Menu for rule selection."""
 
     def __init__(self, active_player_id: int):
-        super().__init__(timeout=35.0)
+        super().__init__(timeout=float(BAMBOOZLE_RULE_INPUT_TIMEOUT_SECONDS) + 10)
         self.active_player_id = active_player_id
         self.selected_rule_id: Optional[int] = None
         self.done = False
@@ -261,6 +266,55 @@ class GoldenMonkeyView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────────────────────
+# Boli Points helpers
+# ─────────────────────────────────────────────────────────────
+
+def calculate_boli_award(
+    player_id: int,
+    game: "GameState",
+    correct_answers: dict,
+    winner_id: int,
+    sorted_players: list,
+) -> tuple:
+    """Returns (boli_amount, reason_string). Amount can be negative."""
+    dm = DIFFICULTY_MULTIPLIER.get(game.question_difficulty, 1.0)
+
+    participation = round(20 * dm)
+    correct_count = correct_answers.get(player_id, 0)
+    correct_reward = correct_count * 3
+
+    position = sorted_players.index(player_id) if player_id in sorted_players else len(sorted_players)
+    if player_id == winner_id:
+        placement_bonus = round(50 * dm)
+        placement_label = "winner"
+    elif position == 1 and len(game.players) >= 3:
+        placement_bonus = round(20 * dm)
+        placement_label = "2nd place"
+    elif position == 2 and len(game.players) >= 5:
+        placement_bonus = round(10 * dm)
+        placement_label = "3rd place"
+    else:
+        placement_bonus = 0
+        placement_label = f"{position + 1}th place"
+
+    final_score = game.scores.get(player_id, 0)
+    score_bonus = max(0, final_score) // 50
+
+    penalty = 0
+    if final_score < 0:
+        penalty = min(0, final_score // 100)
+        penalty = max(penalty, -20)
+
+    total = participation + correct_reward + placement_bonus + score_bonus + penalty
+    diff_str = game.question_difficulty.title() if game.question_difficulty else "Mixed"
+    reason = (
+        f"Bamboozled: {placement_label}, {correct_count} correct, "
+        f"{diff_str}, score {final_score}"
+    )
+    return total, reason
+
+
+# ─────────────────────────────────────────────────────────────
 # Cog
 # ─────────────────────────────────────────────────────────────
 
@@ -336,6 +390,21 @@ class BamboozledCog(commands.Cog):
             )
             return
 
+        channel = interaction.channel
+
+        config_view = GameConfigView()
+        await interaction.response.send_message(
+            "⚙️ **Configure your game!** Select your settings below, then click **Confirm & Start**.\n"
+            "You have 30 seconds — the game will start with defaults if you don't confirm.",
+            view=config_view,
+            ephemeral=True,
+        )
+        await config_view.wait()
+
+        game.total_rounds = config_view.total_rounds
+        game.question_difficulty = config_view.question_difficulty
+        game.question_category = config_view.question_category
+
         game.active = True
         game.session_token = await fetch_session_token()
         await register_active_channel(str(cid))
@@ -343,15 +412,15 @@ class BamboozledCog(commands.Cog):
         roster = "\n".join(
             f"{i + 1}. {game.player_names[pid]}" for i, pid in enumerate(game.players)
         )
-        await interaction.response.send_message(
+        await channel.send(
             f"🎬🎉 **BAMBOOZLED BEGINS!** 🎉🎬\n\n"
             f"**{len(game.players)} player(s) take the stage:**\n{roster}\n\n"
             f"Everyone starts with **{STARTING_POINTS:,} points**. "
-            f"The game runs for **{TOTAL_ROUNDS} rounds**.\n\n"
+            f"**Settings: {config_view.config_summary()}**\n\n"
             f"*The studio audience goes absolutely FERAL...*"
         )
 
-        asyncio.create_task(self._run_game(interaction.channel, game))
+        asyncio.create_task(self._run_game(channel, game))
 
     # ── /bamboozled scores ───────────────────────────────────
 
@@ -480,7 +549,7 @@ class BamboozledCog(commands.Cog):
                 value=f"**{rule['name']}**{perm_note} — *{rule['description']}*",
                 inline=False,
             )
-        embed.set_footer(text=f"Round {game.current_round}/{TOTAL_ROUNDS}")
+        embed.set_footer(text=f"Round {game.current_round}/{game.total_rounds}")
         return embed
 
     def _still_active(self, cid: int, game: GameState) -> bool:
@@ -493,13 +562,13 @@ class BamboozledCog(commands.Cog):
     async def _run_game(self, channel: discord.TextChannel, game: GameState):
         cid = channel.id
 
-        while game.current_round <= TOTAL_ROUNDS and self._still_active(cid, game):
+        while game.current_round <= game.total_rounds and self._still_active(cid, game):
             player_id = game.current_player_id()
 
             if game.silenced.get(player_id):
                 game.silenced[player_id] = False
                 await channel.send(
-                    f"🤫 **{game.player_display_name(player_id)}'s** turn is **SKIPPED** — "
+                    f"🤫 <@{player_id}>'s turn is **SKIPPED** — "
                     f"The Silence reigns supreme. Not a peep."
                 )
                 await asyncio.sleep(2)
@@ -527,7 +596,7 @@ class BamboozledCog(commands.Cog):
                 )
 
             # Post round summary (not after the final round — endgame handles that)
-            if game.current_turn_index == 0 and game.current_round <= TOTAL_ROUNDS:
+            if game.current_turn_index == 0 and game.current_round <= game.total_rounds:
                 completed = game.current_round - 1
                 await asyncio.sleep(1)
                 await channel.send(
@@ -550,9 +619,10 @@ class BamboozledCog(commands.Cog):
         game.answer_time_seconds = 0.0
 
         await channel.send(
-            f"🎬 It's **{player_name}'s** turn. The studio lights dim. "
+            f"🎬 It's <@{player_id}>'s turn. The studio lights dim. "
             f"The audience holds its breath. Here comes your question..."
         )
+        await asyncio.sleep(1.0)
 
         if game.active_bamboozle_rule:
             rule = game.active_bamboozle_rule
@@ -571,7 +641,11 @@ class BamboozledCog(commands.Cog):
 
         await asyncio.sleep(1)
 
-        question, new_token = await fetch_question(game.session_token)
+        question, new_token = await fetch_question(
+            game.session_token,
+            difficulty=game.question_difficulty,
+            category=game.question_category,
+        )
         game.session_token = new_token
 
         answers, correct_idx = shuffle_answers(question)
@@ -655,6 +729,7 @@ class BamboozledCog(commands.Cog):
         if view.chosen_idx == correct_idx:
             game.apply_points(player_id, CORRECT_ANSWER_POINTS)
             game.consecutive_correct[player_id] = game.consecutive_correct.get(player_id, 0) + 1
+            game.correct_answer_count[player_id] = game.correct_answer_count.get(player_id, 0) + 1
             score = game.scores[player_id]
             if game.mist_active:
                 await channel.send(
@@ -674,7 +749,7 @@ class BamboozledCog(commands.Cog):
                 if rule_msg:
                     await channel.send(rule_msg)
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
 
             # Rule 9 (Streak Breaker) — intercept before Chance Card is drawn
             if active_rule and active_rule["id"] == 9:
@@ -739,7 +814,7 @@ class BamboozledCog(commands.Cog):
                 if slow_burn_msg:
                     await channel.send(slow_burn_msg)
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.5)
 
             # Golden Pass check
             if game.golden_pass.get(player_id):
@@ -824,7 +899,11 @@ class BamboozledCog(commands.Cog):
             )
             await asyncio.sleep(1)
 
-            question, new_token = await fetch_question(game.session_token)
+            question, new_token = await fetch_question(
+                game.session_token,
+                difficulty=game.question_difficulty,
+                category=game.question_category,
+            )
             game.session_token = new_token
             answers, correct_idx = shuffle_answers(question)
 
@@ -1263,6 +1342,7 @@ class BamboozledCog(commands.Cog):
                 f"**{pname}** earns **+{GOLDEN_MONKEY_BELLY} pts**! "
                 f"GLORIOUS! MAGNIFICENT! *(Score: {game.scores[player_id]:,})*"
             )
+            await asyncio.sleep(1.0)
 
         else:  # tail
             game.apply_points(player_id, GOLDEN_MONKEY_TAIL)
@@ -1285,11 +1365,11 @@ class BamboozledCog(commands.Cog):
         cid = channel.id
 
         await channel.send(
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🎬🎬🎬 **THAT'S A WRAP ON ROUND 5!** 🎬🎬🎬\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "*The studio audience ERUPTS. The confetti cannons fire. "
-            "Somewhere, a llama weeps with joy.*"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎬🎬🎬 **THAT'S A WRAP ON ROUND {game.total_rounds}!** 🎬🎬🎬\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*The studio audience ERUPTS. The confetti cannons fire. "
+            f"Somewhere, a llama weeps with joy.*"
         )
         await asyncio.sleep(2)
 
@@ -1331,7 +1411,11 @@ class BamboozledCog(commands.Cog):
                 await channel.send(f"❓ **{wname}** faces a tiebreaker question!")
                 await asyncio.sleep(1)
 
-                question, new_token = await fetch_question(game.session_token)
+                question, new_token = await fetch_question(
+                    game.session_token,
+                    difficulty=game.question_difficulty,
+                    category=game.question_category,
+                )
                 game.session_token = new_token
                 answers, correct_idx = shuffle_answers(question)
 
@@ -1403,6 +1487,45 @@ class BamboozledCog(commands.Cog):
         )
         for pid in game.players:
             await update_player_stats(str(pid), pid == champion_id, game.scores.get(pid, 0))
+
+        # Boli Points bridge
+        if NAVI_DB_PATH:
+            final_sorted = sorted(game.players, key=lambda p: game.scores.get(p, 0), reverse=True)
+            boli_results = []
+            for pid in final_sorted:
+                amount, reason = calculate_boli_award(
+                    pid, game, game.correct_answer_count, champion_id, final_sorted
+                )
+                boli_results.append((pid, amount, reason))
+
+            boli_tasks = [
+                award_boli(pid, amount, reason)
+                for pid, amount, reason in boli_results
+                if amount > 0
+            ]
+            if boli_tasks:
+                await asyncio.gather(*boli_tasks, return_exceptions=True)
+
+            medals = ["🥇", "🥈", "🥉"]
+            boli_embed = discord.Embed(
+                title="🍮 Boli Points Awarded (powered by Navi)",
+                color=discord.Color.gold(),
+            )
+            has_negative = any(amount < 0 for _, amount, _ in boli_results)
+            for i, (pid, amount, _) in enumerate(boli_results):
+                pname = game.player_display_name(pid)
+                medal = medals[i] if i < 3 else "  "
+                amount_str = f"+{amount}" if amount >= 0 else str(amount)
+                boli_embed.add_field(
+                    name=f"{medal} {pname}",
+                    value=f"{amount_str} Boli",
+                    inline=False,
+                )
+            if has_negative:
+                boli_embed.set_footer(
+                    text="Negative Boli reflects a negative final score — the chaos got you this time."
+                )
+            await channel.send(embed=boli_embed)
 
         # Clean up
         game.active = False

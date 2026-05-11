@@ -1,3 +1,14 @@
+import os
+
+NAVI_DB_PATH = os.getenv("NAVI_DB_PATH", "")
+
+DIFFICULTY_MULTIPLIER: dict = {
+    "easy":  0.75,
+    "medium": 1.0,
+    "hard":  1.5,
+    None:    1.0,
+}
+
 # ── OpenTDB SFW category whitelist ────────────────────────────────────────────
 # Only fetch from these verified-clean categories.
 # Full list: https://opentdb.com/api_category.php

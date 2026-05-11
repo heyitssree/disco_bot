@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from game_engine.constants import MAX_SINGLE_SWING_FIXED, MIST_TURN_DURATION, SOMBRERO_EXTRA_PENALTY
+from game_engine.constants import MAX_SINGLE_SWING_FIXED, MIST_TURN_DURATION, SOMBRERO_EXTRA_PENALTY, TOTAL_ROUNDS
 
 
 @dataclass
@@ -38,8 +38,15 @@ class GameState:
 
     # Per-player consecutive correct answer streak (reset on wrong/timeout)
     consecutive_correct: Dict[int, int] = field(default_factory=dict)
+    # Per-player total correct answers this game (for Boli calculation)
+    correct_answer_count: Dict[int, int] = field(default_factory=dict)
     # Seconds the active player took to answer this turn (set after answer/timeout)
     answer_time_seconds: float = 0.0
+
+    # Game configuration (set by host at start)
+    total_rounds: int = TOTAL_ROUNDS
+    question_difficulty: Optional[str] = None   # "easy"/"medium"/"hard"/None for mixed
+    question_category: Optional[int] = None     # OpenTDB category ID, None for all
 
     def current_player_id(self) -> int:
         return self.players[self.current_turn_index]

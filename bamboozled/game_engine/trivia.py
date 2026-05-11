@@ -90,13 +90,19 @@ async def _reset_token(token: str) -> Optional[str]:
     return None
 
 
-async def fetch_question(session_token: Optional[str] = None) -> tuple[Optional[dict], Optional[str]]:
+async def fetch_question(
+    session_token: Optional[str] = None,
+    difficulty: Optional[str] = None,
+    category: Optional[int] = None,
+) -> tuple[Optional[dict], Optional[str]]:
     """Fetch one question. Returns (question_dict, token). Falls back on failure."""
     params: dict = {
         "amount": 1,
         "type": "multiple",
-        "category": random.choice(SAFE_OPENTDB_CATEGORY_IDS),
+        "category": category if category is not None else random.choice(SAFE_OPENTDB_CATEGORY_IDS),
     }
+    if difficulty:
+        params["difficulty"] = difficulty
     if session_token:
         params["token"] = session_token
 
