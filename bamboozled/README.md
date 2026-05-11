@@ -138,30 +138,46 @@ Press `Ctrl+O` → `Enter` to save, `Ctrl+X` to exit.
 
 ---
 
-## Step 5 — Run the bot
+## Step 5 — Install and start the systemd service
 
-Open a **new tmux window** (don't touch the existing AstRobot session):
+The bot runs as a systemd service (same pattern as AstRobot). The service file is included in the repo at `bamboozled.service`.
 
 ```bash
-# Create a new tmux session just for Bamboozled
-tmux new -s bamboozled
+# Create the logs directory the service writes to
+mkdir -p ~/disco_bot/bamboozled/logs
 
-# Inside the new session
-cd ~/disco_bot/bamboozled
-source .venv/bin/activate
-python bot.py
+# Copy the service file into place
+sudo cp ~/disco_bot/bamboozled.service /etc/systemd/system/bamboozled.service
+
+# Reload systemd so it picks up the new unit
+sudo systemctl daemon-reload
+
+# Enable the service so it starts automatically on VM reboot
+sudo systemctl enable bamboozled
+
+# Start it now
+sudo systemctl start bamboozled
 ```
 
-On a successful start you should see:
+Confirm it's running:
 
-```
-2026-05-11 [INFO] __main__: Synced 7 slash command(s).
-2026-05-11 [INFO] __main__: Logged in as Bamboozled#1234 (ID: ...)
-2026-05-11 [INFO] __main__: Bamboozled bot is ready!
+```bash
+sudo systemctl status bamboozled
 ```
 
-**Detach from tmux** (bot keeps running after you close SSH):
-Press `Ctrl+B`, release, then press `D`.
+You should see `Active: active (running)`. Check the startup log for the ready message:
+
+```bash
+tail -n 20 ~/disco_bot/bamboozled/logs/bot.log
+```
+
+Expected output:
+
+```
+[INFO] __main__: Synced 8 slash command(s).
+[INFO] __main__: Logged in as Bamboozled#1234 (ID: ...)
+[INFO] __main__: Bamboozled bot is ready!
+```
 
 > **Slash command propagation**: Global command sync can take up to 1 hour on first run. For instant registration during testing, see [Fast dev sync](#fast-dev-sync-optional) below.
 
@@ -173,8 +189,9 @@ In Discord, type `/bamboozled` — the command group should appear. Run through:
 
 | Action | Expected |
 |---|---|
+| `/bamboozled help` | Orange embed with game overview and command list |
 | `/bamboozled join` | Bot posts lobby message with your name |
-| `/bamboozled start` | Game begins, first question posted |
+| `/bamboozled start` | Config UI appears (ephemeral), then game begins |
 | Answer a question | Points awarded, card drawn |
 | `/bamboozled scores` | Ephemeral score list |
 | `/bamboozled leaderboard` | All-time wins embed |
@@ -182,20 +199,17 @@ In Discord, type `/bamboozled` — the command group should appear. Run through:
 
 ---
 
-## Checking logs / reattaching
+## Checking logs
 
 ```bash
-# Reattach to the running bot
-tmux attach -t bamboozled
+# Live log stream (Ctrl+C to stop)
+sudo journalctl -u bamboozled -f
 
-# Stop the bot
-# (inside tmux) Ctrl+C
+# Last 50 lines from the log file
+tail -n 50 ~/disco_bot/bamboozled/logs/bot.log
 
-# Restart after a code update
-tmux attach -t bamboozled
-# Ctrl+C to stop, then:
-git pull origin main
-python bot.py
+# Service status
+sudo systemctl status bamboozled
 ```
 
 ---
@@ -209,14 +223,12 @@ git commit -m "your message"
 git push origin main
 
 # On the VM
-tmux attach -t bamboozled
-# Ctrl+C to stop the bot
 cd ~/disco_bot
 git pull origin main
-cd bamboozled
-source .venv/bin/activate
-python bot.py
-# Ctrl+B then D to detach
+sudo systemctl restart bamboozled
+
+# Confirm it came back up
+sudo systemctl status bamboozled
 ```
 
 ---
@@ -248,7 +260,7 @@ nano ~/disco_bot/bamboozled/game_engine/constants.py
 | `BAMBOOZLE_RULE_FILTER_ENABLED` | `True` | Set to `False` to allow any player-typed rule text through unfiltered |
 | `SAFE_OPENTDB_CATEGORY_IDS` | 12 category IDs | Add or remove OpenTDB category IDs to change which topics questions can come from |
 
-After editing, restart the bot (Ctrl+C in tmux, then `python bot.py`).
+After editing, restart the bot: `sudo systemctl restart bamboozled`
 
 ---
 

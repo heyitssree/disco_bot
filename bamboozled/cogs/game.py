@@ -517,6 +517,49 @@ class BamboozledCog(commands.Cog):
             "The audience leaves in stunned silence."
         )
 
+    # ── /bamboozled help ─────────────────────────────────────
+
+    @bamboozled.command(name="help", description="How to play Bamboozled.")
+    async def help(self, interaction: discord.Interaction):
+        embed = discord.Embed(
+            title="🎬 Bamboozled — Chaos Trivia Game",
+            description=(
+                "A multiplayer trivia game where answering correctly just gets the chaos started. "
+                "Supports 1–6 players per game, fully bot-run with slash commands.\n\n"
+                "**How a turn works:**\n"
+                "Answer a trivia question → Correct gets you a **Chance Card**, wrong gets you a "
+                "**Wicked Wango Card**. Cards can send you to the **Wheel of Mayhem**, which has 8 "
+                "outcomes including the **Ladder of Chance** — which leads to the **Golden Monkey**, "
+                "who will ask you to choose Belly or Tail. Choose wrong and you also draw a Wango "
+                "card. The **Mystic Mist** can descend at any time and hide everyone's scores for "
+                "2 turns. The **Sombrero** passes between players and adds an extra penalty on wrong "
+                "answers. The **Bamboozle** card lets a player select a mechanically-enforced rule "
+                "that applies to everyone for a full round.\n\n"
+                "**Before each game starts, the host picks:**\n"
+                "• **Rounds:** 3, 5, 7, or 10\n"
+                "• **Difficulty:** Easy, Medium, Hard, or Mixed\n"
+                "• **Category:** All, or one of 13 curated topic areas\n\n"
+                "**Boli Points** are awarded at the end based on placement, correct answers, "
+                "difficulty, and your final in-game score. Hard difficulty pays more. A negative "
+                "final score costs a small Boli penalty — the chaos is your problem."
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.add_field(
+            name="📋 Commands",
+            value=(
+                "`/bamboozled join` — Join the lobby\n"
+                "`/bamboozled start` — Start the game and configure settings *(host only)*\n"
+                "`/bamboozled scores` — Check current scores mid-game *(hidden during Mist)*\n"
+                "`/bamboozled leaderboard` — All-time win leaderboard\n"
+                "`/bamboozled stats @user` — A specific player's all-time stats\n"
+                "`/bamboozled forfeit` — Skip your current turn *(treated as timeout)*\n"
+                "`/bamboozled endgame` — Force-end the game with no results saved *(host only)*"
+            ),
+            inline=False,
+        )
+        await interaction.response.send_message(embed=embed)
+
     # ─────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────

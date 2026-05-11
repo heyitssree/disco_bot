@@ -1,0 +1,18 @@
+[Unit]
+Description=Bamboozled — Chaos Trivia Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astrobot
+WorkingDirectory=/home/astrobot/disco_bot/bamboozled
+EnvironmentFile=/home/astrobot/disco_bot/bamboozled/.env
+ExecStart=/home/astrobot/disco_bot/bamboozled/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/astrobot/disco_bot/bamboozled/logs/bot.log
+StandardError=append:/home/astrobot/disco_bot/bamboozled/logs/bot.log
+
+[Install]
+WantedBy=multi-user.target
