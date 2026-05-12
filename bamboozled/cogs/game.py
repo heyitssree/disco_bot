@@ -653,28 +653,34 @@ class BamboozledCog(commands.Cog):
 
     # ── /bamboozled endgame ──────────────────────────────────
 
-    @bamboozled.command(name="endgame", description="Force-end the current game (host only, no results saved).")
+    @bamboozled.command(name="endgame", description="Force-end the current game or disband the lobby (host only).")
     async def endgame(self, interaction: discord.Interaction):
         game = _active_games.get(interaction.channel_id)
-        if not game or not game.active:
+        if not game:
             await interaction.response.send_message(
-                "⚠️ No active game to end.", ephemeral=True
+                "⚠️ No active game or lobby to end.", ephemeral=True
             )
             return
         if interaction.user.id != game.host_id:
             await interaction.response.send_message(
-                "⚠️ Only the host can force-end the game!", ephemeral=True
+                "⚠️ Only the host can end the game!", ephemeral=True
             )
             return
+        was_active = game.active
         game.active = False
         _active_games.pop(game.channel_id, None)
         if game.thread_id:
             _active_games.pop(game.thread_id, None)
         await unregister_active_channel(str(game.channel_id))
-        await interaction.response.send_message(
-            "🛑 **GAME ENDED EARLY.** The producer pulls the plug. No results saved. "
-            "The audience leaves in stunned silence."
-        )
+        if was_active:
+            await interaction.response.send_message(
+                "🛑 **GAME ENDED EARLY.** The producer pulls the plug. No results saved. "
+                "The audience leaves in stunned silence."
+            )
+        else:
+            await interaction.response.send_message(
+                "🛑 **LOBBY DISBANDED.** The show is cancelled before it began. Everyone go home."
+            )
 
     # ── /bamboozled testmode ─────────────────────────────────
 
