@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=astrobot
-WorkingDirectory=/home/astrobot/disco_bot/bamboozled
-EnvironmentFile=/home/astrobot/disco_bot/bamboozled/.env
-ExecStart=/home/astrobot/disco_bot/bamboozled/.venv/bin/python bot.py
+User=sreekuttanjayakumar97
+WorkingDirectory=/home/sreekuttanjayakumar97/disco_bot/bamboozled
+EnvironmentFile=/home/sreekuttanjayakumar97/disco_bot/bamboozled/.env
+ExecStart=/home/sreekuttanjayakumar97/disco_bot/bamboozled/.venv/bin/python bot.py
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/home/astrobot/disco_bot/bamboozled/logs/bot.log
-StandardError=append:/home/astrobot/disco_bot/bamboozled/logs/bot.log
+StandardOutput=append:/home/sreekuttanjayakumar97/disco_bot/bamboozled/logs/bot.log
+StandardError=append:/home/sreekuttanjayakumar97/disco_bot/bamboozled/logs/bot.log
 
 [Install]
 WantedBy=multi-user.target

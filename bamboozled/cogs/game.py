@@ -667,8 +667,8 @@ class BamboozledCog(commands.Cog):
             )
             return
         game.active = False
-        _active_games.pop(interaction.channel_id, None)
-        if game.thread_id and game.thread_id != interaction.channel_id:
+        _active_games.pop(game.channel_id, None)
+        if game.thread_id:
             _active_games.pop(game.thread_id, None)
         await unregister_active_channel(str(game.channel_id))
         await interaction.response.send_message(
@@ -1865,10 +1865,10 @@ class BamboozledCog(commands.Cog):
                     )
                 await channel.send(embed=boli_embed)
 
-        # Clean up
+        # Clean up — remove both original channel and thread entries
         game.active = False
-        _active_games.pop(cid, None)
-        if game.thread_id and game.thread_id != cid:
+        _active_games.pop(game.channel_id, None)
+        if game.thread_id:
             _active_games.pop(game.thread_id, None)
         await unregister_active_channel(str(game.channel_id))
 
