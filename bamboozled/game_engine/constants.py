@@ -20,7 +20,7 @@ SAFE_OPENTDB_CATEGORY_IDS = [
     18,  # Science: Computers
     19,  # Science: Mathematics
     20,  # Mythology
-    21,  # Sports
+    # 21 (Sports) removed — too US-centric (NFL/NBA/MLB) for India-based audience
     22,  # Geography
     23,  # History
     25,  # Art
@@ -57,6 +57,7 @@ QUESTION_TIMEOUT_SECONDS = 30
 GOLDEN_MONKEY_TIMEOUT_SECONDS = 15
 BAMBOOZLE_RULE_INPUT_TIMEOUT_SECONDS = 60
 SWITCHEROO_PICK_TIMEOUT_SECONDS = 20
+DRAW_CARD_TIMEOUT_SECONDS = 10  # how long player has to click "Draw Card" / "Spin" before auto-proceeding
 TOTAL_ROUNDS = 5
 MIST_TURN_DURATION = 2
 

@@ -3,12 +3,27 @@ import html
 import json
 import logging
 import random
+import re
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 
 from game_engine.constants import SAFE_OPENTDB_CATEGORY_IDS
+
+# Questions matching any of these patterns are skipped and replaced.
+# Focused on US-sports and US-culture references unlikely to be relevant outside North America.
+_US_SPECIFIC_RE = re.compile(
+    r'\b('
+    r'NFL|NBA|MLB|NHL|MLS|WNBA|NASCAR|PGA Tour'
+    r'|Super Bowl|World Series|Stanley Cup|March Madness|Rose Bowl|Cotton Bowl'
+    r'|quarterback|touchdowns?|gridiron|pigskin'
+    r'|American football(?!\s+club)'  # allow "X American Football Club" — international teams
+    r'|AFL(?!\s+(?:Cup|Grand Final))'  # exclude Australian rules football
+    r'|CFL\b'                          # Canadian Football League
+    r')',
+    re.IGNORECASE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +150,23 @@ async def fetch_question(
             data = None
 
     if data and data.get("response_code") == 0 and data.get("results"):
-        return _decode(data["results"][0]), session_token
+        q = _decode(data["results"][0])
+        if _US_SPECIFIC_RE.search(q["question"]) or _US_SPECIFIC_RE.search(q["correct_answer"]):
+            logger.debug("Filtered US-specific question: %s", q["question"][:60])
+            # One retry with a fresh category draw
+            params["category"] = random.choice(SAFE_OPENTDB_CATEGORY_IDS)
+            params.pop("token", None)  # don't repeat-exhaust token on retry
+            try:
+                retry_data = await _try()
+                if retry_data and retry_data.get("response_code") == 0 and retry_data.get("results"):
+                    retry_q = _decode(retry_data["results"][0])
+                    if not (_US_SPECIFIC_RE.search(retry_q["question"]) or
+                            _US_SPECIFIC_RE.search(retry_q["correct_answer"])):
+                        return retry_q, session_token
+            except Exception:
+                pass
+            # Retry also matched or failed — return original rather than stall
+        return q, session_token
 
     # Fallback: custom_questions.json
     custom_path = Path(__file__).parent.parent / "data" / "custom_questions.json"

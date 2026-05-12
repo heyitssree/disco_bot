@@ -38,6 +38,13 @@ async def init_db() -> None:
                 channel_id TEXT PRIMARY KEY
             )
         """)
+        # Per-guild settings (e.g. test mode)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS server_settings (
+                guild_id TEXT PRIMARY KEY,
+                test_mode INTEGER DEFAULT 0
+            )
+        """)
         await db.commit()
 
 
@@ -136,3 +143,36 @@ async def get_player_stats(discord_id: str) -> Optional[tuple]:
             (discord_id,),
         ) as cur:
             return await cur.fetchone()
+
+
+async def reset_all_scores() -> int:
+    """Reset all player stats to zero. Returns the number of rows affected."""
+    async with aiosqlite.connect(_DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE players SET games_played = 0, games_won = 0, total_points_earned = 0"
+        )
+        await db.execute("DELETE FROM game_results")
+        await db.commit()
+        return cursor.rowcount
+
+
+async def get_test_mode(guild_id: str) -> bool:
+    async with aiosqlite.connect(_DB_PATH) as db:
+        async with db.execute(
+            "SELECT test_mode FROM server_settings WHERE guild_id = ?", (guild_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return bool(row[0]) if row else False
+
+
+async def set_test_mode(guild_id: str, enabled: bool) -> None:
+    async with aiosqlite.connect(_DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO server_settings (guild_id, test_mode)
+            VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET test_mode = excluded.test_mode
+            """,
+            (guild_id, 1 if enabled else 0),
+        )
+        await db.commit()

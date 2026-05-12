@@ -1,7 +1,9 @@
 """Main game cog: all slash commands, UI components, and game-flow logic."""
 import asyncio
 import logging
+import random
 import time
+from datetime import datetime
 from typing import Optional
 
 import discord
@@ -12,13 +14,17 @@ from cogs.game_config_view import GameConfigView
 from db.database import (
     get_leaderboard,
     get_player_stats,
+    get_test_mode,
     register_active_channel,
+    reset_all_scores,
     save_game_result,
+    set_test_mode,
     unregister_active_channel,
     update_player_stats,
     upsert_player,
 )
 from db.navi_bridge import award_boli
+from game_engine import commentary as cmnt
 from game_engine.cards import (
     CHANCE_CARD_FLAVOUR,
     WANGO_CARD_FLAVOUR,
@@ -45,6 +51,7 @@ from game_engine.constants import (
     DIFFICULTY_MULTIPLIER,
     DOUBLE_DOWN_BONUS,
     DOUBLE_DOWN_PENALTY,
+    DRAW_CARD_TIMEOUT_SECONDS,
     GIFT_STEAL_AMOUNT,
     GOLDEN_MONKEY_BELLY,
     GOLDEN_MONKEY_TAIL,
@@ -77,7 +84,9 @@ from game_engine.wheel import (
 
 logger = logging.getLogger(__name__)
 
-# Channel-keyed game registry
+# Channel-keyed game registry (keyed by both original channel ID and thread ID when applicable).
+# Discord channel/thread IDs are globally unique, so this single dict safely serves multiple
+# servers and concurrent games as long as each game runs in a distinct channel or thread.
 _active_games: dict[int, GameState] = {}
 
 _ANSWER_LABELS = ["A", "B", "C", "D"]
@@ -124,7 +133,7 @@ class AnswerView(discord.ui.View):
 
 
 class PlayerSelectView(discord.ui.View):
-    """Generic single-player dropdown (Switcheroo / Gift)."""
+    """Generic single-player dropdown (Switcheroo / Gift), with optional skip button."""
 
     def __init__(
         self,
@@ -132,11 +141,14 @@ class PlayerSelectView(discord.ui.View):
         active_player_id: int,
         placeholder: str,
         timeout: float,
+        allow_skip: bool = False,
+        skip_label: str = "No thanks, skip",
     ):
         super().__init__(timeout=timeout)
         self.active_player_id = active_player_id
         self.target_id: Optional[int] = None
         self.timed_out = False
+        self.skipped = False
 
         options = [
             discord.SelectOption(
@@ -150,6 +162,11 @@ class PlayerSelectView(discord.ui.View):
         sel.callback = self._cb
         self.add_item(sel)
 
+        if allow_skip:
+            skip_btn = discord.ui.Button(label=skip_label, style=discord.ButtonStyle.secondary)
+            skip_btn.callback = self._skip_cb
+            self.add_item(skip_btn)
+
     async def _cb(self, interaction: discord.Interaction):
         if interaction.user.id != self.active_player_id:
             await interaction.response.send_message(
@@ -160,8 +177,47 @@ class PlayerSelectView(discord.ui.View):
         self.stop()
         await interaction.response.defer()
 
+    async def _skip_cb(self, interaction: discord.Interaction):
+        if interaction.user.id != self.active_player_id:
+            await interaction.response.send_message(
+                "⚠️ That's not your choice to make!", ephemeral=True
+            )
+            return
+        self.skipped = True
+        self.stop()
+        await interaction.response.defer()
+
     async def on_timeout(self):
         self.timed_out = True
+        self.stop()
+
+
+class DrawCardView(discord.ui.View):
+    """Single button the active player clicks to draw a card or spin the wheel.
+    Auto-proceeds after DRAW_CARD_TIMEOUT_SECONDS if ignored."""
+
+    def __init__(self, active_player_id: int, label: str):
+        super().__init__(timeout=float(DRAW_CARD_TIMEOUT_SECONDS))
+        self.active_player_id = active_player_id
+        self.clicked = False
+
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary)
+        btn.callback = self._cb
+        self.add_item(btn)
+
+    async def _cb(self, interaction: discord.Interaction):
+        if interaction.user.id != self.active_player_id:
+            await interaction.response.send_message(
+                "⚠️ Hands off! That's not your card.", ephemeral=True
+            )
+            return
+        self.clicked = True
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
+    async def on_timeout(self):
         self.stop()
 
 
@@ -367,6 +423,55 @@ class BamboozledCog(commands.Cog):
             f"Waiting for the host to `/bamboozled start`..."
         )
 
+    # ── /bamboozled leave ────────────────────────────────────
+
+    @bamboozled.command(name="leave", description="Leave the lobby before the game starts.")
+    async def leave(self, interaction: discord.Interaction):
+        cid = interaction.channel_id
+        game = _active_games.get(cid)
+
+        if not game or interaction.user.id not in game.players:
+            await interaction.response.send_message(
+                "⚠️ You're not in any lobby here.", ephemeral=True
+            )
+            return
+
+        if game.active:
+            await interaction.response.send_message(
+                "⚠️ The game is already running! Use `/bamboozled forfeit` to skip your turn, "
+                "or ask the host to use `/bamboozled endgame`.",
+                ephemeral=True,
+            )
+            return
+
+        pname = interaction.user.display_name
+        game.players.remove(interaction.user.id)
+        game.player_names.pop(interaction.user.id, None)
+        game.scores.pop(interaction.user.id, None)
+
+        if not game.players:
+            _active_games.pop(cid, None)
+            await interaction.response.send_message(
+                f"👋 **{pname}** has left the lobby. No players remaining — lobby closed."
+            )
+            return
+
+        if interaction.user.id == game.host_id:
+            game.host_id = game.players[0]
+            new_host = game.player_names[game.host_id]
+            await interaction.response.send_message(
+                f"👋 **{pname}** (host) has left the lobby. "
+                f"**{new_host}** is now the host!\n\n"
+                f"**Players ({len(game.players)}/6):** "
+                + ", ".join(game.player_names[p] for p in game.players)
+            )
+        else:
+            await interaction.response.send_message(
+                f"👋 **{pname}** has left the lobby.\n\n"
+                f"**Players ({len(game.players)}/6):** "
+                + ", ".join(game.player_names[p] for p in game.players)
+            )
+
     # ── /bamboozled start ────────────────────────────────────
 
     @bamboozled.command(name="start", description="Start the game (host only).")
@@ -405,6 +510,10 @@ class BamboozledCog(commands.Cog):
         game.question_difficulty = config_view.question_difficulty
         game.question_category = config_view.question_category
 
+        # Check test mode for this guild
+        if interaction.guild:
+            game.test_mode = await get_test_mode(str(interaction.guild.id))
+
         game.active = True
         game.session_token = await fetch_session_token()
         await register_active_channel(str(cid))
@@ -412,15 +521,39 @@ class BamboozledCog(commands.Cog):
         roster = "\n".join(
             f"{i + 1}. {game.player_names[pid]}" for i, pid in enumerate(game.players)
         )
-        await channel.send(
+        test_note = "\n\n⚠️ **TEST MODE ACTIVE** — no Boli points or stats will be recorded." if game.test_mode else ""
+        announce_text = (
             f"🎬🎉 **BAMBOOZLED BEGINS!** 🎉🎬\n\n"
             f"**{len(game.players)} player(s) take the stage:**\n{roster}\n\n"
             f"Everyone starts with **{STARTING_POINTS:,} points**. "
             f"**Settings: {config_view.config_summary()}**\n\n"
-            f"*The studio audience goes absolutely FERAL...*"
+            f"*The studio audience goes absolutely FERAL...*{test_note}"
         )
 
-        asyncio.create_task(self._run_game(channel, game))
+        # Try to create a thread for the game
+        game_channel = channel
+        try:
+            announce_msg = await channel.send(announce_text)
+            thread = await announce_msg.create_thread(
+                name=f"🎬 Bamboozled! — {datetime.now().strftime('%b %d %I:%M%p')}",
+                auto_archive_duration=60,
+            )
+            game.thread_id = thread.id
+            _active_games[thread.id] = game
+            game_channel = thread
+            await thread.send(
+                "🎮 **The game is running in this thread!** "
+                "Use `/bamboozled forfeit`, `/bamboozled scores`, and `/bamboozled endgame` here."
+            )
+        except discord.Forbidden:
+            await channel.send(
+                "⚠️ I don't have permission to create threads — running in this channel instead."
+            )
+        except Exception as exc:
+            logger.warning("Failed to create game thread: %s", exc)
+            # announce_text was already sent above; just continue without a thread
+
+        asyncio.create_task(self._run_game(game_channel, game))
 
     # ── /bamboozled scores ───────────────────────────────────
 
@@ -474,6 +607,30 @@ class BamboozledCog(commands.Cog):
         embed.add_field(name="Total Points Earned", value=f"{pts:,}", inline=True)
         await interaction.response.send_message(embed=embed)
 
+    # ── /bamboozled reset_scores (admin only) ───────────────
+
+    @bamboozled.command(
+        name="reset_scores",
+        description="[Admin] Wipe all Bamboozled player stats and game history.",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reset_scores(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        affected = await reset_all_scores()
+        await interaction.followup.send(
+            f"✅ All Bamboozled scores have been reset. {affected} player record(s) cleared.",
+            ephemeral=True,
+        )
+
+    @reset_scores.error
+    async def reset_scores_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                "⛔ Only server admins can reset scores.", ephemeral=True
+            )
+        else:
+            raise error
+
     # ── /bamboozled forfeit ──────────────────────────────────
 
     @bamboozled.command(name="forfeit", description="Forfeit your current turn (treated as timeout).")
@@ -511,11 +668,48 @@ class BamboozledCog(commands.Cog):
             return
         game.active = False
         _active_games.pop(interaction.channel_id, None)
-        await unregister_active_channel(str(interaction.channel_id))
+        if game.thread_id and game.thread_id != interaction.channel_id:
+            _active_games.pop(game.thread_id, None)
+        await unregister_active_channel(str(game.channel_id))
         await interaction.response.send_message(
             "🛑 **GAME ENDED EARLY.** The producer pulls the plug. No results saved. "
             "The audience leaves in stunned silence."
         )
+
+    # ── /bamboozled testmode ─────────────────────────────────
+
+    @bamboozled.command(
+        name="testmode",
+        description="[Admin] Toggle test mode — no Boli points or stats recorded.",
+    )
+    @app_commands.describe(enabled="Enable or disable test mode for this server")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def testmode(self, interaction: discord.Interaction, enabled: bool):
+        if not interaction.guild:
+            await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+            return
+        await set_test_mode(str(interaction.guild.id), enabled)
+        if enabled:
+            await interaction.response.send_message(
+                "⚠️ **Test mode ENABLED** for this server.\n"
+                "Future games will not record Boli points or player stats.\n"
+                "Disable with `/bamboozled testmode enabled:False`.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "✅ **Test mode DISABLED** for this server. Games will record normally.",
+                ephemeral=True,
+            )
+
+    @testmode.error
+    async def testmode_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                "⛔ Only server admins can toggle test mode.", ephemeral=True
+            )
+        else:
+            raise error
 
     # ── /bamboozled help ─────────────────────────────────────
 
@@ -538,7 +732,7 @@ class BamboozledCog(commands.Cog):
                 "**Before each game starts, the host picks:**\n"
                 "• **Rounds:** 3, 5, 7, or 10\n"
                 "• **Difficulty:** Easy, Medium, Hard, or Mixed\n"
-                "• **Category:** All, or one of 13 curated topic areas\n\n"
+                "• **Category:** All, or one of several curated topic areas\n\n"
                 "**Boli Points** are awarded at the end based on placement, correct answers, "
                 "difficulty, and your final in-game score. Hard difficulty pays more. A negative "
                 "final score costs a small Boli penalty — the chaos is your problem."
@@ -549,12 +743,14 @@ class BamboozledCog(commands.Cog):
             name="📋 Commands",
             value=(
                 "`/bamboozled join` — Join the lobby\n"
+                "`/bamboozled leave` — Leave the lobby before the game starts\n"
                 "`/bamboozled start` — Start the game and configure settings *(host only)*\n"
                 "`/bamboozled scores` — Check current scores mid-game *(hidden during Mist)*\n"
                 "`/bamboozled leaderboard` — All-time win leaderboard\n"
                 "`/bamboozled stats @user` — A specific player's all-time stats\n"
                 "`/bamboozled forfeit` — Skip your current turn *(treated as timeout)*\n"
-                "`/bamboozled endgame` — Force-end the game with no results saved *(host only)*"
+                "`/bamboozled endgame` — Force-end the game with no results saved *(host only)*\n"
+                "`/bamboozled testmode` — Toggle test mode *(admin only)*"
             ),
             inline=False,
         )
@@ -597,6 +793,23 @@ class BamboozledCog(commands.Cog):
 
     def _still_active(self, cid: int, game: GameState) -> bool:
         return _active_games.get(cid) is game and game.active
+
+    async def _draw_card_interaction(
+        self,
+        channel: discord.TextChannel,
+        player_id: int,
+        prompt: str,
+    ) -> None:
+        """Send a prompt with a button; wait for the player to click or auto-proceed."""
+        view = DrawCardView(player_id, "▶️ Continue")
+        msg = await channel.send(prompt, view=view)
+        await view.wait()
+        for item in view.children:
+            item.disabled = True
+        try:
+            await msg.edit(view=view)
+        except discord.HTTPException:
+            pass
 
     # ─────────────────────────────────────────────────────────
     # Game Loop
@@ -661,10 +874,7 @@ class BamboozledCog(commands.Cog):
         game.forfeit_requested = False
         game.answer_time_seconds = 0.0
 
-        await channel.send(
-            f"🎬 It's <@{player_id}>'s turn. The studio lights dim. "
-            f"The audience holds its breath. Here comes your question..."
-        )
+        await channel.send(cmnt.turn_intro(player_id))
         await asyncio.sleep(1.0)
 
         if game.active_bamboozle_rule:
@@ -725,9 +935,16 @@ class BamboozledCog(commands.Cog):
         else:
             game.answer_time_seconds = float(QUESTION_TIMEOUT_SECONDS)
 
-        # Disable buttons
-        for item in view.children:
+        # Highlight correct/wrong buttons and disable all
+        correct_text = question["correct_answer"]
+        for i, item in enumerate(view.children):
+            if not isinstance(item, discord.ui.Button):
+                continue
             item.disabled = True
+            if i == correct_idx:
+                item.style = discord.ButtonStyle.success   # green = correct answer
+            elif view.chosen_idx is not None and i == view.chosen_idx and view.chosen_idx != correct_idx:
+                item.style = discord.ButtonStyle.danger    # red = player's wrong pick
         try:
             await msg.edit(view=view)
         except discord.HTTPException:
@@ -744,22 +961,17 @@ class BamboozledCog(commands.Cog):
             game.consecutive_correct[player_id] = 0
 
             score = game.scores[player_id]
-            label = "FORFEITED" if game.forfeit_requested else "TIME'S UP"
             terror_note = (
                 f" ⚠️ *Timeout Terror: -{BAMBOOZLE_TIMEOUT_TERROR_COST} pts!*"
                 if active_rule and active_rule["id"] == 7 and not game.forfeit_requested
                 else ""
             )
             if game.mist_active:
-                await channel.send(
-                    f"⏰ **{label}** for **{player_name}**! "
-                    f"Something happened to their score. Probably not good."
-                )
+                await channel.send(cmnt.timeout_mist(player_name))
+            elif game.forfeit_requested:
+                await channel.send(cmnt.forfeit(player_name, timeout_penalty, score, correct_text))
             else:
-                await channel.send(
-                    f"⏰ **{label}** for **{player_name}**! "
-                    f"That's **{abs(timeout_penalty):,} points**.{terror_note} *(Score: {score:,})*"
-                )
+                await channel.send(cmnt.timeout(player_name, timeout_penalty, score, correct_text, terror=terror_note))
 
             # Rule 2 (Slow Burn) — timeout always exceeds 20s threshold
             if active_rule:
@@ -774,16 +986,11 @@ class BamboozledCog(commands.Cog):
             game.consecutive_correct[player_id] = game.consecutive_correct.get(player_id, 0) + 1
             game.correct_answer_count[player_id] = game.correct_answer_count.get(player_id, 0) + 1
             score = game.scores[player_id]
+
             if game.mist_active:
-                await channel.send(
-                    f"✅ **{player_name}** answered... *That was... probably right.* "
-                    f"Points have been awarded. Maybe."
-                )
+                await channel.send(cmnt.correct_mist(player_name))
             else:
-                await channel.send(
-                    f"✅ **CORRECT!** **{player_name}** nails it for "
-                    f"**+{CORRECT_ANSWER_POINTS}** points! *(Score: {score:,})*"
-                )
+                await channel.send(cmnt.correct(player_name, CORRECT_ANSWER_POINTS, score, correct_text))
 
             # Rule enforcement for correct answers (Rules 1, 4, 8)
             active_rule = game.active_bamboozle_rule
@@ -791,8 +998,6 @@ class BamboozledCog(commands.Cog):
                 rule_msg = apply_after_correct(active_rule, game, player_id)
                 if rule_msg:
                     await channel.send(rule_msg)
-
-            await asyncio.sleep(1.5)
 
             # Rule 9 (Streak Breaker) — intercept before Chance Card is drawn
             if active_rule and active_rule["id"] == 9:
@@ -803,14 +1008,21 @@ class BamboozledCog(commands.Cog):
                         f"the Chance Card is **DISCARDED** and replaced with a Wicked Wango Card!"
                     )
                     await asyncio.sleep(1)
+                    await self._draw_card_interaction(
+                        channel, player_id,
+                        cmnt.wango_card_draw_prompt(player_name, DRAW_CARD_TIMEOUT_SECONDS),
+                    )
                     wango_card = draw_wango_card()
-                    await channel.send(f"🎴 **{player_name}** draws a **Wicked Wango Card**...")
-                    await asyncio.sleep(1)
                     await channel.send(WANGO_CARD_FLAVOUR[wango_card])
                     await asyncio.sleep(1)
                     await self._apply_wango_card(channel, game, player_id, wango_card, chain_depth=0)
                     return
 
+            # Interactive card draw prompt
+            await self._draw_card_interaction(
+                channel, player_id,
+                cmnt.chance_card_draw_prompt(player_name, DRAW_CARD_TIMEOUT_SECONDS),
+            )
             card = draw_chance_card()
             await channel.send(f"🃏 **{player_name}** draws a **Chance Card**...")
             await asyncio.sleep(1)
@@ -829,7 +1041,6 @@ class BamboozledCog(commands.Cog):
             game.consecutive_correct[player_id] = 0
 
             score = game.scores[player_id]
-            correct_text = question["correct_answer"]
             sombrero_note = (
                 f" 🪅 (+{game.sombrero_penalty} Sombrero penalty)"
                 if game.sombrero_holder == player_id
@@ -841,23 +1052,15 @@ class BamboozledCog(commands.Cog):
                 else ""
             )
             if game.mist_active:
-                await channel.send(
-                    f"❌ **{player_name}** answered... *Hmm. Sure. Points have been adjusted. Maybe.*"
-                )
+                await channel.send(cmnt.wrong_mist(player_name))
             else:
-                await channel.send(
-                    f"❌ **WRONG!** The correct answer was **{correct_text}**.\n"
-                    f"**{player_name}** loses **{abs(penalty)}** points{sombrero_note}{dj_note}. "
-                    f"*(Score: {score:,})*"
-                )
+                await channel.send(cmnt.wrong(player_name, penalty, score, correct_text, sombrero_note, dj_note))
 
             # Rule 2 (Slow Burn) check on wrong answer
             if active_rule:
                 slow_burn_msg = apply_after_wrong_or_timeout(active_rule, game, player_id)
                 if slow_burn_msg:
                     await channel.send(slow_burn_msg)
-
-            await asyncio.sleep(1.5)
 
             # Golden Pass check
             if game.golden_pass.get(player_id):
@@ -868,6 +1071,11 @@ class BamboozledCog(commands.Cog):
                 )
                 return
 
+            # Interactive card draw prompt
+            await self._draw_card_interaction(
+                channel, player_id,
+                cmnt.wango_card_draw_prompt(player_name, DRAW_CARD_TIMEOUT_SECONDS),
+            )
             card = draw_wango_card()
             await channel.send(f"🎴 **{player_name}** draws a **Wicked Wango Card**...")
             await asyncio.sleep(1)
@@ -914,13 +1122,20 @@ class BamboozledCog(commands.Cog):
                     game, player_id,
                     placeholder="Choose a player to swap scores with...",
                     timeout=float(SWITCHEROO_PICK_TIMEOUT_SECONDS),
+                    allow_skip=True,
+                    skip_label="🚫 No thanks, keep my score",
                 )
                 await channel.send(
-                    f"🔀 **{pname}**, pick your victim! Whose score are you stealing?",
+                    f"🔀 **{pname}**, pick your victim! Whose score are you stealing?\n"
+                    f"*(Or skip if you'd rather not swap.)*",
                     view=view,
                 )
                 await view.wait()
-                if view.timed_out or view.target_id is None:
+                if view.skipped:
+                    await channel.send(
+                        f"🔀 **{pname}** decides against the Switcheroo. The chaos is left on the table. Wise? Maybe."
+                    )
+                elif view.timed_out or view.target_id is None:
                     await channel.send(
                         "⏰ **Switcheroo timed out!** The moment of chaos passes uneventfully."
                     )
@@ -962,8 +1177,15 @@ class BamboozledCog(commands.Cog):
             )
             await view.wait()
 
-            for item in view.children:
+            correct_text = question["correct_answer"]
+            for i, item in enumerate(view.children):
+                if not isinstance(item, discord.ui.Button):
+                    continue
                 item.disabled = True
+                if i == correct_idx:
+                    item.style = discord.ButtonStyle.success
+                elif view.chosen_idx is not None and i == view.chosen_idx and view.chosen_idx != correct_idx:
+                    item.style = discord.ButtonStyle.danger
             try:
                 await msg.edit(view=view)
             except discord.HTTPException:
@@ -972,25 +1194,26 @@ class BamboozledCog(commands.Cog):
             if view.timed_out:
                 game.apply_points(player_id, TIMEOUT_POINTS)
                 await channel.send(
-                    f"⏰ **TIMED OUT on the Double Down!** "
+                    f"⏰ **TIMED OUT on the Double Down!** Answer was **{correct_text}**. "
                     f"**{pname}** loses **{abs(TIMEOUT_POINTS)} pts**. *(Score: {game.scores[player_id]:,})*"
                 )
             elif view.chosen_idx == correct_idx:
                 game.apply_points(player_id, DOUBLE_DOWN_BONUS)
                 await channel.send(
-                    f"✅ **DOUBLE DOWN CORRECT!!** **{pname}** earns **+{DOUBLE_DOWN_BONUS} pts**! "
+                    f"✅ **DOUBLE DOWN CORRECT!!** It was **{correct_text}**! "
+                    f"**{pname}** earns **+{DOUBLE_DOWN_BONUS} pts**! "
                     f"ABSOLUTELY LEGENDARY. *(Score: {game.scores[player_id]:,})*"
                 )
             else:
                 game.apply_points(player_id, DOUBLE_DOWN_PENALTY)
                 await channel.send(
-                    f"❌ **DOUBLE DOWN WRONG!!** The answer was **{question['correct_answer']}**. "
+                    f"❌ **DOUBLE DOWN WRONG!!** The answer was **{correct_text}**. "
                     f"**{pname}** loses **{abs(DOUBLE_DOWN_PENALTY)} pts**. Devastating. "
                     f"*(Score: {game.scores[player_id]:,})*"
                 )
 
         elif card == ChanceCard.SPIN_THE_WHEEL:
-            await channel.send(f"🎡 **{pname}** is sent to the **WHEEL OF MAYHEM!**")
+            await channel.send(cmnt.send_to_wheel(pname))
             await asyncio.sleep(1)
             await self._spin_wheel(channel, game, player_id, wheel_depth=0)
 
@@ -1062,7 +1285,7 @@ class BamboozledCog(commands.Cog):
             return
 
         if card == WangoCard.WANGO_CLASSIC:
-            await channel.send(f"🎡 **{pname}** is heading straight to the **WHEEL OF MAYHEM!**")
+            await channel.send(cmnt.send_to_wheel(pname))
             await asyncio.sleep(1)
             await self._spin_wheel(channel, game, player_id, wheel_depth=0)
 
@@ -1168,6 +1391,21 @@ class BamboozledCog(commands.Cog):
         player_id: int,
         wheel_depth: int = 0,
     ):
+        # Interactive spin button — player clicks or it auto-spins
+        pname = game.player_display_name(player_id)
+        spin_view = DrawCardView(player_id, "🎡 SPIN THE WHEEL!")
+        spin_msg = await channel.send(
+            cmnt.spin_prompt(pname, DRAW_CARD_TIMEOUT_SECONDS),
+            view=spin_view,
+        )
+        await spin_view.wait()
+        for item in spin_view.children:
+            item.disabled = True
+        try:
+            await spin_msg.edit(view=spin_view)
+        except discord.HTTPException:
+            pass
+
         for line in SPIN_SUSPENSE:
             await channel.send(line)
             await asyncio.sleep(0.8)
@@ -1306,7 +1544,7 @@ class BamboozledCog(commands.Cog):
 
             if card == WangoCard.WANGO_CLASSIC:
                 # This wheel spin cannot trigger Wango Again
-                await channel.send(f"🎡 **{pname}** heads back to the Wheel of Mayhem!")
+                await channel.send(cmnt.send_to_wheel(pname))
                 await asyncio.sleep(1)
                 await self._spin_wheel_capped(channel, game, player_id)
             else:
@@ -1316,6 +1554,20 @@ class BamboozledCog(commands.Cog):
         self, channel: discord.TextChannel, game: GameState, player_id: int
     ):
         """Spin at wheel_depth=1: Wango Again is converted to Bonus Round."""
+        pname = game.player_display_name(player_id)
+        spin_view = DrawCardView(player_id, "🎡 SPIN THE WHEEL!")
+        spin_msg = await channel.send(
+            cmnt.spin_prompt(pname, DRAW_CARD_TIMEOUT_SECONDS),
+            view=spin_view,
+        )
+        await spin_view.wait()
+        for item in spin_view.children:
+            item.disabled = True
+        try:
+            await spin_msg.edit(view=spin_view)
+        except discord.HTTPException:
+            pass
+
         for line in SPIN_SUSPENSE:
             await channel.send(line)
             await asyncio.sleep(0.8)
@@ -1349,56 +1601,96 @@ class BamboozledCog(commands.Cog):
         self, channel: discord.TextChannel, game: GameState, player_id: int
     ):
         pname = game.player_display_name(player_id)
+
+        # Randomly decide which side is lucky this turn — the monkey knows, the player doesn't
+        belly_is_lucky = random.random() < 0.5
+        lucky_pts = GOLDEN_MONKEY_BELLY    # +300
+        unlucky_pts = GOLDEN_MONKEY_TAIL   # -200
+
         await channel.send(
             f"🐒 **{pname}** has climbed the **Ladder of Chance** "
             f"and faces the **GOLDEN MONKEY**... 🐒\n"
-            f"*The studio falls completely silent.*"
+            f"*The studio falls completely silent. The monkey could go either way today.*"
         )
         await asyncio.sleep(1)
 
         view = GoldenMonkeyView(player_id)
         await channel.send(
-            f"🐒 <@{player_id}> **The Golden Monkey awaits. Belly or Tail?** "
-            f"You have **{GOLDEN_MONKEY_TIMEOUT_SECONDS} seconds.** *(Only your click counts!)*",
+            f"🐒 <@{player_id}> **The Golden Monkey waits. BELLY or TAIL?** "
+            f"One is fortune. One is misfortune. The monkey has already decided — have you? "
+            f"**{GOLDEN_MONKEY_TIMEOUT_SECONDS} seconds.** *(Only your click counts!)*",
             view=view,
         )
         await view.wait()
 
         if view.timed_out or view.choice is None:
-            await channel.send(
-                f"⏳ *The Monkey grows impatient.* **TAIL** by default!\n"
-                f"**{pname}** loses **{abs(GOLDEN_MONKEY_TAIL)} pts**! "
-                f"The monkey is... disappointed."
-            )
-            game.apply_points(player_id, GOLDEN_MONKEY_TAIL)
-            await channel.send(f"*(Score: {game.scores[player_id]:,})*")
-            await asyncio.sleep(1)
-            card = draw_wango_card()
-            await channel.send(f"🎴 The Monkey's parting gift: {WANGO_CARD_FLAVOUR[card]}")
-            await asyncio.sleep(1)
-            await self._apply_wango_card(channel, game, player_id, card, chain_depth=0)
+            # Default to tail on timeout — still random outcome
+            default_pts = unlucky_pts if belly_is_lucky else lucky_pts
+            if default_pts >= 0:
+                await channel.send(
+                    f"⏳ *The Monkey grew impatient.* **TAIL** by default! "
+                    f"**{pname}** earns **+{default_pts} pts**! Wait — the monkey is... confused?"
+                )
+                game.apply_points(player_id, default_pts)
+                await channel.send(f"*(Score: {game.scores[player_id]:,})*")
+            else:
+                await channel.send(
+                    f"⏳ *The Monkey grew impatient.* **TAIL** by default! "
+                    f"**{pname}** loses **{abs(default_pts)} pts**! The monkey is... disappointed."
+                )
+                game.apply_points(player_id, default_pts)
+                await channel.send(f"*(Score: {game.scores[player_id]:,})*")
+                await asyncio.sleep(1)
+                card = draw_wango_card()
+                await channel.send(f"🎴 The Monkey's parting gift: {WANGO_CARD_FLAVOUR[card]}")
+                await asyncio.sleep(1)
+                await self._apply_wango_card(channel, game, player_id, card, chain_depth=0)
 
         elif view.choice == "belly":
-            game.apply_points(player_id, GOLDEN_MONKEY_BELLY)
-            await channel.send(
-                f"🫃 **BELLY!** THE MONKEY IS PLEASED! "
-                f"**{pname}** earns **+{GOLDEN_MONKEY_BELLY} pts**! "
-                f"GLORIOUS! MAGNIFICENT! *(Score: {game.scores[player_id]:,})*"
-            )
-            await asyncio.sleep(1.0)
+            pts = lucky_pts if belly_is_lucky else unlucky_pts
+            if pts >= 0:
+                game.apply_points(player_id, pts)
+                await channel.send(
+                    f"🫃 **BELLY!** THE MONKEY IS PLEASED! "
+                    f"**{pname}** earns **+{pts} pts**! "
+                    f"Today the belly was blessed! *(Score: {game.scores[player_id]:,})*"
+                )
+                await asyncio.sleep(1.0)
+            else:
+                game.apply_points(player_id, pts)
+                await channel.send(
+                    f"🫃 **BELLY!** The monkey... *winces*. "
+                    f"**{pname}** loses **{abs(pts)} pts**! "
+                    f"Belly was the wrong call today. *(Score: {game.scores[player_id]:,})*"
+                )
+                await asyncio.sleep(1)
+                card = draw_wango_card()
+                await channel.send(f"🎴 The Monkey's displeasure: {WANGO_CARD_FLAVOUR[card]}")
+                await asyncio.sleep(1)
+                await self._apply_wango_card(channel, game, player_id, card, chain_depth=0)
 
         else:  # tail
-            game.apply_points(player_id, GOLDEN_MONKEY_TAIL)
-            await channel.send(
-                f"🐒 **TAIL!** The monkey SCREECHES! "
-                f"**{pname}** loses **{abs(GOLDEN_MONKEY_TAIL)} pts**! "
-                f"Was it worth it?! *(Score: {game.scores[player_id]:,})*"
-            )
-            await asyncio.sleep(1)
-            card = draw_wango_card()
-            await channel.send(f"🎴 And as punishment: {WANGO_CARD_FLAVOUR[card]}")
-            await asyncio.sleep(1)
-            await self._apply_wango_card(channel, game, player_id, card, chain_depth=0)
+            pts = unlucky_pts if belly_is_lucky else lucky_pts
+            if pts >= 0:
+                game.apply_points(player_id, pts)
+                await channel.send(
+                    f"🐒 **TAIL!** The monkey does a little dance! "
+                    f"**{pname}** earns **+{pts} pts**! "
+                    f"The tail was sacred today! *(Score: {game.scores[player_id]:,})*"
+                )
+                await asyncio.sleep(1.0)
+            else:
+                game.apply_points(player_id, pts)
+                await channel.send(
+                    f"🐒 **TAIL!** The monkey SCREECHES! "
+                    f"**{pname}** loses **{abs(pts)} pts**! "
+                    f"Should've gone belly. *(Score: {game.scores[player_id]:,})*"
+                )
+                await asyncio.sleep(1)
+                card = draw_wango_card()
+                await channel.send(f"🎴 And as punishment: {WANGO_CARD_FLAVOUR[card]}")
+                await asyncio.sleep(1)
+                await self._apply_wango_card(channel, game, player_id, card, chain_depth=0)
 
     # ─────────────────────────────────────────────────────────
     # Endgame
@@ -1407,13 +1699,7 @@ class BamboozledCog(commands.Cog):
     async def _run_endgame(self, channel: discord.TextChannel, game: GameState):
         cid = channel.id
 
-        await channel.send(
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎬🎬🎬 **THAT'S A WRAP ON ROUND {game.total_rounds}!** 🎬🎬🎬\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"*The studio audience ERUPTS. The confetti cannons fire. "
-            f"Somewhere, a llama weeps with joy.*"
-        )
+        await channel.send(cmnt.endgame_wrap(game.total_rounds))
         await asyncio.sleep(2)
 
         # Lift any residual mist for the final reveal
@@ -1474,8 +1760,15 @@ class BamboozledCog(commands.Cog):
                 )
                 await view.wait()
 
-                for item in view.children:
+                correct_text = question["correct_answer"]
+                for i, item in enumerate(view.children):
+                    if not isinstance(item, discord.ui.Button):
+                        continue
                     item.disabled = True
+                    if i == correct_idx:
+                        item.style = discord.ButtonStyle.success
+                    elif view.chosen_idx is not None and i == view.chosen_idx and view.chosen_idx != correct_idx:
+                        item.style = discord.ButtonStyle.danger
                 try:
                     await msg.edit(view=view)
                 except discord.HTTPException:
@@ -1484,19 +1777,20 @@ class BamboozledCog(commands.Cog):
                 if view.timed_out:
                     game.apply_points(w, TIMEOUT_POINTS)
                     await channel.send(
-                        f"⏰ **{wname}** timed out! **{TIMEOUT_POINTS:,} pts**. "
-                        f"*(Score: {game.scores[w]:,})*"
+                        f"⏰ **{wname}** timed out! Answer: **{correct_text}**. "
+                        f"**{abs(TIMEOUT_POINTS):,} pts**. *(Score: {game.scores[w]:,})*"
                     )
                 elif view.chosen_idx == correct_idx:
                     game.apply_points(w, CORRECT_ANSWER_POINTS)
                     await channel.send(
-                        f"✅ **CORRECT!** **{wname}** earns **+{CORRECT_ANSWER_POINTS} pts**! "
+                        f"✅ **CORRECT!** It was **{correct_text}**! "
+                        f"**{wname}** earns **+{CORRECT_ANSWER_POINTS} pts**! "
                         f"*(Score: {game.scores[w]:,})*"
                     )
                 else:
                     game.apply_points(w, WRONG_ANSWER_POINTS)
                     await channel.send(
-                        f"❌ **WRONG!** The answer was **{question['correct_answer']}**. "
+                        f"❌ **WRONG!** The answer was **{correct_text}**. "
                         f"**{wname}** loses **{abs(WRONG_ANSWER_POINTS)} pts**. "
                         f"*(Score: {game.scores[w]:,})*"
                     )
@@ -1514,66 +1808,77 @@ class BamboozledCog(commands.Cog):
         champion_name = game.player_display_name(champion_id)
         champion_score = game.scores[champion_id]
 
-        await channel.send(
-            f"\n🏆🏆🏆 **THE WINNER IS... {champion_name.upper()}!!!** 🏆🏆🏆\n"
-            f"Final score: **{champion_score:,} points!**\n\n"
-            f"*{champion_name} is carried off on the shoulders of a grateful nation.*"
-        )
+        await channel.send(cmnt.winner_announce(champion_name.upper(), champion_score))
 
-        # Save results
-        final_scores = {str(pid): game.scores.get(pid, 0) for pid in game.players}
-        await save_game_result(
-            channel_id=str(cid),
-            winner_id=str(champion_id),
-            player_count=len(game.players),
-            final_scores=final_scores,
-        )
-        for pid in game.players:
-            await update_player_stats(str(pid), pid == champion_id, game.scores.get(pid, 0))
-
-        # Boli Points bridge
-        if NAVI_DB_PATH:
-            final_sorted = sorted(game.players, key=lambda p: game.scores.get(p, 0), reverse=True)
-            boli_results = []
-            for pid in final_sorted:
-                amount, reason = calculate_boli_award(
-                    pid, game, game.correct_answer_count, champion_id, final_sorted
-                )
-                boli_results.append((pid, amount, reason))
-
-            boli_tasks = [
-                award_boli(pid, amount, reason)
-                for pid, amount, reason in boli_results
-                if amount > 0
-            ]
-            if boli_tasks:
-                await asyncio.gather(*boli_tasks, return_exceptions=True)
-
-            medals = ["🥇", "🥈", "🥉"]
-            boli_embed = discord.Embed(
-                title="🍮 Boli Points Awarded (powered by Navi)",
-                color=discord.Color.gold(),
+        if game.test_mode:
+            await channel.send(
+                "⚠️ **TEST MODE** — results not recorded and no Boli points awarded."
             )
-            has_negative = any(amount < 0 for _, amount, _ in boli_results)
-            for i, (pid, amount, _) in enumerate(boli_results):
-                pname = game.player_display_name(pid)
-                medal = medals[i] if i < 3 else "  "
-                amount_str = f"+{amount}" if amount >= 0 else str(amount)
-                boli_embed.add_field(
-                    name=f"{medal} {pname}",
-                    value=f"{amount_str} Boli",
-                    inline=False,
+        else:
+            # Save results
+            final_scores = {str(pid): game.scores.get(pid, 0) for pid in game.players}
+            await save_game_result(
+                channel_id=str(game.channel_id),
+                winner_id=str(champion_id),
+                player_count=len(game.players),
+                final_scores=final_scores,
+            )
+            for pid in game.players:
+                await update_player_stats(str(pid), pid == champion_id, game.scores.get(pid, 0))
+
+            # Boli Points bridge
+            if NAVI_DB_PATH:
+                final_sorted = sorted(game.players, key=lambda p: game.scores.get(p, 0), reverse=True)
+                boli_results = []
+                for pid in final_sorted:
+                    amount, reason = calculate_boli_award(
+                        pid, game, game.correct_answer_count, champion_id, final_sorted
+                    )
+                    boli_results.append((pid, amount, reason))
+
+                boli_tasks = [
+                    award_boli(pid, amount, reason)
+                    for pid, amount, reason in boli_results
+                    if amount > 0
+                ]
+                if boli_tasks:
+                    await asyncio.gather(*boli_tasks, return_exceptions=True)
+
+                medals = ["🥇", "🥈", "🥉"]
+                boli_embed = discord.Embed(
+                    title="🍮 Boli Points Awarded (powered by Navi)",
+                    color=discord.Color.gold(),
                 )
-            if has_negative:
-                boli_embed.set_footer(
-                    text="Negative Boli reflects a negative final score — the chaos got you this time."
-                )
-            await channel.send(embed=boli_embed)
+                has_negative = any(amount < 0 for _, amount, _ in boli_results)
+                for i, (pid, amount, _) in enumerate(boli_results):
+                    pname = game.player_display_name(pid)
+                    medal = medals[i] if i < 3 else "  "
+                    amount_str = f"+{amount}" if amount >= 0 else str(amount)
+                    boli_embed.add_field(
+                        name=f"{medal} {pname}",
+                        value=f"{amount_str} Boli",
+                        inline=False,
+                    )
+                if has_negative:
+                    boli_embed.set_footer(
+                        text="Negative Boli reflects a negative final score — the chaos got you this time."
+                    )
+                await channel.send(embed=boli_embed)
 
         # Clean up
         game.active = False
         _active_games.pop(cid, None)
-        await unregister_active_channel(str(cid))
+        if game.thread_id and game.thread_id != cid:
+            _active_games.pop(game.thread_id, None)
+        await unregister_active_channel(str(game.channel_id))
+
+        # Archive thread if game ran in one
+        if isinstance(channel, discord.Thread):
+            await asyncio.sleep(2)
+            try:
+                await channel.edit(archived=True, locked=True)
+            except Exception as exc:
+                logger.warning("Failed to archive game thread: %s", exc)
 
 
 async def setup(bot: commands.Bot):

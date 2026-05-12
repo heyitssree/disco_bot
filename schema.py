@@ -136,6 +136,41 @@ def _create_tables(conn: sqlite3.Connection) -> None:
     """)
 
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS external_boli_points (
+            id          INTEGER PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            username    TEXT NOT NULL,
+            points      INTEGER NOT NULL,
+            source_game TEXT DEFAULT 'partner',
+            game_id     TEXT,
+            awarded_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ext_boli_user ON external_boli_points (user_id)")
+
+    # View: combined native + external boli for leaderboard / profile display.
+    # Drop-and-recreate so schema changes take effect on restart.
+    conn.execute("DROP VIEW IF EXISTS boli_totals_view")
+    conn.execute("""
+        CREATE VIEW boli_totals_view AS
+        SELECT
+            u.user_id,
+            u.username,
+            u.rashi,
+            u.prediction_count,
+            u.experience,
+            u.boli_points                                              AS native_boli_points,
+            COALESCE((
+                SELECT SUM(e.points) FROM external_boli_points e WHERE e.user_id = u.user_id
+            ), 0)                                                      AS external_boli_points,
+            u.boli_points + COALESCE((
+                SELECT SUM(e.points) FROM external_boli_points e WHERE e.user_id = u.user_id
+            ), 0)                                                      AS total_boli_points
+        FROM user_stats u
+    """)
+
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS market_items (
             item_id       TEXT PRIMARY KEY,
             name          TEXT NOT NULL,
@@ -511,20 +546,35 @@ def get_user_profile(
     conn: sqlite3.Connection,
     user_id: int,
 ) -> dict | None:
-    """Return user profile dict or None if user doesn't exist."""
+    """Return user profile dict or None if user doesn't exist.
+
+    boli_points = native (internal) points only.
+    external_boli = sum of all external partner awards (can be negative).
+    total_boli_points = boli_points + external_boli — use this for display.
+    """
     row = conn.execute(
-        "SELECT user_id, username, rashi, boli_points, experience, last_seen, prediction_count, "
-        "daily_action_count, last_action_date, extra_actions "
-        "FROM user_stats WHERE user_id = ?",
+        """
+        SELECT u.user_id, u.username, u.rashi, u.boli_points, u.experience,
+               u.last_seen, u.prediction_count, u.daily_action_count,
+               u.last_action_date, u.extra_actions,
+               COALESCE((
+                   SELECT SUM(e.points) FROM external_boli_points e WHERE e.user_id = u.user_id
+               ), 0)
+        FROM user_stats u WHERE u.user_id = ?
+        """,
         [user_id],
     ).fetchone()
     if not row:
         return None
+    native = row[3]
+    external = row[10]
     return {
         "user_id": row[0],
         "username": row[1],
         "rashi": row[2],
-        "boli_points": row[3],
+        "boli_points": native,
+        "external_boli": external,
+        "total_boli_points": native + external,
         "experience": row[4],
         "last_seen": row[5],
         "prediction_count": row[6],
@@ -624,14 +674,20 @@ def get_leaderboard(
     limit: int = 10,
     offset: int = 0,
 ) -> list[dict]:
-    """Return users sorted by Boli Points, with optional pagination offset."""
+    """Return users sorted by total Boli Points (native + external), with pagination."""
     rows = conn.execute(
-        "SELECT username, rashi, boli_points, prediction_count "
-        "FROM user_stats ORDER BY boli_points DESC LIMIT ? OFFSET ?",
+        "SELECT username, rashi, total_boli_points, prediction_count, experience "
+        "FROM boli_totals_view ORDER BY total_boli_points DESC LIMIT ? OFFSET ?",
         [limit, offset],
     ).fetchall()
     return [
-        {"username": r[0], "rashi": r[1], "boli_points": r[2], "prediction_count": r[3]}
+        {
+            "username": r[0],
+            "rashi": r[1],
+            "boli_points": r[2],   # total, for display
+            "prediction_count": r[3],
+            "experience": r[4],
+        }
         for r in rows
     ]
 
@@ -1980,6 +2036,32 @@ def log_partner_score(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [game_id, user_id, guild_id, username, raw_points, boli_awarded, xp_awarded, game_type],
+        )
+        conn.commit()
+    _db_write(_write)
+
+
+def add_external_boli(
+    conn: sqlite3.Connection,
+    user_id: int,
+    username: str,
+    points: int,
+    game_id: str | None = None,
+    source_game: str = "partner",
+) -> None:
+    """Record an external boli award in the separate external_boli_points table.
+
+    Points are stored as-is (can be negative for deductions).
+    Does NOT touch user_stats.boli_points — the combined total is exposed
+    through boli_totals_view and get_user_profile()'s total_boli_points field.
+    """
+    def _write() -> None:
+        conn.execute(
+            """
+            INSERT INTO external_boli_points (user_id, username, points, source_game, game_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [user_id, username, points, source_game, game_id],
         )
         conn.commit()
     _db_write(_write)

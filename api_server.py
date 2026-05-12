@@ -43,8 +43,8 @@ _rate_counters: dict[int, list[float]] = defaultdict(list)
 
 
 def _normalize_score(raw_points: int) -> int:
-    """1:1 mapping: raw score → Boli. Negative values (fail/loss) → 0."""
-    return max(0, int(raw_points))
+    """1:1 passthrough. Negative values are kept as deductions (stored in external_boli_points)."""
+    return int(raw_points)
 
 
 def _is_rate_limited(guild_id: int) -> bool:
@@ -81,7 +81,7 @@ def create_app(db_conn: sqlite3.Connection, allowed_guild_id: int | None) -> Any
 
     from schema import (
         upsert_user,
-        update_boli_points,
+        add_external_boli,
         add_experience,
         partner_score_exists,
         log_partner_score,
@@ -129,14 +129,21 @@ def create_app(db_conn: sqlite3.Connection, allowed_guild_id: int | None) -> Any
         if not get_config_int(db_conn, "feature_partner_api", 1):
             raise HTTPException(status_code=503, detail="Partner API awards are currently disabled by admin.")
 
-        # Normalize score → Boli (1:1 passthrough)
+        # Normalize score → external Boli (1:1, negatives kept as deductions)
         boli = _normalize_score(payload.points)
         xp = max(_MIN_XP, int(boli * _XP_RATIO)) if boli > 0 else 0
 
-        # Award points
+        # Ensure user row exists, then record in isolated external table
         upsert_user(db_conn, payload.user_id, payload.username)
+        add_external_boli(
+            db_conn,
+            user_id=payload.user_id,
+            username=payload.username,
+            points=boli,
+            game_id=game_id,
+            source_game=payload.game_type,
+        )
         if boli > 0:
-            update_boli_points(db_conn, payload.user_id, boli)
             add_experience(db_conn, payload.user_id, xp)
 
         # Log

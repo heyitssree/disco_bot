@@ -2201,7 +2201,7 @@ async def navi_slash(
 async def ping_slash(interaction: discord.Interaction) -> None:
     latency_ms = round(bot.latency * 1000)
     profile = get_user_profile(db_conn, interaction.user.id)
-    pts = profile["boli_points"] if profile else 0
+    pts = profile["total_boli_points"] if profile else 0
     reply = get_template("ping", pts, latency=latency_ms)
     if not reply:
         reply = f"Pong! Latency is {latency_ms}ms."
@@ -2381,7 +2381,7 @@ async def mypoints_slash(interaction: discord.Interaction) -> None:
         return
 
     rashi = profile.get("rashi") or "Not yet assigned"
-    pts = profile.get("boli_points", 0)
+    pts = profile.get("total_boli_points", 0)
     xp = profile.get("experience", 0)
     count = profile.get("prediction_count", 0)
     level = get_level_from_points(xp)  # level derived from XP, never Boli

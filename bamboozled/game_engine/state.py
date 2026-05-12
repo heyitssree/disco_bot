@@ -48,6 +48,12 @@ class GameState:
     question_difficulty: Optional[str] = None   # "easy"/"medium"/"hard"/None for mixed
     question_category: Optional[int] = None     # OpenTDB category ID, None for all
 
+    # Test mode: no Boli points awarded, no stats recorded (admin-toggled per guild)
+    test_mode: bool = False
+
+    # Thread ID if game was moved to a Discord thread; None if running in main channel
+    thread_id: Optional[int] = None
+
     def current_player_id(self) -> int:
         return self.players[self.current_turn_index]
 
