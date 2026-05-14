@@ -14,7 +14,10 @@ _CAT_NAMES: dict[int, str] = {
     21: "Sports",
     20: "Mythology",
     28: "Vehicles",
+    29: "Comics",
     30: "Science: Gadgets",
+    31: "Anime & Manga",
+    32: "Cartoons & Animations",
 }
 
 
@@ -69,7 +72,10 @@ class GameConfigView(discord.ui.View):
                 discord.SelectOption(label="Sports", value="21"),
                 discord.SelectOption(label="Mythology", value="20"),
                 discord.SelectOption(label="Vehicles", value="28"),
+                discord.SelectOption(label="Comics", value="29"),
                 discord.SelectOption(label="Science: Gadgets", value="30"),
+                discord.SelectOption(label="Anime & Manga", value="31"),
+                discord.SelectOption(label="Cartoons & Animations", value="32"),
             ],
             row=2,
         )

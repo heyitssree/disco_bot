@@ -109,11 +109,13 @@ async def fetch_question(
     session_token: Optional[str] = None,
     difficulty: Optional[str] = None,
     category: Optional[int] = None,
+    question_type: str = "multiple",
 ) -> tuple[Optional[dict], Optional[str]]:
-    """Fetch one question. Returns (question_dict, token). Falls back on failure."""
+    """Fetch one question. Returns (question_dict, token). Falls back on failure.
+    question_type: 'multiple' (4-choice) or 'boolean' (True/False)."""
     params: dict = {
         "amount": 1,
-        "type": "multiple",
+        "type": question_type,
         "category": category if category is not None else random.choice(SAFE_OPENTDB_CATEGORY_IDS),
     }
     if difficulty:

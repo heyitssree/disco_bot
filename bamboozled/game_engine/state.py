@@ -1,7 +1,9 @@
+import random
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from game_engine.constants import MAX_SINGLE_SWING_FIXED, MIST_TURN_DURATION, SOMBRERO_EXTRA_PENALTY, TOTAL_ROUNDS
+from game_engine.constants import MAX_SINGLE_SWING_FIXED, MIST_TURN_DURATION, SAFE_OPENTDB_CATEGORY_IDS, SOMBRERO_EXTRA_PENALTY, STARTING_POINTS, TOTAL_ROUNDS
 
 
 @dataclass
@@ -54,6 +56,16 @@ class GameState:
     # Thread ID if game was moved to a Discord thread; None if running in main channel
     thread_id: Optional[int] = None
 
+    # Timestamp of most-recent player join (used for lobby timeout)
+    last_join_time: float = field(default_factory=time.time)
+
+    # Tracks whether each player has used their one Switcheroo this game
+    switcheroo_used: Dict[int, bool] = field(default_factory=dict)
+
+    # Shuffled category cycle for question variety when "All Categories" is selected
+    category_rotation: List[int] = field(default_factory=list)
+    category_rotation_index: int = 0
+
     def current_player_id(self) -> int:
         return self.players[self.current_turn_index]
 
@@ -94,7 +106,6 @@ class GameState:
         return delta
 
     def scores_display(self) -> Dict[int, str]:
-        import random
         if self.mist_active:
             phrases = [
                 "unknowable", "somewhere between bad and worse",
@@ -116,3 +127,37 @@ class GameState:
     def activate_mist(self):
         self.mist_active = True
         self.mist_turns_remaining = self.mist_turn_duration
+
+    def next_auto_category(self) -> Optional[int]:
+        """Return next category from the rotation (used when no specific category is selected)."""
+        if not self.category_rotation:
+            return None
+        cat = self.category_rotation[self.category_rotation_index % len(self.category_rotation)]
+        self.category_rotation_index += 1
+        return cat
+
+    def reset_for_new_game(self) -> None:
+        """Reset game to lobby state, keeping players. Call after a game ends."""
+        self.scores = {pid: STARTING_POINTS for pid in self.players}
+        self.current_round = 1
+        self.current_turn_index = 0
+        self.active = False
+        self.game_over = False
+        self.golden_pass = {}
+        self.silenced = {}
+        self.sombrero_holder = None
+        self.sombrero_penalty = SOMBRERO_EXTRA_PENALTY
+        self.active_bamboozle_rule = None
+        self.mist_active = False
+        self.mist_turns_remaining = 0
+        self.mist_turn_duration = MIST_TURN_DURATION
+        self.session_token = None
+        self.forfeit_requested = False
+        self.consecutive_correct = {}
+        self.correct_answer_count = {}
+        self.answer_time_seconds = 0.0
+        self.switcheroo_used = {}
+        self.category_rotation = []
+        self.category_rotation_index = 0
+        self.thread_id = None
+        self.last_join_time = time.time()

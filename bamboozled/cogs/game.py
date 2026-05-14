@@ -71,6 +71,7 @@ from game_engine.constants import (
     WANGO_AGAIN_WHEEL_DEPTH_LIMIT,
     DOUBLE_WANGO_CHAIN_LIMIT,
     WRONG_ANSWER_POINTS,
+    SAFE_OPENTDB_CATEGORY_IDS,
 )
 from game_engine.state import GameState
 from game_engine.trivia import fetch_question, fetch_session_token, shuffle_answers
@@ -88,6 +89,9 @@ logger = logging.getLogger(__name__)
 # Discord channel/thread IDs are globally unique, so this single dict safely serves multiple
 # servers and concurrent games as long as each game runs in a distinct channel or thread.
 _active_games: dict[int, GameState] = {}
+
+# Channel IDs that currently have an active lobby-timeout watcher task
+_lobby_watchers: set[int] = set()
 
 _ANSWER_LABELS = ["A", "B", "C", "D"]
 
@@ -413,8 +417,14 @@ class BamboozledCog(commands.Cog):
         game.players.append(interaction.user.id)
         game.player_names[interaction.user.id] = interaction.user.display_name
         game.scores[interaction.user.id] = STARTING_POINTS
+        game.last_join_time = time.time()
 
         await upsert_player(str(interaction.user.id), interaction.user.display_name)
+
+        # Start lobby watcher if not already running
+        if cid not in _lobby_watchers:
+            asyncio.create_task(self._lobby_timeout_watch(cid, game))
+            _lobby_watchers.add(cid)
 
         roster = "\n".join(f"• {game.player_names[pid]}" for pid in game.players)
         await interaction.response.send_message(
@@ -817,12 +827,61 @@ class BamboozledCog(commands.Cog):
         except discord.HTTPException:
             pass
 
+    async def _cleanup_game(self, game: GameState) -> None:
+        """Remove game from registry and archive thread if applicable."""
+        _active_games.pop(game.channel_id, None)
+        if game.thread_id:
+            _active_games.pop(game.thread_id, None)
+        await unregister_active_channel(str(game.channel_id))
+        if game.thread_id:
+            thread = self.bot.get_channel(game.thread_id)
+            if isinstance(thread, discord.Thread):
+                try:
+                    await asyncio.sleep(2)
+                    await thread.edit(archived=True, locked=True)
+                except Exception as exc:
+                    logger.warning("Failed to archive game thread: %s", exc)
+
+    async def _lobby_timeout_watch(self, cid: int, game: GameState) -> None:
+        """Auto-disband the lobby if no game starts within 10 minutes of the last player joining."""
+        try:
+            while True:
+                await asyncio.sleep(60)
+                # Exit if game was already cleaned up or replaced
+                if _active_games.get(cid) is not game and (
+                    not game.channel_id or _active_games.get(game.channel_id) is not game
+                ):
+                    return
+                # Exit if game is running
+                if game.active:
+                    return
+                # Disband if 10 minutes have passed since last join
+                if time.time() - game.last_join_time > 600:
+                    game.active = False
+                    channel = self.bot.get_channel(cid) or self.bot.get_channel(game.channel_id)
+                    if channel:
+                        await channel.send(
+                            "⏰ **Lobby auto-disbanded!** No game started within 10 minutes of "
+                            "the last player joining. Use `/bamboozled join` to open a new lobby."
+                        )
+                    await self._cleanup_game(game)
+                    return
+        finally:
+            _lobby_watchers.discard(cid)
+
     # ─────────────────────────────────────────────────────────
     # Game Loop
     # ─────────────────────────────────────────────────────────
 
     async def _run_game(self, channel: discord.TextChannel, game: GameState):
         cid = channel.id
+
+        # Build a shuffled category rotation so questions cycle across all categories evenly
+        if not game.question_category:
+            rotation = list(SAFE_OPENTDB_CATEGORY_IDS) * 4  # enough for a long game
+            random.shuffle(rotation)
+            game.category_rotation = rotation
+            game.category_rotation_index = 0
 
         while game.current_round <= game.total_rounds and self._still_active(cid, game):
             player_id = game.current_player_id()
@@ -900,10 +959,11 @@ class BamboozledCog(commands.Cog):
 
         await asyncio.sleep(1)
 
+        auto_cat = game.next_auto_category() if not game.question_category else game.question_category
         question, new_token = await fetch_question(
             game.session_token,
             difficulty=game.question_difficulty,
-            category=game.question_category,
+            category=auto_cat,
         )
         game.session_token = new_token
 
@@ -1117,13 +1177,24 @@ class BamboozledCog(commands.Cog):
 
         elif card == ChanceCard.SWITCHEROO:
             if game.is_solo():
-                old = game.scores[player_id]
-                game.scores[player_id] = 0
+                # No opponent in solo — convert to Lucky Llama consolation
+                game.apply_points(player_id, LUCKY_LLAMA_BONUS)
+                score = game.scores[player_id]
                 await channel.send(
-                    f"🔀 **SWITCHEROO!** **{pname}** swaps with the **Phantom Player** (0 pts)! "
-                    f"{old:,} → **{game.scores[player_id]:,}**. The phantom laughs."
+                    f"🔀 **SWITCHEROO!** *No victims available...* The chaos fizzles — "
+                    f"but the llama takes pity. 🦙 **+{LUCKY_LLAMA_BONUS} pts!** "
+                    f"*(Score: {score:,})*"
+                )
+            elif game.switcheroo_used.get(player_id):
+                # Already used their one Switcheroo this game — consolation prize
+                game.apply_points(player_id, LUCKY_LLAMA_BONUS)
+                score = game.scores[player_id]
+                await channel.send(
+                    f"🔀 **SWITCHEROO!** *Already used this game!* The card fizzles into a "
+                    f"consolation llama. 🦙 **+{LUCKY_LLAMA_BONUS} pts!** *(Score: {score:,})*"
                 )
             else:
+                game.switcheroo_used[player_id] = True
                 view = PlayerSelectView(
                     game, player_id,
                     placeholder="Choose a player to swap scores with...",
@@ -1157,16 +1228,21 @@ class BamboozledCog(commands.Cog):
                     )
 
         elif card == ChanceCard.DOUBLE_DOWN:
+            # 30% chance of a True/False question for variety
+            dd_type = "boolean" if random.random() < 0.30 else "multiple"
+            tf_note = " *(True or False!)*" if dd_type == "boolean" else ""
             await channel.send(
-                f"⬇️⬇️ **{pname}**, the Double Down demands **another question**! "
+                f"⬇️⬇️ **{pname}**, the Double Down demands **another question**!{tf_note} "
                 f"Correct = **+{DOUBLE_DOWN_BONUS} pts**. Wrong = **{DOUBLE_DOWN_PENALTY} pts**. No cards drawn after."
             )
             await asyncio.sleep(1)
 
+            dd_cat = game.next_auto_category() if not game.question_category else game.question_category
             question, new_token = await fetch_question(
                 game.session_token,
                 difficulty=game.question_difficulty,
-                category=game.question_category,
+                category=dd_cat,
+                question_type=dd_type,
             )
             game.session_token = new_token
             answers, correct_idx = shuffle_answers(question)
@@ -1871,20 +1947,43 @@ class BamboozledCog(commands.Cog):
                     )
                 await channel.send(embed=boli_embed)
 
-        # Clean up — remove both original channel and thread entries
+        # ── Play-again: reset game to lobby state instead of fully cleaning up ──
+        # Archive and unlink the thread (it held the completed game), then open
+        # a lobby in the original channel so the host can start a new game.
         game.active = False
-        _active_games.pop(game.channel_id, None)
-        if game.thread_id:
-            _active_games.pop(game.thread_id, None)
-        await unregister_active_channel(str(game.channel_id))
+        old_thread_id = game.thread_id
 
-        # Archive thread if game ran in one
+        # Archive the completed game thread first
         if isinstance(channel, discord.Thread):
-            await asyncio.sleep(2)
             try:
                 await channel.edit(archived=True, locked=True)
             except Exception as exc:
                 logger.warning("Failed to archive game thread: %s", exc)
+
+        # Reset game state but keep players in the lobby
+        game.reset_for_new_game()  # clears thread_id among other state
+
+        # Remove stale thread entry from registry (original channel entry stays)
+        if old_thread_id:
+            _active_games.pop(old_thread_id, None)
+
+        # Figure out where to post the lobby message
+        lobby_channel = self.bot.get_channel(game.channel_id) or channel
+        roster = "\n".join(f"• {game.player_names[pid]}" for pid in game.players)
+        host_name = game.player_names.get(game.host_id, "Host")
+        await lobby_channel.send(
+            f"🎬 **Game over! The lobby is still open.**\n\n"
+            f"**Players staying ({len(game.players)}/6):**\n{roster}\n\n"
+            f"**{host_name}** can use `/bamboozled start` to play again, "
+            f"or players can use `/bamboozled leave` to exit.\n"
+            f"⏰ *Lobby auto-closes in 10 minutes if no new game starts.*"
+        )
+
+        # Restart lobby timeout watcher
+        lobby_cid = game.channel_id
+        if lobby_cid not in _lobby_watchers:
+            asyncio.create_task(self._lobby_timeout_watch(lobby_cid, game))
+            _lobby_watchers.add(lobby_cid)
 
 
 async def setup(bot: commands.Bot):

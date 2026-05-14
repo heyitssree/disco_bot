@@ -26,7 +26,10 @@ SAFE_OPENTDB_CATEGORY_IDS = [
     25,  # Art
     27,  # Animals
     28,  # Vehicles
+    29,  # Entertainment: Comics
     30,  # Science: Gadgets
+    31,  # Entertainment: Japanese Anime & Manga
+    32,  # Entertainment: Cartoon & Animations
 ]
 
 # ── Bamboozle Rule content filter ─────────────────────────────────────────────
