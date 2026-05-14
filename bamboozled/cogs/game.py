@@ -330,6 +330,44 @@ class GoldenMonkeyView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────────────────────
+# Game Controls View (host-only buttons pinned in the game thread)
+# ─────────────────────────────────────────────────────────────
+
+
+class GameControlsView(discord.ui.View):
+    """Small view pinned to the first message of the game thread.
+    Gives the host a visible button to force-end the game mid-run."""
+
+    def __init__(self, game: "GameState", cog: "BamboozledCog"):
+        super().__init__(timeout=None)
+        self.game = game
+        self.cog = cog
+
+    @discord.ui.button(label="🛑 End Game", style=discord.ButtonStyle.danger, row=0)
+    async def end_game_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        game = self.game
+        if interaction.user.id != game.host_id:
+            await interaction.response.send_message(
+                "⚠️ Only the host can force-end the game!", ephemeral=True
+            )
+            return
+        if not game.active:
+            await interaction.response.send_message(
+                "⚠️ No game is running.", ephemeral=True
+            )
+            return
+        game.active = False
+        self.stop()
+        # Respond immediately — cleanup (which sleeps 2s for thread archive) runs in background
+        await interaction.response.edit_message(view=None)
+        await interaction.followup.send(
+            "🛑 **GAME ENDED EARLY.** The producer pulls the plug. No results saved. "
+            "The audience leaves in stunned silence."
+        )
+        asyncio.create_task(self.cog._cleanup_game(game))
+
+
+# ─────────────────────────────────────────────────────────────
 # Lobby View (button-based join/leave/start/disband)
 # ─────────────────────────────────────────────────────────────
 
@@ -533,7 +571,8 @@ class LobbyView(discord.ui.View):
             game_channel = thread
             await thread.send(
                 "🎮 **The game is running in this thread!** "
-                "Use `/bamboozled forfeit`, `/bamboozled scores`, and `/bamboozled endgame` here."
+                "Use `/bamboozled forfeit` to skip your turn or `/bamboozled scores` to check scores.",
+                view=GameControlsView(game, self.cog),
             )
         except discord.Forbidden:
             await channel.send(
