@@ -48,13 +48,16 @@ class GameState:
     # Game configuration (set by host at start)
     total_rounds: int = TOTAL_ROUNDS
     question_difficulty: Optional[str] = None   # "easy"/"medium"/"hard"/None for mixed
-    question_category: Optional[int] = None     # OpenTDB category ID, None for all
+    question_categories: List[int] = field(default_factory=list)  # empty = all categories
 
     # Test mode: no Boli points awarded, no stats recorded (admin-toggled per guild)
     test_mode: bool = False
 
     # Thread ID if game was moved to a Discord thread; None if running in main channel
     thread_id: Optional[int] = None
+
+    # Message ID of the lobby embed posted in the channel (used as the primary registry key)
+    lobby_id: Optional[int] = None
 
     # Timestamp of most-recent player join (used for lobby timeout)
     last_join_time: float = field(default_factory=time.time)
@@ -136,6 +139,13 @@ class GameState:
         self.category_rotation_index += 1
         return cat
 
+    def pick_question_category(self) -> Optional[int]:
+        """Return the category to use for the next question.
+        Randomly picks from selected categories, or falls back to the full rotation."""
+        if self.question_categories:
+            return random.choice(self.question_categories)
+        return self.next_auto_category()
+
     def reset_for_new_game(self) -> None:
         """Reset game to lobby state, keeping players. Call after a game ends."""
         self.scores = {pid: STARTING_POINTS for pid in self.players}
@@ -159,5 +169,7 @@ class GameState:
         self.switcheroo_used = {}
         self.category_rotation = []
         self.category_rotation_index = 0
+        self.question_categories = []
         self.thread_id = None
+        self.lobby_id = None
         self.last_join_time = time.time()

@@ -85,12 +85,16 @@ from game_engine.wheel import (
 
 logger = logging.getLogger(__name__)
 
-# Channel-keyed game registry (keyed by both original channel ID and thread ID when applicable).
-# Discord channel/thread IDs are globally unique, so this single dict safely serves multiple
-# servers and concurrent games as long as each game runs in a distinct channel or thread.
+# Primary game registry: keyed by lobby message ID (set when lobby is posted) or by thread ID
+# (added when a game moves into a thread).  Multiple concurrent lobbies/games per channel are
+# supported because the keys are message/thread IDs, not channel IDs.
 _active_games: dict[int, GameState] = {}
 
-# Channel IDs that currently have an active lobby-timeout watcher task
+# channel_id → list of all GameState objects active in that channel (lobbies + running games).
+# Used for player-based lookup when a command is issued outside of a game thread.
+_channel_games: dict[int, list[GameState]] = {}
+
+# Lobby message IDs that currently have an active lobby-timeout watcher task.
 _lobby_watchers: set[int] = set()
 
 _ANSWER_LABELS = ["A", "B", "C", "D"]
@@ -326,6 +330,245 @@ class GoldenMonkeyView(discord.ui.View):
 
 
 # ─────────────────────────────────────────────────────────────
+# Lobby View (button-based join/leave/start/disband)
+# ─────────────────────────────────────────────────────────────
+
+
+class LobbyView(discord.ui.View):
+    """Persistent view attached to the lobby embed message.
+
+    Buttons are visible to everyone; auth checks run on click.
+    The view is stopped (buttons disabled) when the game starts or the lobby is disbanded.
+    """
+
+    def __init__(self, game: "GameState", cog: "BamboozledCog"):
+        super().__init__(timeout=None)
+        self.game = game
+        self.cog = cog
+
+    # ── Embed builder ────────────────────────────────────────
+
+    def lobby_embed(self) -> discord.Embed:
+        game = self.game
+        if game.active:
+            embed = discord.Embed(
+                title="🎬 Bamboozled! — Game in Progress",
+                color=discord.Color.red(),
+            )
+            roster = "\n".join(f"• {game.player_names[pid]}" for pid in game.players)
+            embed.description = f"🎮 A game is running! Check the game thread.\n\n**Players:**\n{roster}"
+        else:
+            embed = discord.Embed(
+                title="🎬 Bamboozled! — Lobby Open",
+                color=discord.Color.green(),
+            )
+            if game.players:
+                roster = "\n".join(f"• {game.player_names[pid]}" for pid in game.players)
+                host_name = game.player_names.get(game.host_id, "Unknown")
+                embed.description = (
+                    f"**Players ({len(game.players)}/6):**\n{roster}\n\n"
+                    f"👑 Host: **{host_name}**\n\n"
+                    f"Press **Join** to join or **Leave** to exit. "
+                    f"The host can **Start** or **End** the lobby.\n"
+                    f"⏰ *Auto-closes after 10 minutes of inactivity.*"
+                )
+            else:
+                embed.description = "Lobby is empty."
+        return embed
+
+    # ── Helpers ───────────────────────────────────────────────
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        """Edit the lobby message in-place with the updated embed."""
+        try:
+            await interaction.message.edit(embed=self.lobby_embed(), view=self)
+        except Exception:
+            pass
+
+    # ── Buttons ───────────────────────────────────────────────
+
+    @discord.ui.button(label="🎮 Join", style=discord.ButtonStyle.success, row=0)
+    async def join_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        game = self.game
+        if game.active:
+            await interaction.response.send_message(
+                "⚠️ A game is already running in this lobby!", ephemeral=True
+            )
+            return
+        if interaction.user.id in game.players:
+            await interaction.response.send_message(
+                "⚠️ You're already in this lobby!", ephemeral=True
+            )
+            return
+        if len(game.players) >= 6:
+            await interaction.response.send_message(
+                "⚠️ This lobby is full (6 players max)!", ephemeral=True
+            )
+            return
+
+        game.players.append(interaction.user.id)
+        game.player_names[interaction.user.id] = interaction.user.display_name
+        game.scores[interaction.user.id] = STARTING_POINTS
+        game.last_join_time = time.time()
+        await upsert_player(str(interaction.user.id), interaction.user.display_name)
+
+        await interaction.response.edit_message(embed=self.lobby_embed(), view=self)
+        await interaction.followup.send(
+            f"🎬 **{interaction.user.display_name}** joined the lobby! "
+            f"({len(game.players)}/6 players)"
+        )
+
+    @discord.ui.button(label="👋 Leave", style=discord.ButtonStyle.secondary, row=0)
+    async def leave_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        game = self.game
+        if interaction.user.id not in game.players:
+            await interaction.response.send_message(
+                "⚠️ You're not in this lobby.", ephemeral=True
+            )
+            return
+        if game.active:
+            await interaction.response.send_message(
+                "⚠️ Game is running. Use `/bamboozled forfeit` or ask the host "
+                "to use `/bamboozled endgame`.",
+                ephemeral=True,
+            )
+            return
+
+        pname = interaction.user.display_name
+        uid = interaction.user.id
+        game.players.remove(uid)
+        game.player_names.pop(uid, None)
+        game.scores.pop(uid, None)
+
+        if not game.players:
+            await self.cog._cleanup_game(game)
+            self.stop()
+            await interaction.response.edit_message(
+                content="🛑 **Lobby closed** — all players left.",
+                embed=None,
+                view=None,
+            )
+            return
+
+        host_msg = ""
+        if uid == game.host_id:
+            game.host_id = game.players[0]
+            host_msg = f" **{game.player_names[game.host_id]}** is now the host!"
+
+        await interaction.response.edit_message(embed=self.lobby_embed(), view=self)
+        await interaction.followup.send(f"👋 **{pname}** left the lobby.{host_msg}")
+
+    @discord.ui.button(label="▶️ Start", style=discord.ButtonStyle.primary, row=1)
+    async def start_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        game = self.game
+        if interaction.user.id != game.host_id:
+            await interaction.response.send_message(
+                "⚠️ Only the host can start the game!", ephemeral=True
+            )
+            return
+        if game.active:
+            await interaction.response.send_message(
+                "⚠️ A game is already running!", ephemeral=True
+            )
+            return
+        if not game.players:
+            await interaction.response.send_message(
+                "⚠️ No players in the lobby!", ephemeral=True
+            )
+            return
+
+        config_view = GameConfigView()
+        await interaction.response.send_message(
+            "⚙️ **Configure your game!** Select your settings, then click **Confirm & Start**.\n"
+            "You have 30 seconds — defaults apply if you don't confirm.",
+            view=config_view,
+            ephemeral=True,
+        )
+        await config_view.wait()
+
+        game.total_rounds = config_view.total_rounds
+        game.question_difficulty = config_view.question_difficulty
+        game.question_categories = config_view.question_categories
+
+        if interaction.guild:
+            game.test_mode = await get_test_mode(str(interaction.guild.id))
+
+        game.active = True
+        game.session_token = await fetch_session_token()
+        await register_active_channel(str(game.channel_id))
+
+        # Disable lobby view buttons and update embed
+        self.stop()
+        try:
+            await interaction.message.edit(embed=self.lobby_embed(), view=None)
+        except Exception:
+            pass
+
+        channel = interaction.channel
+        roster = "\n".join(
+            f"{i + 1}. {game.player_names[pid]}" for i, pid in enumerate(game.players)
+        )
+        test_note = (
+            "\n\n⚠️ **TEST MODE ACTIVE** — no Boli points or stats will be recorded."
+            if game.test_mode
+            else ""
+        )
+        announce_text = (
+            f"🎬🎉 **BAMBOOZLED BEGINS!** 🎉🎬\n\n"
+            f"**{len(game.players)} player(s) take the stage:**\n{roster}\n\n"
+            f"Everyone starts with **{STARTING_POINTS:,} points**. "
+            f"**Settings: {config_view.config_summary()}**\n\n"
+            f"*The studio audience goes absolutely FERAL...*{test_note}"
+        )
+
+        game_channel = channel
+        try:
+            announce_msg = await channel.send(announce_text)
+            thread = await announce_msg.create_thread(
+                name=f"🎬 Bamboozled! — {datetime.now().strftime('%b %d %I:%M%p')}",
+                auto_archive_duration=60,
+            )
+            game.thread_id = thread.id
+            _active_games[thread.id] = game
+            game_channel = thread
+            await thread.send(
+                "🎮 **The game is running in this thread!** "
+                "Use `/bamboozled forfeit`, `/bamboozled scores`, and `/bamboozled endgame` here."
+            )
+        except discord.Forbidden:
+            await channel.send(
+                "⚠️ I don't have permission to create threads — running in this channel instead."
+            )
+        except Exception as exc:
+            logger.warning("Failed to create game thread: %s", exc)
+
+        asyncio.create_task(self.cog._run_game(game_channel, game))
+
+    @discord.ui.button(label="🛑 End Lobby", style=discord.ButtonStyle.danger, row=1)
+    async def end_lobby_btn(self, interaction: discord.Interaction, _btn: discord.ui.Button):
+        game = self.game
+        if interaction.user.id != game.host_id:
+            await interaction.response.send_message(
+                "⚠️ Only the host can end the lobby!", ephemeral=True
+            )
+            return
+        if game.active:
+            await interaction.response.send_message(
+                "⚠️ A game is running. Use `/bamboozled endgame` to force-end it.",
+                ephemeral=True,
+            )
+            return
+
+        await self.cog._cleanup_game(game)
+        self.stop()
+        await interaction.response.edit_message(
+            content="🛑 **Lobby disbanded.** See you next time!",
+            embed=None,
+            view=None,
+        )
+
+
+# ─────────────────────────────────────────────────────────────
 # Boli Points helpers
 # ─────────────────────────────────────────────────────────────
 
@@ -387,65 +630,52 @@ class BamboozledCog(commands.Cog):
 
     # ── /bamboozled join ─────────────────────────────────────
 
-    @bamboozled.command(name="join", description="Join the Bamboozled lobby!")
+    @bamboozled.command(name="join", description="Create a new Bamboozled lobby!")
     async def join(self, interaction: discord.Interaction):
         cid = interaction.channel_id
-        game = _active_games.get(cid)
 
-        if game and game.active:
-            await interaction.response.send_message(
-                "⚠️ A game is already running! Wait for the next one.", ephemeral=True
-            )
-            return
+        # Prevent a user from being in two lobbies in the same channel
+        for g in _channel_games.get(cid, []):
+            if interaction.user.id in g.players:
+                await interaction.response.send_message(
+                    "⚠️ You're already in a lobby in this channel! "
+                    "Use the lobby message buttons to manage your spot.",
+                    ephemeral=True,
+                )
+                return
 
-        if not game:
-            game = GameState(channel_id=cid, host_id=interaction.user.id)
-            _active_games[cid] = game
-
-        if interaction.user.id in game.players:
-            await interaction.response.send_message(
-                "⚠️ You're already in the lobby!", ephemeral=True
-            )
-            return
-
-        if len(game.players) >= 6:
-            await interaction.response.send_message(
-                "⚠️ The lobby is full (6 players max)!", ephemeral=True
-            )
-            return
-
+        game = GameState(channel_id=cid, host_id=interaction.user.id)
         game.players.append(interaction.user.id)
         game.player_names[interaction.user.id] = interaction.user.display_name
         game.scores[interaction.user.id] = STARTING_POINTS
-        game.last_join_time = time.time()
 
         await upsert_player(str(interaction.user.id), interaction.user.display_name)
 
-        # Start lobby watcher if not already running
-        if cid not in _lobby_watchers:
-            asyncio.create_task(self._lobby_timeout_watch(cid, game))
-            _lobby_watchers.add(cid)
+        # Post the lobby embed with interactive buttons
+        view = LobbyView(game, self)
+        msg = await interaction.channel.send(embed=view.lobby_embed(), view=view)
+        game.lobby_id = msg.id
+        _active_games[msg.id] = game
+        _channel_games.setdefault(cid, []).append(game)
 
-        roster = "\n".join(f"• {game.player_names[pid]}" for pid in game.players)
         await interaction.response.send_message(
-            f"🎬 **{interaction.user.display_name}** has entered the arena!\n\n"
-            f"**Players ({len(game.players)}/6):**\n{roster}\n\n"
-            f"Waiting for the host to `/bamboozled start`..."
+            f"🎬 **Lobby created!** Others can click **Join** on the message above.",
+            ephemeral=True,
         )
+
+        asyncio.create_task(self._lobby_timeout_watch(game))
+        _lobby_watchers.add(game.lobby_id)
 
     # ── /bamboozled leave ────────────────────────────────────
 
     @bamboozled.command(name="leave", description="Leave the lobby before the game starts.")
     async def leave(self, interaction: discord.Interaction):
-        cid = interaction.channel_id
-        game = _active_games.get(cid)
-
-        if not game or interaction.user.id not in game.players:
+        game = self._find_player_game(interaction.channel_id, interaction.user.id)
+        if not game:
             await interaction.response.send_message(
                 "⚠️ You're not in any lobby here.", ephemeral=True
             )
             return
-
         if game.active:
             await interaction.response.send_message(
                 "⚠️ The game is already running! Use `/bamboozled forfeit` to skip your turn, "
@@ -453,45 +683,38 @@ class BamboozledCog(commands.Cog):
                 ephemeral=True,
             )
             return
-
+        # Delegate to the lobby button logic by directly mutating state
         pname = interaction.user.display_name
-        game.players.remove(interaction.user.id)
-        game.player_names.pop(interaction.user.id, None)
-        game.scores.pop(interaction.user.id, None)
+        uid = interaction.user.id
+        game.players.remove(uid)
+        game.player_names.pop(uid, None)
+        game.scores.pop(uid, None)
 
         if not game.players:
-            _active_games.pop(cid, None)
+            await self._cleanup_game(game)
             await interaction.response.send_message(
-                f"👋 **{pname}** has left the lobby. No players remaining — lobby closed."
+                f"👋 **{pname}** left. No players remaining — lobby closed."
             )
             return
 
-        if interaction.user.id == game.host_id:
+        host_msg = ""
+        if uid == game.host_id:
             game.host_id = game.players[0]
-            new_host = game.player_names[game.host_id]
-            await interaction.response.send_message(
-                f"👋 **{pname}** (host) has left the lobby. "
-                f"**{new_host}** is now the host!\n\n"
-                f"**Players ({len(game.players)}/6):** "
-                + ", ".join(game.player_names[p] for p in game.players)
-            )
-        else:
-            await interaction.response.send_message(
-                f"👋 **{pname}** has left the lobby.\n\n"
-                f"**Players ({len(game.players)}/6):** "
-                + ", ".join(game.player_names[p] for p in game.players)
-            )
+            host_msg = f" **{game.player_names[game.host_id]}** is now the host!"
+
+        # Refresh the lobby embed if we can find the lobby message
+        await self._refresh_lobby_embed(game)
+        await interaction.response.send_message(f"👋 **{pname}** left the lobby.{host_msg}")
 
     # ── /bamboozled start ────────────────────────────────────
 
-    @bamboozled.command(name="start", description="Start the game (host only).")
+    @bamboozled.command(name="start", description="Start the game (host only). Prefer the lobby Start button.")
     async def start(self, interaction: discord.Interaction):
-        cid = interaction.channel_id
-        game = _active_games.get(cid)
-
+        game = self._find_host_game(interaction.channel_id, interaction.user.id)
         if not game:
             await interaction.response.send_message(
-                "⚠️ No lobby found. Use `/bamboozled join` first!", ephemeral=True
+                "⚠️ No lobby found where you are the host. Use `/bamboozled join` first!",
+                ephemeral=True,
             )
             return
         if game.active:
@@ -499,80 +722,20 @@ class BamboozledCog(commands.Cog):
                 "⚠️ The game is already running!", ephemeral=True
             )
             return
-        if interaction.user.id != game.host_id:
-            await interaction.response.send_message(
-                "⚠️ Only the host can start the game!", ephemeral=True
-            )
-            return
-
-        channel = interaction.channel
-
-        config_view = GameConfigView()
+        # Redirect to the lobby Start button flow — avoids duplicating the thread-creation logic
         await interaction.response.send_message(
-            "⚙️ **Configure your game!** Select your settings below, then click **Confirm & Start**.\n"
-            "You have 30 seconds — the game will start with defaults if you don't confirm.",
-            view=config_view,
+            "⚙️ Use the **▶️ Start** button on the lobby message above to configure and start the game.",
             ephemeral=True,
         )
-        await config_view.wait()
-
-        game.total_rounds = config_view.total_rounds
-        game.question_difficulty = config_view.question_difficulty
-        game.question_category = config_view.question_category
-
-        # Check test mode for this guild
-        if interaction.guild:
-            game.test_mode = await get_test_mode(str(interaction.guild.id))
-
-        game.active = True
-        game.session_token = await fetch_session_token()
-        await register_active_channel(str(cid))
-
-        roster = "\n".join(
-            f"{i + 1}. {game.player_names[pid]}" for i, pid in enumerate(game.players)
-        )
-        test_note = "\n\n⚠️ **TEST MODE ACTIVE** — no Boli points or stats will be recorded." if game.test_mode else ""
-        announce_text = (
-            f"🎬🎉 **BAMBOOZLED BEGINS!** 🎉🎬\n\n"
-            f"**{len(game.players)} player(s) take the stage:**\n{roster}\n\n"
-            f"Everyone starts with **{STARTING_POINTS:,} points**. "
-            f"**Settings: {config_view.config_summary()}**\n\n"
-            f"*The studio audience goes absolutely FERAL...*{test_note}"
-        )
-
-        # Try to create a thread for the game
-        game_channel = channel
-        try:
-            announce_msg = await channel.send(announce_text)
-            thread = await announce_msg.create_thread(
-                name=f"🎬 Bamboozled! — {datetime.now().strftime('%b %d %I:%M%p')}",
-                auto_archive_duration=60,
-            )
-            game.thread_id = thread.id
-            _active_games[thread.id] = game
-            game_channel = thread
-            await thread.send(
-                "🎮 **The game is running in this thread!** "
-                "Use `/bamboozled forfeit`, `/bamboozled scores`, and `/bamboozled endgame` here."
-            )
-        except discord.Forbidden:
-            await channel.send(
-                "⚠️ I don't have permission to create threads — running in this channel instead."
-            )
-        except Exception as exc:
-            logger.warning("Failed to create game thread: %s", exc)
-            # announce_text was already sent above; just continue without a thread
-
-        asyncio.create_task(self._run_game(game_channel, game))
 
     # ── /bamboozled scores ───────────────────────────────────
 
     @bamboozled.command(name="scores", description="Check current scores (obfuscated during Mist).")
     async def scores(self, interaction: discord.Interaction):
-        game = _active_games.get(interaction.channel_id)
+        game = self._find_player_game(interaction.channel_id, interaction.user.id)
         if not game or not game.active:
             await interaction.response.send_message(
-                "⚠️ No active game in this channel.", ephemeral=True
+                "⚠️ No active game found for you in this channel.", ephemeral=True
             )
             return
         embed = self._scores_embed(game)
@@ -645,10 +808,10 @@ class BamboozledCog(commands.Cog):
 
     @bamboozled.command(name="forfeit", description="Forfeit your current turn (treated as timeout).")
     async def forfeit(self, interaction: discord.Interaction):
-        game = _active_games.get(interaction.channel_id)
+        game = self._find_player_game(interaction.channel_id, interaction.user.id)
         if not game or not game.active:
             await interaction.response.send_message(
-                "⚠️ No active game in this channel.", ephemeral=True
+                "⚠️ No active game found for you in this channel.", ephemeral=True
             )
             return
         if interaction.user.id != game.current_player_id():
@@ -665,23 +828,15 @@ class BamboozledCog(commands.Cog):
 
     @bamboozled.command(name="endgame", description="Force-end the current game or disband the lobby (host only).")
     async def endgame(self, interaction: discord.Interaction):
-        game = _active_games.get(interaction.channel_id)
+        game = self._find_host_game(interaction.channel_id, interaction.user.id)
         if not game:
             await interaction.response.send_message(
-                "⚠️ No active game or lobby to end.", ephemeral=True
-            )
-            return
-        if interaction.user.id != game.host_id:
-            await interaction.response.send_message(
-                "⚠️ Only the host can end the game!", ephemeral=True
+                "⚠️ No active game or lobby found where you are the host.", ephemeral=True
             )
             return
         was_active = game.active
         game.active = False
-        _active_games.pop(game.channel_id, None)
-        if game.thread_id:
-            _active_games.pop(game.thread_id, None)
-        await unregister_active_channel(str(game.channel_id))
+        await self._cleanup_game(game)
         if was_active:
             await interaction.response.send_message(
                 "🛑 **GAME ENDED EARLY.** The producer pulls the plug. No results saved. "
@@ -756,11 +911,23 @@ class BamboozledCog(commands.Cog):
             color=discord.Color.orange(),
         )
         embed.add_field(
+            name="📋 How to join",
+            value=(
+                "1. One player uses `/bamboozled join` to open a **lobby** with an interactive message.\n"
+                "2. Others click **🎮 Join** on that message to join the same lobby. "
+                "Multiple lobbies can run in parallel — each `/join` creates a new one.\n"
+                "3. The host clicks **▶️ Start** to configure and begin. "
+                "Players can click **👋 Leave** at any time before the game starts.\n"
+                "4. The host can click **🛑 End Lobby** to disband before the game starts, "
+                "or use `/bamboozled endgame` once a game is running."
+            ),
+            inline=False,
+        )
+        embed.add_field(
             name="📋 Commands",
             value=(
-                "`/bamboozled join` — Join the lobby\n"
-                "`/bamboozled leave` — Leave the lobby before the game starts\n"
-                "`/bamboozled start` — Start the game and configure settings *(host only)*\n"
+                "`/bamboozled join` — Create a new lobby\n"
+                "`/bamboozled leave` — Leave the lobby *(slash fallback; use the button)*\n"
                 "`/bamboozled scores` — Check current scores mid-game *(hidden during Mist)*\n"
                 "`/bamboozled leaderboard` — All-time win leaderboard\n"
                 "`/bamboozled stats @user` — A specific player's all-time stats\n"
@@ -768,6 +935,11 @@ class BamboozledCog(commands.Cog):
                 "`/bamboozled endgame` — Force-end the game with no results saved *(host only)*\n"
                 "`/bamboozled testmode` — Toggle test mode *(admin only)*"
             ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔥 Hot Streak",
+            value="Answer **3 or more in a row** correctly and earn a 🔥 **HOT STREAK!** badge.",
             inline=False,
         )
         await interaction.response.send_message(embed=embed)
@@ -807,8 +979,45 @@ class BamboozledCog(commands.Cog):
         embed.set_footer(text=f"Round {game.current_round}/{game.total_rounds}")
         return embed
 
-    def _still_active(self, cid: int, game: GameState) -> bool:
-        return _active_games.get(cid) is game and game.active
+    def _still_active(self, _cid: int, game: GameState) -> bool:
+        """True while the game has not been force-ended by /endgame."""
+        return game.active
+
+    def _find_player_game(self, channel_id: int, user_id: int) -> Optional["GameState"]:
+        """Find a game/lobby that this user belongs to, starting from a channel or thread ID."""
+        # Direct hit: channel_id might be a thread_id or lobby message ID
+        g = _active_games.get(channel_id)
+        if g and user_id in g.players:
+            return g
+        # Search all games registered in this channel
+        for g in _channel_games.get(channel_id, []):
+            if user_id in g.players:
+                return g
+        return None
+
+    def _find_host_game(self, channel_id: int, user_id: int) -> Optional["GameState"]:
+        """Find a game/lobby hosted by this user, starting from a channel or thread ID."""
+        g = _active_games.get(channel_id)
+        if g and g.host_id == user_id:
+            return g
+        for g in _channel_games.get(channel_id, []):
+            if g.host_id == user_id:
+                return g
+        return None
+
+    async def _refresh_lobby_embed(self, game: "GameState") -> None:
+        """Re-fetch and update the lobby embed message if possible."""
+        if not game.lobby_id or not game.channel_id:
+            return
+        channel = self.bot.get_channel(game.channel_id)
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(game.lobby_id)
+            view = LobbyView(game, self)
+            await msg.edit(embed=view.lobby_embed(), view=view)
+        except Exception:
+            pass
 
     async def _draw_card_interaction(
         self,
@@ -828,10 +1037,16 @@ class BamboozledCog(commands.Cog):
             pass
 
     async def _cleanup_game(self, game: GameState) -> None:
-        """Remove game from registry and archive thread if applicable."""
-        _active_games.pop(game.channel_id, None)
+        """Remove game from all registries and archive any game thread."""
+        if game.lobby_id:
+            _active_games.pop(game.lobby_id, None)
         if game.thread_id:
             _active_games.pop(game.thread_id, None)
+        chan_list = _channel_games.get(game.channel_id)
+        if chan_list and game in chan_list:
+            chan_list.remove(game)
+            if not chan_list:
+                _channel_games.pop(game.channel_id, None)
         await unregister_active_channel(str(game.channel_id))
         if game.thread_id:
             thread = self.bot.get_channel(game.thread_id)
@@ -842,32 +1057,39 @@ class BamboozledCog(commands.Cog):
                 except Exception as exc:
                     logger.warning("Failed to archive game thread: %s", exc)
 
-    async def _lobby_timeout_watch(self, cid: int, game: GameState) -> None:
+    async def _lobby_timeout_watch(self, game: GameState) -> None:
         """Auto-disband the lobby if no game starts within 10 minutes of the last player joining."""
+        lobby_id = game.lobby_id
         try:
             while True:
                 await asyncio.sleep(60)
-                # Exit if game was already cleaned up or replaced
-                if _active_games.get(cid) is not game and (
-                    not game.channel_id or _active_games.get(game.channel_id) is not game
-                ):
+                # Exit if game was already cleaned up or started
+                if _active_games.get(lobby_id) is not game:
                     return
-                # Exit if game is running
                 if game.active:
                     return
-                # Disband if 10 minutes have passed since last join
                 if time.time() - game.last_join_time > 600:
                     game.active = False
-                    channel = self.bot.get_channel(cid) or self.bot.get_channel(game.channel_id)
-                    if channel:
-                        await channel.send(
-                            "⏰ **Lobby auto-disbanded!** No game started within 10 minutes of "
-                            "the last player joining. Use `/bamboozled join` to open a new lobby."
-                        )
+                    channel = self.bot.get_channel(game.channel_id)
+                    if channel and lobby_id:
+                        # Try to update the lobby message, fall back to a plain message
+                        try:
+                            msg = await channel.fetch_message(lobby_id)
+                            closed_embed = discord.Embed(
+                                title="🎬 Bamboozled! — Lobby Closed",
+                                description="⏰ **Lobby auto-disbanded** — no game started within 10 minutes.",
+                                color=discord.Color.dark_gray(),
+                            )
+                            await msg.edit(embed=closed_embed, view=None)
+                        except Exception:
+                            await channel.send(
+                                "⏰ **Lobby auto-disbanded!** No game started within 10 minutes. "
+                                "Use `/bamboozled join` to open a new lobby."
+                            )
                     await self._cleanup_game(game)
                     return
         finally:
-            _lobby_watchers.discard(cid)
+            _lobby_watchers.discard(lobby_id)
 
     # ─────────────────────────────────────────────────────────
     # Game Loop
@@ -876,8 +1098,9 @@ class BamboozledCog(commands.Cog):
     async def _run_game(self, channel: discord.TextChannel, game: GameState):
         cid = channel.id
 
-        # Build a shuffled category rotation so questions cycle across all categories evenly
-        if not game.question_category:
+        # Build a shuffled full-rotation only when no specific categories were chosen.
+        # When specific categories are selected, pick_question_category() samples them directly.
+        if not game.question_categories:
             rotation = list(SAFE_OPENTDB_CATEGORY_IDS) * 4  # enough for a long game
             random.shuffle(rotation)
             game.category_rotation = rotation
@@ -959,11 +1182,10 @@ class BamboozledCog(commands.Cog):
 
         await asyncio.sleep(1)
 
-        auto_cat = game.next_auto_category() if not game.question_category else game.question_category
         question, new_token = await fetch_question(
             game.session_token,
             difficulty=game.question_difficulty,
-            category=auto_cat,
+            category=game.pick_question_category(),
         )
         game.session_token = new_token
 
@@ -1049,7 +1271,8 @@ class BamboozledCog(commands.Cog):
         # ── Correct ──────────────────────────────────────────
         if view.chosen_idx == correct_idx:
             game.apply_points(player_id, CORRECT_ANSWER_POINTS)
-            game.consecutive_correct[player_id] = game.consecutive_correct.get(player_id, 0) + 1
+            streak = game.consecutive_correct.get(player_id, 0) + 1
+            game.consecutive_correct[player_id] = streak
             game.correct_answer_count[player_id] = game.correct_answer_count.get(player_id, 0) + 1
             score = game.scores[player_id]
 
@@ -1057,6 +1280,13 @@ class BamboozledCog(commands.Cog):
                 await channel.send(cmnt.correct_mist(player_name))
             else:
                 await channel.send(cmnt.correct(player_name, CORRECT_ANSWER_POINTS, score, correct_text))
+
+            # Hot Streak visual badge (3+ correct in a row, independent of any Bamboozle rule)
+            if streak >= 3 and not game.mist_active:
+                await channel.send(
+                    f"🔥 **HOT STREAK!** **{player_name}** has answered "
+                    f"**{streak} in a row** correctly! The crowd is losing its mind!"
+                )
 
             # Rule enforcement for correct answers (Rules 1, 4, 8)
             active_rule = game.active_bamboozle_rule
@@ -1237,11 +1467,10 @@ class BamboozledCog(commands.Cog):
             )
             await asyncio.sleep(1)
 
-            dd_cat = game.next_auto_category() if not game.question_category else game.question_category
             question, new_token = await fetch_question(
                 game.session_token,
                 difficulty=game.question_difficulty,
-                category=dd_cat,
+                category=game.pick_question_category(),
                 question_type=dd_type,
             )
             game.session_token = new_token
@@ -1825,7 +2054,7 @@ class BamboozledCog(commands.Cog):
                 question, new_token = await fetch_question(
                     game.session_token,
                     difficulty=game.question_difficulty,
-                    category=game.question_category,
+                    category=game.pick_question_category(),
                 )
                 game.session_token = new_token
                 answers, correct_idx = shuffle_answers(question)
@@ -1947,43 +2176,43 @@ class BamboozledCog(commands.Cog):
                     )
                 await channel.send(embed=boli_embed)
 
-        # ── Play-again: reset game to lobby state instead of fully cleaning up ──
-        # Archive and unlink the thread (it held the completed game), then open
-        # a lobby in the original channel so the host can start a new game.
+        # ── Play-again: reset to lobby state, keeping the same players ──
         game.active = False
         old_thread_id = game.thread_id
+        old_lobby_id = game.lobby_id
 
-        # Archive the completed game thread first
+        # Archive the completed game thread
         if isinstance(channel, discord.Thread):
             try:
                 await channel.edit(archived=True, locked=True)
             except Exception as exc:
                 logger.warning("Failed to archive game thread: %s", exc)
 
-        # Reset game state but keep players in the lobby
-        game.reset_for_new_game()  # clears thread_id among other state
+        # Clear all volatile game state (resets thread_id and lobby_id too)
+        game.reset_for_new_game()
 
-        # Remove stale thread entry from registry (original channel entry stays)
+        # Remove stale registry entries
         if old_thread_id:
             _active_games.pop(old_thread_id, None)
+        if old_lobby_id:
+            _active_games.pop(old_lobby_id, None)
 
-        # Figure out where to post the lobby message
+        await unregister_active_channel(str(game.channel_id))
+
+        # Post a fresh lobby embed with join/start buttons in the original channel
         lobby_channel = self.bot.get_channel(game.channel_id) or channel
-        roster = "\n".join(f"• {game.player_names[pid]}" for pid in game.players)
-        host_name = game.player_names.get(game.host_id, "Host")
-        await lobby_channel.send(
-            f"🎬 **Game over! The lobby is still open.**\n\n"
-            f"**Players staying ({len(game.players)}/6):**\n{roster}\n\n"
-            f"**{host_name}** can use `/bamboozled start` to play again, "
-            f"or players can use `/bamboozled leave` to exit.\n"
-            f"⏰ *Lobby auto-closes in 10 minutes if no new game starts.*"
+        view = LobbyView(game, self)
+        msg = await lobby_channel.send(
+            "🎬 **Game over! Same players — ready for another round?**",
+            embed=view.lobby_embed(),
+            view=view,
         )
+        game.lobby_id = msg.id
+        _active_games[msg.id] = game
 
         # Restart lobby timeout watcher
-        lobby_cid = game.channel_id
-        if lobby_cid not in _lobby_watchers:
-            asyncio.create_task(self._lobby_timeout_watch(lobby_cid, game))
-            _lobby_watchers.add(lobby_cid)
+        asyncio.create_task(self._lobby_timeout_watch(game))
+        _lobby_watchers.add(game.lobby_id)
 
 
 async def setup(bot: commands.Bot):
